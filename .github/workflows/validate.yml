@@ -25,6 +25,9 @@ defaults:
 
 jobs:
   validate:
+    # GitHub excludes required workflows from their source repository. Mirror
+    # that boundary for this file's ordinary pull_request/push triggers.
+    if: github.repository != 'autumngarage/touchstone-workflows'
     name: validate (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 20
