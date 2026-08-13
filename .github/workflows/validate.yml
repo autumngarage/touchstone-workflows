@@ -12,10 +12,6 @@ on:
   push:
     branches: [main]
 
-concurrency:
-  group: touchstone-validate-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
 
