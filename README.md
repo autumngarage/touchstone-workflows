@@ -6,4 +6,3 @@ request cannot weaken its own merge gate by editing a same-named local file.
 
 Changes to `main` require a pull request. Touchstone's audited GitHub policy
 owns which source repository, path, and full commit SHA are required.
-Protected source for Touchstone organization-required GitHub Actions workflows
