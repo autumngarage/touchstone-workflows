@@ -20,6 +20,20 @@ defaults:
     shell: bash
 
 jobs:
+  source-contract:
+    # Required workflows do not run against their source repository. This job
+    # keeps changes to the adapter reviewable without adding work to consumers.
+    if: github.repository == 'autumngarage/touchstone-workflows'
+    name: source contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Test workflow contract
+        run: bash tests/test-workflow.sh
+
   validate:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
@@ -39,22 +53,20 @@ jobs:
           git config --global user.name "Touchstone CI"
           git config --global init.defaultBranch main
 
-      - name: Run the test suite
+      - name: Fetch pinned Touchstone validator
         run: |
-          set -uo pipefail
-          failed=0
-          for test in tests/test-*.sh; do
-            echo "::group::$test"
-            if bash "$test"; then
-              echo "PASS $test"
-            else
-              echo "::error file=$test::test file failed"
-              failed=$((failed + 1))
-            fi
-            echo "::endgroup::"
-          done
-          if [ "$failed" -ne 0 ]; then
-            echo "$failed test file(s) failed"
-            exit 1
-          fi
-          echo "suite green"
+          set -euo pipefail
+          touchstone_revision="7438185f875dd978e0f1f86b0ca591833db6b5af"
+          touchstone_sha256="a67b32edc6dc2bfba48be22fd0ccb327116f16c114b1f3873f5b48af61fd3fd3"
+          validator="$RUNNER_TEMP/touchstone-run.sh"
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
+            --output "$validator"
+          printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
+
+      - name: Run declared validation
+        run: |
+          set -euo pipefail
+          bash "$RUNNER_TEMP/touchstone-run.sh" validate \
+            --project "$GITHUB_WORKSPACE" \
+            --json
