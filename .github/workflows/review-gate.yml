@@ -1,0 +1,149 @@
+name: review-gate
+
+# Central required review gate for Touchstone consumers. GitHub runs this
+# pinned source against the target pull request and against the merge
+# queue's commit, outside the PR's control. It reads evidence with the
+# read-only token, runs the pure evaluator fetched from Touchstone at a
+# pinned revision, and passes or fails. It publishes nothing: the job's own
+# conclusion is the verdict, and no workflow in the target repository can
+# forge it.
+#
+# Re-evaluation after evidence changes (a review landing, an answer posted)
+# is requested by the driver with `gh run rerun`; the merge queue always
+# re-evaluates the merged result before landing.
+#
+# DEPENDENCY CONTRACT: the runner image, the target repository, github.com.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  source-contract:
+    if: github.repository == 'autumngarage/touchstone-workflows'
+    name: source contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test workflow contract
+        run: bash tests/test-workflow.sh
+
+  review-gate:
+    if: github.repository != 'autumngarage/touchstone-workflows'
+    name: review-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
+    steps:
+      - name: Fetch pinned evaluator
+        run: |
+          set -euo pipefail
+          touchstone_revision="4d56ad411a95e020510860fb8595172a662af0f5"
+          evaluator_sha256="9000ea60baddba1e0b47f131fba11ab064aa07778c998f1dd89bd219618aac18"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
+            -o "$RUNNER_TEMP/evaluate.jq"
+          echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict
+
+      - name: Evaluate review evidence for the pull request
+        run: |
+          set -euo pipefail
+          tmp="$RUNNER_TEMP/evidence"
+          mkdir -p "$tmp"
+
+          # Which pull request? A queue commit names it in its branch.
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              number="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
+              ;;
+            merge_group)
+              queue_ref="$(jq -r '.merge_group.head_ref' "$GITHUB_EVENT_PATH")"
+              number="$(printf '%s' "$queue_ref" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-fA-F]{40}$#\1#p')"
+              [ -n "$number" ] || { echo "ERROR: merge group ref '$queue_ref' names no pull request." >&2; exit 1; }
+              ;;
+            *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
+          esac
+
+          api_array() { gh api --paginate "$1" | jq -s 'add // []' >"$2"; }
+
+          gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"
+          head="$(jq -r '.head.sha' "$tmp/pr.json")"
+          base="$(jq -r '.base.sha' "$tmp/pr.json")"
+          # When did this SHA last become the head? Its commit date, or the
+          # force-push that restored it -- a bare request binds only a head
+          # current when it was posted. And a bare request cannot outlive a
+          # base retarget: the reviewer never saw the new base's diff.
+          head_committed_at="$(gh api "repos/$REPO/commits/$head" --jq '.commit.committer.date')"
+          gh api --paginate "repos/$REPO/issues/$number/timeline?per_page=100" \
+            -H 'Accept: application/vnd.github+json' | jq -s 'add // []' >"$tmp/timeline.json"
+          head_current_since="$(jq -r --arg committed "$head_committed_at" \
+            '([.[] | select(.event == "head_ref_force_pushed") | .created_at] + [$committed]) | max' "$tmp/timeline.json")"
+          base_retargeted_at="$(jq -r '[.[] | select(.event == "base_ref_changed") | .created_at] | max // ""' "$tmp/timeline.json")"
+
+          api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
+          api_array "repos/$REPO/pulls/$number/comments?per_page=100" "$tmp/review-comments.json"
+          api_array "repos/$REPO/commits/$head/pulls?per_page=100" "$tmp/head-pulls.json"
+          # shellcheck disable=SC2016
+          gh api graphql --paginate \
+            -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviews(first:100,after:$endCursor){nodes{databaseId body state submittedAt updatedAt commit{oid} author{login}} pageInfo{hasNextPage endCursor}}}}}' \
+            -F owner="${REPO%%/*}" -F repo="${REPO#*/}" -F number="$number" \
+            | jq -s '[.[].data.repository.pullRequest.reviews.nodes[] | {id: .databaseId, body, state, submitted_at: .submittedAt, updated_at: .updatedAt, commit_id: .commit.oid, user: {login: .author.login}}]' \
+            >"$tmp/reviews.json"
+
+          # Trusted result comments name an abbreviated commit; resolve it so
+          # the evaluator compares full SHAs.
+          printf '{}\n' >"$tmp/resolved.json"
+          while IFS=$'\t' read -r id abbreviated || [ -n "$id" ]; do
+            [ -n "$id" ] || continue
+            if [ "${#abbreviated}" -eq 40 ]; then resolved="$abbreviated"
+            elif ! resolved="$(gh api "repos/$REPO/commits/$abbreviated" --jq .sha 2>/dev/null)"; then
+              echo "WARNING: trusted comment $id names unresolvable commit $abbreviated; ignored." >&2; resolved=""
+            fi
+            jq --arg id "$id" --arg sha "$resolved" '. + {($id): $sha}' "$tmp/resolved.json" >"$tmp/resolved.next" && mv "$tmp/resolved.next" "$tmp/resolved.json"
+          done < <(jq -r --arg trusted "$TRUSTED_REVIEWERS" '.[] | (.user.login // "") as $login | select(($trusted | split(",") | index($login)) != null) | ((.body // "") | capture("Reviewed commit:[*]*[[:space:]]*`(?<sha>[0-9a-fA-F]{7,40})`")?) as $m | select($m != null) | [(.id | tostring), $m.sha] | @tsv' "$tmp/issues.json")
+          jq --slurpfile resolved "$tmp/resolved.json" 'map(. + {resolved_review_sha: ($resolved[0][(.id | tostring)] // "")})' "$tmp/issues.json" >"$tmp/issues-resolved.json"
+
+          # A request binds the base it was made against or any ancestor of
+          # the current tip; the default branch advancing does not unmake it.
+          printf '["%s"]' "$base" >"$tmp/bases.json"
+          while IFS= read -r request_base; do
+            [ -n "$request_base" ] && [ "$request_base" != "$base" ] || continue
+            status="$(gh api "repos/$REPO/compare/$request_base...$base" --jq .status 2>/dev/null || echo unknown)"
+            case "$status" in identical | ahead)
+              jq --arg sha "$request_base" '. + [$sha]' "$tmp/bases.json" >"$tmp/bases.next" && mv "$tmp/bases.next" "$tmp/bases.json" ;;
+            esac
+          done < <(jq -r '.[] | (.body // "") | capture("touchstone:pr-open head=[0-9a-fA-F]{40} base=[^ ]+ base_sha=(?<b>[0-9a-fA-F]{40})")? | .b' "$tmp/issues.json" | sort -u)
+
+          jq -n \
+            --slurpfile pr "$tmp/pr.json" --slurpfile issueComments "$tmp/issues-resolved.json" \
+            --slurpfile reviews "$tmp/reviews.json" --slurpfile reviewComments "$tmp/review-comments.json" \
+            --slurpfile headPulls "$tmp/head-pulls.json" --slurpfile bases "$tmp/bases.json" \
+            --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" --arg currentSince "$head_current_since" --arg retargetedAt "$base_retargeted_at" \
+            '($pr[0]) as $pr | {
+              contractVersion: 2, complete: true,
+              trustedAuthors: ($trusted | split(",")),
+              pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha, baseRef: $pr.base.ref, baseSha: $pr.base.sha,
+                   acceptableBaseShas: $bases[0], headCurrentSince: $currentSince, baseRetargetedAt: $retargetedAt,
+                   openHeadPulls: [$headPulls[0][] | select(.state == "open" and .base.repo.full_name == $repo and .head.sha == $pr.head.sha) | .number]},
+              issueComments: $issueComments[0], reviews: $reviews[0], reviewComments: $reviewComments[0]
+            }' >"$tmp/evidence.json"
+
+          verdict="$(jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json")"
+          jq -r '.summary' <<<"$verdict"
+          [ "$(jq -r .conclusion <<<"$verdict")" = success ]
