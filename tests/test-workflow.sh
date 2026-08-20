@@ -27,6 +27,10 @@ assert_count 1 'touchstone-run\.sh" validate'
 # shellcheck disable=SC2016
 assert_count 1 '--project "\$GITHUB_WORKSPACE"'
 assert_count 1 '--json'
+# The merge queue tests a temporary merge commit; a required check that does
+# not report there ejects every queue entry.
+assert_count 1 '^  merge_group:'
+assert_count 1 'types: \[checks_requested\]'
 
 if grep -Eq 'tests/test-\*\.sh|(^|[^[:alnum:]_-])(npm|pip|uv|brew|apt-get)([^[:alnum:]_-]|$)' "$workflow"; then
   fail "required workflow must invoke only the declaration engine"
