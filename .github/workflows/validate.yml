@@ -60,8 +60,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="7438185f875dd978e0f1f86b0ca591833db6b5af"
-          touchstone_sha256="a67b32edc6dc2bfba48be22fd0ccb327116f16c114b1f3873f5b48af61fd3fd3"
+          touchstone_revision="62d84f17e775a14c743d3951bf6979006e2ccb40"
+          touchstone_sha256="d2934fe2d887b47c9ecde83cc8f70ff7363df2a957b3311dd69cd67ac2ac32da"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
