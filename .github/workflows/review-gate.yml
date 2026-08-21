@@ -54,8 +54,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="4d56ad411a95e020510860fb8595172a662af0f5"
-          evaluator_sha256="9000ea60baddba1e0b47f131fba11ab064aa07778c998f1dd89bd219618aac18"
+          touchstone_revision="0d39544b3af9e84c01e81f7f727ff922999ac549"
+          evaluator_sha256="cb00377d74ca7e238b7d4e19d09eb4f2e5af45b9533733fd62442ba08b8a98aa"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
             -o "$RUNNER_TEMP/evaluate.jq"
