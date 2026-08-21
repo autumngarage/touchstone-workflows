@@ -4,6 +4,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/validate.yml"
 review_gate="$repo_root/.github/workflows/review-gate.yml"
+delivery_evidence="$repo_root/.github/workflows/delivery-evidence.yml"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -43,7 +44,7 @@ fi
 
 # Required gates: pinned evaluator fetches with checksums, both PR and queue
 # events, read-only tokens, no checkout of target code, no publication.
-for gate in "$review_gate"; do
+for gate in "$review_gate" "$delivery_evidence"; do
   grep -Eq 'touchstone_revision="[0-9a-f]{40}"' "$gate" || fail "$gate: evaluator revision is not pinned"
   grep -Eq 'evaluator_sha256="[0-9a-f]{64}"' "$gate" || fail "$gate: evaluator checksum is not pinned"
   grep -q 'sha256sum --check --strict' "$gate" || fail "$gate: checksum is not enforced"
@@ -53,6 +54,6 @@ for gate in "$review_gate"; do
   if grep -Eq 'checks: write|statuses: write|contents: write' "$gate"; then fail "$gate: a required gate must not hold write permissions"; fi
   if grep -Eq 'uses: actions/checkout' "$gate" && ! grep -q "github.repository == 'autumngarage/touchstone-workflows'" "$gate"; then fail "$gate: checks out target code"; fi
 done
-grep -q 'TOUCHSTONE_REVISION_PLACEHOLDER\|SHA256_PLACEHOLDER' "$review_gate" && fail "gate evaluator pins are placeholders"
+for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
 echo "workflow contract passed"

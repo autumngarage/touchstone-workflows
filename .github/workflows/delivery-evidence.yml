@@ -1,0 +1,60 @@
+name: delivery-evidence
+
+# Central required check that a pull request recorded its review tier and
+# validation. Shape and presence only; never content quality. Runs from this
+# pinned source on the pull request and on the merge queue's commit, fetches
+# the evaluator from Touchstone at a pinned revision, and reads the PR body
+# by number so the queue commit is judged on the same evidence.
+#
+# DEPENDENCY CONTRACT: the runner image, the target repository, github.com.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  delivery-evidence:
+    if: github.repository != 'autumngarage/touchstone-workflows'
+    name: delivery-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Fetch pinned evaluator
+        run: |
+          set -euo pipefail
+          touchstone_revision="5eeac5426e11380b385e10901f43ef1d4fd7e534"
+          evaluator_sha256="23baea71e588734c93d63f7d73043db675035c1539d1ab10466df1b28d7a6d59"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \
+            -o "$RUNNER_TEMP/check-delivery-evidence.sh"
+          echo "${evaluator_sha256}  $RUNNER_TEMP/check-delivery-evidence.sh" | sha256sum --check --strict
+
+      - name: Verify recorded evidence
+        run: |
+          set -euo pipefail
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              number="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
+              ;;
+            merge_group)
+              queue_ref="$(jq -r '.merge_group.head_ref' "$GITHUB_EVENT_PATH")"
+              number="$(printf '%s' "$queue_ref" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-fA-F]{40}$#\1#p')"
+              [ -n "$number" ] || { echo "ERROR: merge group ref '$queue_ref' names no pull request." >&2; exit 1; }
+              ;;
+            *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
+          esac
+          gh api "repos/$REPO/pulls/$number" --jq '.body // ""' >"$RUNNER_TEMP/pr-body.md"
+          bash "$RUNNER_TEMP/check-delivery-evidence.sh" "$RUNNER_TEMP/pr-body.md"
