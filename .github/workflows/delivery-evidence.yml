@@ -23,6 +23,22 @@ defaults:
     shell: bash
 
 jobs:
+  # This repository is the workflow source, not a consumer: the job below is
+  # guarded off here, so without this one every job would skip and the run
+  # would conclude "skipped" -- which never satisfies a required workflow.
+  # review-gate.yml and validate.yml already carry the same job; the asymmetry
+  # would have made this repository unadoptable by its own policy.
+  source-contract:
+    if: github.repository == 'autumngarage/touchstone-workflows'
+    name: source contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout workflow source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Test workflow contract
+        run: bash tests/test-workflow.sh
+
   delivery-evidence:
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: delivery-evidence

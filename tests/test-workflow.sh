@@ -56,4 +56,14 @@ for gate in "$review_gate" "$delivery_evidence"; do
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
+# Every workflow must keep a job that runs *here*. Each one guards its consumer
+# job off on this repository, so a workflow with no source-side job has all jobs
+# skipped and the run concludes "skipped" -- which never satisfies a required
+# workflow. That would make this repository unadoptable by its own policy, and
+# block every merge in the repository every consumer's checks are pinned to.
+for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
+  grep -q "if: github.repository == 'autumngarage/touchstone-workflows'" "$gate" \
+    || fail "$gate: no job runs on the workflow source, so its run concludes 'skipped' here"
+done
+
 echo "workflow contract passed"
