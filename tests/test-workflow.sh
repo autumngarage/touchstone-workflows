@@ -61,6 +61,7 @@ for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate
 # a machine-readable manifest so the policy engine can compare its desired rule
 # with its one publisher instead of relying on an ambiguous duplicate context.
 command -v jq >/dev/null 2>&1 || fail "jq is required to validate the source contract"
+command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML"
 jq -e '
   . as $contract
   | .contractVersion == 1
@@ -89,45 +90,32 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
   relative_gate="${gate#"$repo_root"/}"
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
     || fail "$relative_gate: workflow is absent from the source contract manifest"
-  if ! published_jobs="$(awk -v context="$required_status_check" '
-    $0 == "jobs:" { in_jobs = 1; next }
-    /^[[:space:]]*#/ { next }
-    in_jobs && /^[^ ]/ { in_jobs = 0; job = "" }
-    in_jobs && /^  [^ #]/ && $0 !~ /^  [A-Za-z_][A-Za-z0-9_-]*:/ { exit 4 }
-    in_jobs && /^    [^ #]/ && $0 !~ /^    [A-Za-z_][A-Za-z0-9_-]*:/ { exit 4 }
-    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*[^#[:space:]]/ { exit 3 }
-    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*(#.*)?$/ {
-      job = $0
-      sub(/^  /, "", job)
-      sub(/:[[:space:]]*(#.*)?$/, "", job)
-      next
-    }
-    in_jobs && /^    name:([[:space:]]+|$)/ {
-      value = $0
-      sub(/^    name:[[:space:]]*/, "", value)
-      sub(/[[:space:]]+$/, "", value)
-      if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
-        value = substr(value, 2, length(value) - 2)
-      } else if (value !~ /^[A-Za-z0-9][A-Za-z0-9 ._()\/-]*$/) {
-        exit 2
-      }
-      if (value !~ /^[A-Za-z0-9][A-Za-z0-9 ._()\/-]*$/) { exit 2 }
-      if (value == context) { print job }
-    }
-  ' "$gate")"; then
-    fail "$relative_gate: jobs must use canonical block mappings, keys, and one-line literal names"
+  if ! published_jobs="$(ruby -ryaml -e '
+    document = YAML.safe_load(
+      File.read(ARGV.fetch(0)),
+      permitted_classes: [], permitted_symbols: [], aliases: false
+    )
+    jobs = document.fetch("jobs")
+    raise "jobs must be a mapping" unless jobs.is_a?(Hash)
+    jobs.each do |job, configuration|
+      raise "invalid job ID: #{job.inspect}" unless job.is_a?(String) && job.match?(/\A[A-Za-z_][A-Za-z0-9_-]*\z/)
+      raise "job #{job} must be a mapping" unless configuration.is_a?(Hash)
+      name = configuration["name"]
+      raise "job #{job} name must be a string" unless name.nil? || name.is_a?(String)
+      if job == ARGV.fetch(3) && name == ARGV.fetch(1)
+        expected_guard = "github.repository == " + 39.chr + ARGV.fetch(2) + 39.chr
+        raise "status publisher has the wrong repository guard" unless configuration["if"] == expected_guard
+      end
+      puts job if name == ARGV.fetch(1)
+    end
+  ' "$gate" "$required_status_check" "$source_repository" "$status_job")"; then
+    fail "$relative_gate: workflow jobs or names are malformed"
   fi
   if [ -n "$published_jobs" ]; then
     [ "$relative_gate" = "$status_publisher" ] \
       || fail "$relative_gate: duplicates required status '$required_status_check' owned by $status_publisher"
     [ "$published_jobs" = "$status_job" ] \
       || fail "$relative_gate: required status '$required_status_check' must be published only by job $status_job"
-    awk -v repository="$source_repository" -v job="$status_job" '
-      $0 == "  " job ":" { in_source_contract = 1; next }
-      in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
-      in_source_contract && $0 == "    if: github.repository == \047" repository "\047" { found = 1 }
-      END { exit(found ? 0 : 1) }
-    ' "$gate" || fail "$relative_gate: status publisher is not guarded to $source_repository"
   else
     [ "$relative_gate" != "$status_publisher" ] \
       || fail "$relative_gate: source-contract job does not publish '$required_status_check'"
@@ -137,30 +125,27 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  for status_key in name "'name'" '"name"' '"na\u006de"'; do
-    for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\""; do
-      fixture="$(mktemp -d)"
-      trap 'rm -rf "$fixture"' EXIT HUP INT TERM
-      mkdir -p "$fixture/.github"
-      cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
-      cp "$source_contract" "$fixture/.touchstone-source-contract.json"
-      printf '%s\n' \
-        '# Comments do not end the jobs mapping, regardless of indentation.' \
-        '  duplicate-source-contract: # Inline comments preserve a block mapping.' \
-        "    $status_key: $status_spelling" \
-        '    runs-on: ubuntu-latest' \
-        '    steps: []' >>"$fixture/$status_publisher"
-      if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
-        fail "source contract accepted a duplicate status publisher under another job ID"
-      fi
-      if [ "$status_key" = name ]; then
+  for job_indent in '    ' '      '; do
+    for status_key in name "'name'" '"name"' '"na\u006de"'; do
+      for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\""; do
+        fixture="$(mktemp -d)"
+        trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+        mkdir -p "$fixture/.github"
+        cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+        cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+        printf '%s\n' \
+          '# Comments do not end the jobs mapping, regardless of indentation.' \
+          '  duplicate-source-contract: # Inline comments preserve a block mapping.' \
+          "$job_indent$status_key: $status_spelling" \
+          "${job_indent}runs-on: ubuntu-latest" \
+          "${job_indent}steps: []" >>"$fixture/$status_publisher"
+        if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+          fail "source contract accepted a duplicate status publisher under another job ID"
+        fi
         grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
-          || fail "canonical duplicate status publisher did not fail for ownership"
-      else
-        grep -Fq "jobs must use canonical block mappings" "$fixture/self-test.out" \
-          || fail "non-canonical name key did not fail validation"
-      fi
-      rm -r "$fixture"
+          || fail "YAML-equivalent duplicate status publisher did not fail for ownership"
+        rm -r "$fixture"
+      done
     done
   done
   fixture="$(mktemp -d)"
@@ -173,8 +158,8 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
     fail "source contract accepted a duplicate status publisher in a flow-style job mapping"
   fi
-  grep -Fq "jobs must use canonical block mappings" "$fixture/self-test.out" \
-    || fail "flow-style job mapping did not fail for the expected invariant"
+  grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+    || fail "flow-style duplicate did not fail for the ownership invariant"
   rm -r "$fixture"
 fi
 
