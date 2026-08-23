@@ -64,7 +64,9 @@ command -v jq >/dev/null 2>&1 || fail "jq is required to validate the source con
 jq -e '
   . as $contract
   | .contractVersion == 1
-  and (.requiredStatusCheck | type == "string" and length > 0)
+  and (.requiredStatusCheck
+    | type == "string"
+    and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*$"))
   and (.sourceRepository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
   and (.statusJob | type == "string" and test("^[A-Za-z_][A-Za-z0-9_-]*$"))
   and (.statusPublisher | type == "string")
@@ -87,15 +89,27 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
   relative_gate="${gate#"$repo_root"/}"
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
     || fail "$relative_gate: workflow is absent from the source contract manifest"
-  published_jobs="$(awk -v context="$required_status_check" '
+  if ! published_jobs="$(awk -v context="$required_status_check" '
     /^  [^ ]+:[[:space:]]*$/ {
       job = $0
       sub(/^  /, "", job)
       sub(/:[[:space:]]*$/, "", job)
       next
     }
-    $0 == "    name: " context { print job }
-  ' "$gate")"
+    /^    name:[[:space:]]*/ {
+      value = $0
+      sub(/^    name:[[:space:]]*/, "", value)
+      if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
+        value = substr(value, 2, length(value) - 2)
+      } else if (value !~ /^[A-Za-z0-9][A-Za-z0-9 ._()\/-]*$/) {
+        exit 2
+      }
+      if (value !~ /^[A-Za-z0-9][A-Za-z0-9 ._()\/-]*$/) { exit 2 }
+      if (value == context) { print job }
+    }
+  ' "$gate")"; then
+    fail "$relative_gate: job names must be one-line literal strings in the source contract character set"
+  fi
   if [ -n "$published_jobs" ]; then
     [ "$relative_gate" = "$status_publisher" ] \
       || fail "$relative_gate: duplicates required status '$required_status_check' owned by $status_publisher"
@@ -116,21 +130,24 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  fixture="$(mktemp -d)"
-  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
-  mkdir -p "$fixture/.github"
-  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
-  cp "$source_contract" "$fixture/.touchstone-source-contract.json"
-  printf '%s\n' \
-    '  duplicate-source-contract:' \
-    '    name: source contract' \
-    '    runs-on: ubuntu-latest' \
-    '    steps: []' >>"$fixture/$status_publisher"
-  if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
-    fail "source contract accepted a duplicate status publisher under another job ID"
-  fi
-  grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
-    || fail "duplicate status publisher did not fail for the expected invariant"
+  for status_spelling in "$required_status_check" "'$required_status_check'" "\"$required_status_check\""; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    printf '%s\n' \
+      '  duplicate-source-contract:' \
+      "    name: $status_spelling" \
+      '    runs-on: ubuntu-latest' \
+      '    steps: []' >>"$fixture/$status_publisher"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted a duplicate status publisher under another job ID"
+    fi
+    grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+      || fail "duplicate status publisher did not fail for the expected invariant"
+    rm -r "$fixture"
+  done
 fi
 
 echo "workflow contract passed"
