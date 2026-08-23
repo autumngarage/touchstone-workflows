@@ -65,7 +65,8 @@ jq -e '
   . as $contract
   | .contractVersion == 1
   and (.requiredStatusCheck | type == "string" and length > 0)
-  and (.statusJob | type == "string" and test("^[A-Za-z0-9_-]+$"))
+  and (.sourceRepository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
+  and (.statusJob | type == "string" and test("^[A-Za-z_][A-Za-z0-9_-]*$"))
   and (.statusPublisher | type == "string")
   and (.workflowPaths | type == "array" and length > 0 and length == (unique | length))
   and ($contract.workflowPaths | index($contract.statusPublisher) != null)
@@ -75,6 +76,7 @@ jq -e '
     and (endswith(".yml") or endswith(".yaml")))
 ' "$source_contract" >/dev/null || fail "source contract manifest is malformed"
 required_status_check="$(jq -er '.requiredStatusCheck' "$source_contract")"
+source_repository="$(jq -er '.sourceRepository' "$source_contract")"
 status_job="$(jq -er '.statusJob' "$source_contract")"
 status_publisher="$(jq -er '.statusPublisher' "$source_contract")"
 manifest_workflow_count="$(jq -r '.workflowPaths | length' "$source_contract")"
@@ -93,6 +95,12 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
   ' "$gate"; then
     [ "$relative_gate" = "$status_publisher" ] \
       || fail "$relative_gate: duplicates required status '$required_status_check' owned by $status_publisher"
+    awk -v repository="$source_repository" -v job="$status_job" '
+      $0 == "  " job ":" { in_source_contract = 1; next }
+      in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
+      in_source_contract && $0 == "    if: github.repository == \047" repository "\047" { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$gate" || fail "$relative_gate: status publisher is not guarded to $source_repository"
   else
     [ "$relative_gate" != "$status_publisher" ] \
       || fail "$relative_gate: source-contract job does not publish '$required_status_check'"

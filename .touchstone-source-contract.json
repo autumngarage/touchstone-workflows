@@ -1,6 +1,7 @@
 {
   "contractVersion": 1,
   "requiredStatusCheck": "source contract",
+  "sourceRepository": "autumngarage/touchstone-workflows",
   "statusJob": "source-contract",
   "statusPublisher": ".github/workflows/validate.yml",
   "workflowPaths": [
