@@ -67,9 +67,9 @@ jq -e '
   | .contractVersion == 1
   and (.requiredStatusCheck
     | type == "string"
-    and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*$"))
-  and (.sourceRepository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
-  and (.statusJob | type == "string" and test("^[A-Za-z_][A-Za-z0-9_-]*$"))
+    and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
+  and (.sourceRepository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\z"))
+  and (.statusJob | type == "string" and test("^[A-Za-z_][A-Za-z0-9_-]*\\z"))
   and (.statusPublisher | type == "string")
   and (.workflowPaths | type == "array" and length > 0 and length == (unique | length))
   and ($contract.workflowPaths | index($contract.statusPublisher) != null)
@@ -224,6 +224,21 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fail "source contract rejected valid GitHub YAML scalar spellings"
   fi
   rm -r "$fixture"
+
+  for manifest_identifier in requiredStatusCheck sourceRepository statusJob; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    jq --arg field "$manifest_identifier" '.[$field] += "\n"' \
+      "$source_contract" >"$fixture/.touchstone-source-contract.json"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted a trailing newline in $manifest_identifier"
+    fi
+    grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
+      || fail "trailing newline in $manifest_identifier did not fail manifest validation"
+    rm -r "$fixture"
+  done
 fi
 
 echo "workflow contract passed"
