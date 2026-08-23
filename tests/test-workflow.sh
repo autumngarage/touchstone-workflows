@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="${TOUCHSTONE_CONTRACT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 workflow="$repo_root/.github/workflows/validate.yml"
 review_gate="$repo_root/.github/workflows/review-gate.yml"
 delivery_evidence="$repo_root/.github/workflows/delivery-evidence.yml"
@@ -87,14 +87,20 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
   relative_gate="${gate#"$repo_root"/}"
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
     || fail "$relative_gate: workflow is absent from the source contract manifest"
-  if awk -v context="$required_status_check" -v job="$status_job" '
-    $0 == "  " job ":" { in_source_contract = 1; next }
-    in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
-    in_source_contract && $0 == "    name: " context { found = 1 }
-    END { exit(found ? 0 : 1) }
-  ' "$gate"; then
+  published_jobs="$(awk -v context="$required_status_check" '
+    /^  [^ ]+:[[:space:]]*$/ {
+      job = $0
+      sub(/^  /, "", job)
+      sub(/:[[:space:]]*$/, "", job)
+      next
+    }
+    $0 == "    name: " context { print job }
+  ' "$gate")"
+  if [ -n "$published_jobs" ]; then
     [ "$relative_gate" = "$status_publisher" ] \
       || fail "$relative_gate: duplicates required status '$required_status_check' owned by $status_publisher"
+    [ "$published_jobs" = "$status_job" ] \
+      || fail "$relative_gate: required status '$required_status_check' must be published only by job $status_job"
     awk -v repository="$source_repository" -v job="$status_job" '
       $0 == "  " job ":" { in_source_contract = 1; next }
       in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
@@ -108,5 +114,23 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
 done
 [ "$repository_workflow_count" -eq "$manifest_workflow_count" ] \
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
+
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+  printf '%s\n' \
+    '  duplicate-source-contract:' \
+    '    name: source contract' \
+    '    runs-on: ubuntu-latest' \
+    '    steps: []' >>"$fixture/$status_publisher"
+  if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+    fail "source contract accepted a duplicate status publisher under another job ID"
+  fi
+  grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+    || fail "duplicate status publisher did not fail for the expected invariant"
+fi
 
 echo "workflow contract passed"
