@@ -90,13 +90,17 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
     || fail "$relative_gate: workflow is absent from the source contract manifest"
   if ! published_jobs="$(awk -v context="$required_status_check" '
-    /^  [^ ]+:[[:space:]]*$/ {
+    $0 == "jobs:" { in_jobs = 1; next }
+    /^[[:space:]]*#/ { next }
+    in_jobs && /^[^ ]/ { in_jobs = 0; job = "" }
+    in_jobs && /^  [^ ]+:[[:space:]]*[^#[:space:]]/ { exit 3 }
+    in_jobs && /^  [^ ]+:[[:space:]]*(#.*)?$/ {
       job = $0
       sub(/^  /, "", job)
-      sub(/:[[:space:]]*$/, "", job)
+      sub(/:[[:space:]]*(#.*)?$/, "", job)
       next
     }
-    /^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/ {
+    in_jobs && /^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/ {
       value = $0
       sub(/^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/, "", value)
       sub(/[[:space:]]+$/, "", value)
@@ -109,7 +113,7 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
       if (value == context) { print job }
     }
   ' "$gate")"; then
-    fail "$relative_gate: job names must be one-line literal strings in the source contract character set"
+    fail "$relative_gate: jobs must use block mappings and one-line literal names in the source contract character set"
   fi
   if [ -n "$published_jobs" ]; then
     [ "$relative_gate" = "$status_publisher" ] \
@@ -139,7 +143,8 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
       cp "$source_contract" "$fixture/.touchstone-source-contract.json"
       printf '%s\n' \
-        '  duplicate-source-contract:' \
+        '# Comments do not end the jobs mapping, regardless of indentation.' \
+        '  duplicate-source-contract: # Inline comments preserve a block mapping.' \
         "    $status_key: $status_spelling" \
         '    runs-on: ubuntu-latest' \
         '    steps: []' >>"$fixture/$status_publisher"
@@ -151,6 +156,19 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       rm -r "$fixture"
     done
   done
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+  printf '  duplicate-source-contract: {name: %s, runs-on: ubuntu-latest, steps: []}\n' \
+    "$required_status_check" >>"$fixture/$status_publisher"
+  if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+    fail "source contract accepted a duplicate status publisher in a flow-style job mapping"
+  fi
+  grep -Fq "jobs must use block mappings" "$fixture/self-test.out" \
+    || fail "flow-style job mapping did not fail for the expected invariant"
+  rm -r "$fixture"
 fi
 
 echo "workflow contract passed"
