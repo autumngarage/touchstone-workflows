@@ -92,24 +92,43 @@ for gate in \
   relative_gate="${gate#"$repo_root"/}"
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
     || fail "$relative_gate: workflow is absent from the source contract manifest"
-  if ! published_jobs="$(ruby -ryaml -e '
-    document = YAML.safe_load(
-      File.read(ARGV.fetch(0)),
-      permitted_classes: [], permitted_symbols: [], aliases: false
-    )
-    jobs = document.fetch("jobs")
-    raise "jobs must be a mapping" unless jobs.is_a?(Hash)
-    jobs.each do |job, configuration|
-      raise "invalid job ID: #{job.inspect}" unless job.is_a?(String) && job.match?(/\A[A-Za-z_][A-Za-z0-9_-]*\z/)
-      raise "job #{job} must be a mapping" unless configuration.is_a?(Hash)
-      name = configuration["name"]
-      raise "job #{job} name must be a string" unless name.nil? || name.is_a?(String)
+  if ! published_jobs="$(ruby -rpsych -e '
+    pairs = lambda do |node, label|
+      raise "#{label} must be a mapping" unless node.is_a?(Psych::Nodes::Mapping)
+      node.children.each_slice(2).to_a
+    end
+    scalar = lambda do |node, label|
+      raise "#{label} must be a scalar" unless node.is_a?(Psych::Nodes::Scalar)
+      node.value
+    end
+
+    root = Psych.parse_file(ARGV.fetch(0)).root
+    root_pairs = pairs.call(root, "workflow")
+    root_pairs.each { |key, _| scalar.call(key, "workflow key") }
+    jobs_entries = root_pairs.select { |key, _| key.value == "jobs" }
+    raise "workflow must declare exactly one jobs mapping" unless jobs_entries.length == 1
+    jobs = pairs.call(jobs_entries.first.fetch(1), "jobs")
+    seen_jobs = {}
+    jobs.each do |job_node, configuration|
+      job = scalar.call(job_node, "job ID")
+      raise "invalid job ID: #{job.inspect}" unless job.match?(/\A[A-Za-z_][A-Za-z0-9_-]*\z/)
+      raise "duplicate job ID: #{job}" if seen_jobs[job]
+      seen_jobs[job] = true
+
+      fields = pairs.call(configuration, "job #{job}")
+      fields.each { |key, _| scalar.call(key, "job #{job} key") }
+      names = fields.select { |key, _| key.value == "name" }
+      raise "job #{job} declares name more than once" if names.length > 1
+      name = names.empty? ? nil : scalar.call(names.first.fetch(1), "job #{job} name")
       if name && !name.match?(/\A[A-Za-z0-9][A-Za-z0-9 ._()\/-]*\z/)
         raise "job #{job} name must be a literal in the source contract character set"
       end
       if job == ARGV.fetch(3) && name == ARGV.fetch(1)
+        guards = fields.select { |key, _| key.value == "if" }
+        raise "status publisher must declare one repository guard" unless guards.length == 1
+        guard = scalar.call(guards.first.fetch(1), "status publisher guard")
         expected_guard = "github.repository == " + 39.chr + ARGV.fetch(2) + 39.chr
-        raise "status publisher has the wrong repository guard" unless configuration["if"] == expected_guard
+        raise "status publisher has the wrong repository guard" unless guard == expected_guard
       end
       puts job if name == ARGV.fetch(1)
     end
@@ -186,6 +205,24 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   fi
   grep -Fq "duplicates required status '$required_status_check'" "$fixture/self-test.out" \
     || fail "dot-prefixed workflow did not fail for duplicate status ownership"
+  rm -r "$fixture"
+
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+  printf '%s\n' \
+    '  on:' \
+    '    name: scheduled source audit' \
+    '    runs-on: ubuntu-latest' \
+    '    env:' \
+    '      RELEASE_DATE: 2026-08-23' \
+    '    steps: []' >>"$fixture/$status_publisher"
+  if ! TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+    cat "$fixture/self-test.out" >&2
+    fail "source contract rejected valid GitHub YAML scalar spellings"
+  fi
   rm -r "$fixture"
 fi
 
