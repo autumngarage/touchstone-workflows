@@ -75,12 +75,16 @@ jq -e '
   .contractVersion == 1
   and (.requiredStatusCheck | type == "string" and length > 0)
   and (.workflowPaths | type == "array" and length > 0 and length == (unique | length))
-  and all(.workflowPaths[]; type == "string" and startswith(".github/workflows/") and endswith(".yml"))
+  and all(.workflowPaths[];
+    type == "string"
+    and startswith(".github/workflows/")
+    and (endswith(".yml") or endswith(".yaml")))
 ' "$source_contract" >/dev/null || fail "source contract manifest is malformed"
 required_status_check="$(jq -er '.requiredStatusCheck' "$source_contract")"
 manifest_workflow_count="$(jq -r '.workflowPaths | length' "$source_contract")"
 repository_workflow_count=0
-for gate in "$repo_root"/.github/workflows/*.yml; do
+for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml; do
+  [ -f "$gate" ] || continue
   repository_workflow_count=$((repository_workflow_count + 1))
   relative_gate="${gate#"$repo_root"/}"
   jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
