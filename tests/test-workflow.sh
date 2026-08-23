@@ -102,6 +102,9 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
       raise "job #{job} must be a mapping" unless configuration.is_a?(Hash)
       name = configuration["name"]
       raise "job #{job} name must be a string" unless name.nil? || name.is_a?(String)
+      if name && !name.match?(/\A[A-Za-z0-9][A-Za-z0-9 ._()\/-]*\z/)
+        raise "job #{job} name must be a literal in the source contract character set"
+      end
       if job == ARGV.fetch(3) && name == ARGV.fetch(1)
         expected_guard = "github.repository == " + 39.chr + ARGV.fetch(2) + 39.chr
         raise "status publisher has the wrong repository guard" unless configuration["if"] == expected_guard
@@ -125,9 +128,10 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  expression_status="\${{ '$required_status_check' }}"
   for job_indent in '    ' '      '; do
     for status_key in name "'name'" '"name"' '"na\u006de"'; do
-      for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\""; do
+      for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\"" "$expression_status"; do
         fixture="$(mktemp -d)"
         trap 'rm -rf "$fixture"' EXIT HUP INT TERM
         mkdir -p "$fixture/.github"
@@ -142,8 +146,13 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
         if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
           fail "source contract accepted a duplicate status publisher under another job ID"
         fi
-        grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
-          || fail "YAML-equivalent duplicate status publisher did not fail for ownership"
+        if [ "$status_spelling" = "$expression_status" ]; then
+          grep -Fq "workflow jobs or names are malformed" "$fixture/self-test.out" \
+            || fail "expression-based job name did not fail the literal-name invariant"
+        else
+          grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+            || fail "YAML-equivalent duplicate status publisher did not fail for ownership"
+        fi
         rm -r "$fixture"
       done
     done
