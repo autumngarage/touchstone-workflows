@@ -30,18 +30,9 @@ defaults:
     shell: bash
 
 jobs:
-  source-contract:
-    if: github.repository == 'autumngarage/touchstone-workflows'
-    name: source contract
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout workflow source
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Test workflow contract
-        run: bash tests/test-workflow.sh
-
   review-gate:
+    # The source repository's policy requires the source contract published by
+    # validate.yml. Keeping one publisher avoids ambiguous duplicate contexts.
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: review-gate
     runs-on: ubuntu-latest

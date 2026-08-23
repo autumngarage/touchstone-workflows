@@ -1,6 +1,7 @@
 {
   "contractVersion": 1,
   "requiredStatusCheck": "source contract",
+  "statusPublisher": ".github/workflows/validate.yml",
   "workflowPaths": [
     ".github/workflows/delivery-evidence.yml",
     ".github/workflows/review-gate.yml",
