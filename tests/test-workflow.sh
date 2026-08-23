@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/validate.yml"
 review_gate="$repo_root/.github/workflows/review-gate.yml"
 delivery_evidence="$repo_root/.github/workflows/delivery-evidence.yml"
+source_contract="$repo_root/.touchstone-source-contract.json"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -56,14 +57,56 @@ for gate in "$review_gate" "$delivery_evidence"; do
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
-# Every workflow must keep a job that runs *here*. Each one guards its consumer
-# job off on this repository, so a workflow with no source-side job has all jobs
-# skipped and the run concludes "skipped" -- which never satisfies a required
-# workflow. That would make this repository unadoptable by its own policy, and
-# block every merge in the repository every consumer's checks are pinned to.
-for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
-  grep -q "if: github.repository == 'autumngarage/touchstone-workflows'" "$gate" \
-    || fail "$gate: no job runs on the workflow source, so its run concludes 'skipped' here"
+# The repository policy requires one literal status context. Keep that name in
+# a machine-readable manifest so the policy engine can compare its desired rule
+# with its one publisher instead of relying on an ambiguous duplicate context.
+command -v jq >/dev/null 2>&1 || fail "jq is required to validate the source contract"
+jq -e '
+  . as $contract
+  | .contractVersion == 1
+  and (.requiredStatusCheck | type == "string" and length > 0)
+  and (.sourceRepository | type == "string" and test("^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"))
+  and (.statusJob | type == "string" and test("^[A-Za-z_][A-Za-z0-9_-]*$"))
+  and (.statusPublisher | type == "string")
+  and (.workflowPaths | type == "array" and length > 0 and length == (unique | length))
+  and ($contract.workflowPaths | index($contract.statusPublisher) != null)
+  and all(.workflowPaths[];
+    type == "string"
+    and startswith(".github/workflows/")
+    and (endswith(".yml") or endswith(".yaml")))
+' "$source_contract" >/dev/null || fail "source contract manifest is malformed"
+required_status_check="$(jq -er '.requiredStatusCheck' "$source_contract")"
+source_repository="$(jq -er '.sourceRepository' "$source_contract")"
+status_job="$(jq -er '.statusJob' "$source_contract")"
+status_publisher="$(jq -er '.statusPublisher' "$source_contract")"
+manifest_workflow_count="$(jq -r '.workflowPaths | length' "$source_contract")"
+repository_workflow_count=0
+for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml; do
+  [ -f "$gate" ] || continue
+  repository_workflow_count=$((repository_workflow_count + 1))
+  relative_gate="${gate#"$repo_root"/}"
+  jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
+    || fail "$relative_gate: workflow is absent from the source contract manifest"
+  if awk -v context="$required_status_check" -v job="$status_job" '
+    $0 == "  " job ":" { in_source_contract = 1; next }
+    in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
+    in_source_contract && $0 == "    name: " context { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$gate"; then
+    [ "$relative_gate" = "$status_publisher" ] \
+      || fail "$relative_gate: duplicates required status '$required_status_check' owned by $status_publisher"
+    awk -v repository="$source_repository" -v job="$status_job" '
+      $0 == "  " job ":" { in_source_contract = 1; next }
+      in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
+      in_source_contract && $0 == "    if: github.repository == \047" repository "\047" { found = 1 }
+      END { exit(found ? 0 : 1) }
+    ' "$gate" || fail "$relative_gate: status publisher is not guarded to $source_repository"
+  else
+    [ "$relative_gate" != "$status_publisher" ] \
+      || fail "$relative_gate: source-contract job does not publish '$required_status_check'"
+  fi
 done
+[ "$repository_workflow_count" -eq "$manifest_workflow_count" ] \
+  || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 echo "workflow contract passed"
