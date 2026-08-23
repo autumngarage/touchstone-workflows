@@ -123,16 +123,17 @@ for gate in \
       if name && !name.match?(/\A[A-Za-z0-9][A-Za-z0-9 ._()\/-]*\z/)
         raise "job #{job} name must be a literal in the source contract character set"
       end
-      if job == ARGV.fetch(3) && name == ARGV.fetch(1)
+      effective_name = name || job
+      if job == ARGV.fetch(3) && effective_name == ARGV.fetch(1) && ARGV.fetch(4) == ARGV.fetch(5)
         guards = fields.select { |key, _| key.value == "if" }
         raise "status publisher must declare one repository guard" unless guards.length == 1
         guard = scalar.call(guards.first.fetch(1), "status publisher guard")
         expected_guard = "github.repository == " + 39.chr + ARGV.fetch(2) + 39.chr
         raise "status publisher has the wrong repository guard" unless guard == expected_guard
       end
-      puts job if name == ARGV.fetch(1)
+      puts job if effective_name == ARGV.fetch(1)
     end
-  ' "$gate" "$required_status_check" "$source_repository" "$status_job")"; then
+  ' "$gate" "$required_status_check" "$source_repository" "$status_job" "$relative_gate" "$status_publisher")"; then
     fail "$relative_gate: workflow jobs or names are malformed"
   fi
   if [ -n "$published_jobs" ]; then
@@ -239,6 +240,33 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "trailing newline in $manifest_identifier did not fail manifest validation"
     rm -r "$fixture"
   done
+
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  sed 's/^    name: source contract$/    name: source-contract/' \
+    "$fixture/$status_publisher" >"$fixture/status-publisher.next"
+  mv "$fixture/status-publisher.next" "$fixture/$status_publisher"
+  unnamed_workflow=".github/workflows/unnamed-duplicate.yml"
+  printf '%s\n' \
+    'name: unnamed duplicate' \
+    'on: pull_request' \
+    'jobs:' \
+    '  source-contract:' \
+    '    runs-on: ubuntu-latest' \
+    '    steps: []' >"$fixture/$unnamed_workflow"
+  jq --arg context source-contract --arg path "$unnamed_workflow" \
+    '.requiredStatusCheck = $context | .workflowPaths += [$path]' \
+    "$source_contract" >"$fixture/.touchstone-source-contract.json"
+  if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+    fail "source contract accepted an unnamed duplicate status publisher"
+  fi
+  if ! grep -Fq "duplicates required status 'source-contract'" "$fixture/self-test.out"; then
+    cat "$fixture/self-test.out" >&2
+    fail "unnamed duplicate did not fail for GitHub's effective job name"
+  fi
+  rm -r "$fixture"
 fi
 
 echo "workflow contract passed"
