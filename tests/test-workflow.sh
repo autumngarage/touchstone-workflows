@@ -96,9 +96,10 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
       sub(/:[[:space:]]*$/, "", job)
       next
     }
-    /^    name:[[:space:]]*/ {
+    /^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/ {
       value = $0
-      sub(/^    name:[[:space:]]*/, "", value)
+      sub(/^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/, "", value)
+      sub(/[[:space:]]+$/, "", value)
       if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
         value = substr(value, 2, length(value) - 2)
       } else if (value !~ /^[A-Za-z0-9][A-Za-z0-9 ._()\/-]*$/) {
@@ -130,23 +131,25 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  for status_spelling in "$required_status_check" "'$required_status_check'" "\"$required_status_check\""; do
-    fixture="$(mktemp -d)"
-    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
-    mkdir -p "$fixture/.github"
-    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
-    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
-    printf '%s\n' \
-      '  duplicate-source-contract:' \
-      "    name: $status_spelling" \
-      '    runs-on: ubuntu-latest' \
-      '    steps: []' >>"$fixture/$status_publisher"
-    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
-      fail "source contract accepted a duplicate status publisher under another job ID"
-    fi
-    grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
-      || fail "duplicate status publisher did not fail for the expected invariant"
-    rm -r "$fixture"
+  for status_key in name "'name'" '"name"'; do
+    for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\""; do
+      fixture="$(mktemp -d)"
+      trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+      mkdir -p "$fixture/.github"
+      cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+      cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+      printf '%s\n' \
+        '  duplicate-source-contract:' \
+        "    $status_key: $status_spelling" \
+        '    runs-on: ubuntu-latest' \
+        '    steps: []' >>"$fixture/$status_publisher"
+      if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+        fail "source contract accepted a duplicate status publisher under another job ID"
+      fi
+      grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+        || fail "duplicate status publisher did not fail for the expected invariant"
+      rm -r "$fixture"
+    done
   done
 fi
 
