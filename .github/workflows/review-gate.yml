@@ -45,8 +45,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="0d39544b3af9e84c01e81f7f727ff922999ac549"
-          evaluator_sha256="cb00377d74ca7e238b7d4e19d09eb4f2e5af45b9533733fd62442ba08b8a98aa"
+          touchstone_revision="e85157b8df4050f21b8c01140e579989a8ec00fa"
+          evaluator_sha256="079f5184c29c3acbd216f302cf9ba78d70caa2009a06bfbeb5211f833f890ff7"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
             -o "$RUNNER_TEMP/evaluate.jq"
@@ -71,7 +71,52 @@ jobs:
             *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
           esac
 
+          # touchstone:permission-collector:start
           api_array() { gh api --paginate "$1" | jq -s 'add // []' >"$2"; }
+
+          response_body() {
+            awk 'body { print; next } { line = $0; sub(/\r$/, "", line); if (line == "") body = 1 }' "$1"
+          }
+
+          collect_author_permissions() {
+            issue_comments="$1"
+            review_comments="$2"
+            output="$3"
+            printf '{}\n' >"$output"
+
+            jq -r -s '
+              ([.[0][]?
+                | select(
+                    ((.body // "") | test("^[[:space:]]*@codex[[:space:]]+review([[:space:]]|$)"; "i"))
+                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer id=[0-9]+[[:space:]]*-->")))
+                | .user.login // empty]
+               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty])
+              | unique[]
+            ' "$issue_comments" "$review_comments" |
+              while IFS= read -r login; do
+                response="$tmp/permission-response.json"
+                error="$tmp/permission-error.txt"
+                if gh api --include "repos/$REPO/collaborators/$login/permission" >"$response" 2>"$error"; then
+                  if ! permission="$(response_body "$response" | jq -er '.permission | select(type == "string" and length > 0)')"; then
+                    echo "ERROR: malformed effective permission response for '$login'." >&2
+                    return 1
+                  fi
+                else
+                  status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response")"
+                  if [ "$status" = 404 ]; then
+                    permission=none
+                  else
+                    echo "ERROR: cannot resolve effective repository permission for '$login' (HTTP ${status:-transport failure})." >&2
+                    cat "$error" >&2
+                    return 1
+                  fi
+                fi
+                jq --arg login "$login" --arg permission "$permission" \
+                  '. + {($login): $permission}' "$output" >"$output.next"
+                mv "$output.next" "$output"
+              done
+          }
+          # touchstone:permission-collector:end
 
           gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"
           head="$(jq -r '.head.sha' "$tmp/pr.json")"
@@ -89,6 +134,7 @@ jobs:
 
           api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
           api_array "repos/$REPO/pulls/$number/comments?per_page=100" "$tmp/review-comments.json"
+          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
           api_array "repos/$REPO/commits/$head/pulls?per_page=100" "$tmp/head-pulls.json"
           # shellcheck disable=SC2016
           gh api graphql --paginate \
@@ -125,10 +171,12 @@ jobs:
             --slurpfile pr "$tmp/pr.json" --slurpfile issueComments "$tmp/issues-resolved.json" \
             --slurpfile reviews "$tmp/reviews.json" --slurpfile reviewComments "$tmp/review-comments.json" \
             --slurpfile headPulls "$tmp/head-pulls.json" --slurpfile bases "$tmp/bases.json" \
+            --slurpfile authorPermissions "$tmp/author-permissions.json" \
             --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" --arg currentSince "$head_current_since" --arg retargetedAt "$base_retargeted_at" \
             '($pr[0]) as $pr | {
-              contractVersion: 2, complete: true,
+              contractVersion: 3, complete: true,
               trustedAuthors: ($trusted | split(",")),
+              authorPermissions: $authorPermissions[0],
               pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha, baseRef: $pr.base.ref, baseSha: $pr.base.sha,
                    acceptableBaseShas: $bases[0], headCurrentSince: $currentSince, baseRetargetedAt: $retargetedAt,
                    openHeadPulls: [$headPulls[0][] | select(.state == "open" and .base.repo.full_name == $repo and .head.sha == $pr.head.sha) | .number]},

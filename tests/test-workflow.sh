@@ -57,6 +57,100 @@ for gate in "$review_gate" "$delivery_evidence"; do
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
+echo "==> review-gate collects effective permission once per potential driver author"
+collector_fixture="$(mktemp -d)"
+trap 'rm -rf "$collector_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:permission-collector:start/ { copying = 1; next }
+  /touchstone:permission-collector:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$collector_fixture/collector.sh"
+# shellcheck source=/dev/null
+source "$collector_fixture/collector.sh"
+tmp="$collector_fixture/evidence"
+# Used by the sourced production collector.
+# shellcheck disable=SC2034
+REPO=example/project
+mkdir -p "$tmp"
+mock_calls="$collector_fixture/calls"
+: >"$mock_calls"
+
+gh() {
+  [ "$1" = api ] || return 99
+  case "$2" in
+    --paginate)
+      case "$3" in
+        *issues/*/comments*)
+          printf '%s\n' \
+            '[{"body":"@codex review","user":{"login":"admin"}},{"body":"ordinary discussion","user":{"login":"ignored"}}]' \
+            '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
+          ;;
+        *pulls/*/comments*)
+          printf '%s\n' \
+            '[{"in_reply_to_id":7,"user":{"login":"writer"}},{"in_reply_to_id":null,"user":{"login":"finding"}}]' \
+            '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
+          ;;
+        *) return 98 ;;
+      esac
+      ;;
+    --include)
+      login="${3%/permission}"
+      login="${login##*/}"
+      printf '%s\n' "$login" >>"$mock_calls"
+      case "$login" in
+        admin) permission="admin" ;;
+        writer) permission="write" ;;
+        maintainer) permission="maintain" ;;
+        outsider)
+          printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}\n'
+          echo 'gh: Not Found (HTTP 404)' >&2
+          return 1
+          ;;
+        denied)
+          printf 'HTTP/2.0 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{"message":"Forbidden"}\n'
+          echo 'gh: Forbidden (HTTP 403)' >&2
+          return 1
+          ;;
+        transport)
+          echo 'gh: connection reset' >&2
+          return 1
+          ;;
+        *) return 97 ;;
+      esac
+      printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n{"permission":"%s"}\n' "$permission"
+      ;;
+    *) return 96 ;;
+  esac
+}
+
+api_array 'repos/example/project/issues/1/comments?per_page=100' "$tmp/issues.json"
+api_array 'repos/example/project/pulls/1/comments?per_page=100' "$tmp/review-comments.json"
+collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
+jq -e '. == {admin:"admin", maintainer:"maintain", outsider:"none", writer:"write"}' \
+  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, or expected 404"
+for login in admin writer maintainer outsider; do
+  [ "$(grep -Fxc "$login" "$mock_calls")" -eq 1 ] || fail "$login permission was not looked up exactly once"
+done
+if grep -Eq '^(ignored|finding)$' "$mock_calls"; then
+  fail "ordinary discussion or a top-level finding triggered a permission lookup"
+fi
+
+printf '[{"body":"@codex review","user":{"login":"denied"}}]\n' >"$tmp/issues.json"
+printf '[]\n' >"$tmp/review-comments.json"
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
+  fail "an authorization failure did not fail permission collection closed"
+fi
+grep -Fq "HTTP 403" "$tmp/denied.err" || fail "authorization failure lost its HTTP context"
+
+printf '[{"body":"@codex review","user":{"login":"transport"}}]\n' >"$tmp/issues.json"
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
+  fail "a transport failure did not fail permission collection closed"
+fi
+grep -Fq "transport failure" "$tmp/transport.err" || fail "transport failure lost its diagnostic context"
+rm -rf "$collector_fixture"
+trap - EXIT HUP INT TERM
+echo "  OK: pagination, unique lookup, non-collaborators, and failures are explicit"
+
 # The repository policy requires one literal status context. Keep that name in
 # a machine-readable manifest so the policy engine can compare its desired rule
 # with its one publisher instead of relying on an ambiguous duplicate context.
