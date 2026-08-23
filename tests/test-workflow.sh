@@ -84,7 +84,9 @@ status_job="$(jq -er '.statusJob' "$source_contract")"
 status_publisher="$(jq -er '.statusPublisher' "$source_contract")"
 manifest_workflow_count="$(jq -r '.workflowPaths | length' "$source_contract")"
 repository_workflow_count=0
-for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml; do
+for gate in \
+  "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/*.yaml \
+  "$repo_root"/.github/workflows/.*.yml "$repo_root"/.github/workflows/.*.yaml; do
   [ -f "$gate" ] || continue
   repository_workflow_count=$((repository_workflow_count + 1))
   relative_gate="${gate#"$repo_root"/}"
@@ -169,6 +171,21 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   fi
   grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
     || fail "flow-style duplicate did not fail for the ownership invariant"
+  rm -r "$fixture"
+
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  hidden_workflow=".github/workflows/.duplicate.yml"
+  cp "$fixture/$status_publisher" "$fixture/$hidden_workflow"
+  jq --arg path "$hidden_workflow" '.workflowPaths += [$path]' \
+    "$source_contract" >"$fixture/.touchstone-source-contract.json"
+  if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+    fail "source contract accepted a dot-prefixed duplicate status publisher"
+  fi
+  grep -Fq "duplicates required status '$required_status_check'" "$fixture/self-test.out" \
+    || fail "dot-prefixed workflow did not fail for duplicate status ownership"
   rm -r "$fixture"
 fi
 
