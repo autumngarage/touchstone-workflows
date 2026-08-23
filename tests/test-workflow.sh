@@ -93,16 +93,18 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
     $0 == "jobs:" { in_jobs = 1; next }
     /^[[:space:]]*#/ { next }
     in_jobs && /^[^ ]/ { in_jobs = 0; job = "" }
-    in_jobs && /^  [^ ]+:[[:space:]]*[^#[:space:]]/ { exit 3 }
-    in_jobs && /^  [^ ]+:[[:space:]]*(#.*)?$/ {
+    in_jobs && /^  [^ #]/ && $0 !~ /^  [A-Za-z_][A-Za-z0-9_-]*:/ { exit 4 }
+    in_jobs && /^    [^ #]/ && $0 !~ /^    [A-Za-z_][A-Za-z0-9_-]*:/ { exit 4 }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*[^#[:space:]]/ { exit 3 }
+    in_jobs && /^  [A-Za-z_][A-Za-z0-9_-]*:[[:space:]]*(#.*)?$/ {
       job = $0
       sub(/^  /, "", job)
       sub(/:[[:space:]]*(#.*)?$/, "", job)
       next
     }
-    in_jobs && /^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/ {
+    in_jobs && /^    name:([[:space:]]+|$)/ {
       value = $0
-      sub(/^    (name|"name"|\047name\047)[[:space:]]*:[[:space:]]*/, "", value)
+      sub(/^    name:[[:space:]]*/, "", value)
       sub(/[[:space:]]+$/, "", value)
       if ((value ~ /^".*"$/) || (value ~ /^\047.*\047$/)) {
         value = substr(value, 2, length(value) - 2)
@@ -113,7 +115,7 @@ for gate in "$repo_root"/.github/workflows/*.yml "$repo_root"/.github/workflows/
       if (value == context) { print job }
     }
   ' "$gate")"; then
-    fail "$relative_gate: jobs must use block mappings and one-line literal names in the source contract character set"
+    fail "$relative_gate: jobs must use canonical block mappings, keys, and one-line literal names"
   fi
   if [ -n "$published_jobs" ]; then
     [ "$relative_gate" = "$status_publisher" ] \
@@ -135,7 +137,7 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  for status_key in name "'name'" '"name"'; do
+  for status_key in name "'name'" '"name"' '"na\u006de"'; do
     for status_spelling in "$required_status_check" "$required_status_check   " "'$required_status_check'" "\"$required_status_check\""; do
       fixture="$(mktemp -d)"
       trap 'rm -rf "$fixture"' EXIT HUP INT TERM
@@ -151,8 +153,13 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
         fail "source contract accepted a duplicate status publisher under another job ID"
       fi
-      grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
-        || fail "duplicate status publisher did not fail for the expected invariant"
+      if [ "$status_key" = name ]; then
+        grep -Fq "must be published only by job $status_job" "$fixture/self-test.out" \
+          || fail "canonical duplicate status publisher did not fail for ownership"
+      else
+        grep -Fq "jobs must use canonical block mappings" "$fixture/self-test.out" \
+          || fail "non-canonical name key did not fail validation"
+      fi
       rm -r "$fixture"
     done
   done
@@ -166,7 +173,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
     fail "source contract accepted a duplicate status publisher in a flow-style job mapping"
   fi
-  grep -Fq "jobs must use block mappings" "$fixture/self-test.out" \
+  grep -Fq "jobs must use canonical block mappings" "$fixture/self-test.out" \
     || fail "flow-style job mapping did not fail for the expected invariant"
   rm -r "$fixture"
 fi
