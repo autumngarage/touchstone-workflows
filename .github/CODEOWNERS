@@ -1,0 +1,4 @@
+# The status context protecting this repository is defined by these files.
+/.github/workflows/ @henrymodisett
+/.touchstone-source-contract.json @henrymodisett
+/tests/test-workflow.sh @henrymodisett

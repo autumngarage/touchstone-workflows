@@ -5,6 +5,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workflow="$repo_root/.github/workflows/validate.yml"
 review_gate="$repo_root/.github/workflows/review-gate.yml"
 delivery_evidence="$repo_root/.github/workflows/delivery-evidence.yml"
+source_contract="$repo_root/.touchstone-source-contract.json"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -65,5 +66,33 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
   grep -q "if: github.repository == 'autumngarage/touchstone-workflows'" "$gate" \
     || fail "$gate: no job runs on the workflow source, so its run concludes 'skipped' here"
 done
+
+# The repository policy requires one literal status context. Keep that name in
+# a machine-readable manifest so the policy engine can compare its desired rule
+# with the jobs that publish it instead of duplicating the name in prose.
+command -v jq >/dev/null 2>&1 || fail "jq is required to validate the source contract"
+jq -e '
+  .contractVersion == 1
+  and (.requiredStatusCheck | type == "string" and length > 0)
+  and (.workflowPaths | type == "array" and length > 0 and length == (unique | length))
+  and all(.workflowPaths[]; type == "string" and startswith(".github/workflows/") and endswith(".yml"))
+' "$source_contract" >/dev/null || fail "source contract manifest is malformed"
+required_status_check="$(jq -er '.requiredStatusCheck' "$source_contract")"
+manifest_workflow_count="$(jq -r '.workflowPaths | length' "$source_contract")"
+repository_workflow_count=0
+for gate in "$repo_root"/.github/workflows/*.yml; do
+  repository_workflow_count=$((repository_workflow_count + 1))
+  relative_gate="${gate#"$repo_root"/}"
+  jq -e --arg path "$relative_gate" '.workflowPaths | index($path) != null' "$source_contract" >/dev/null \
+    || fail "$relative_gate: workflow is absent from the source contract manifest"
+  awk -v context="$required_status_check" '
+    /^  source-contract:$/ { in_source_contract = 1; next }
+    in_source_contract && /^  [^ ]/ { in_source_contract = 0 }
+    in_source_contract && $0 == "    name: " context { found = 1 }
+    END { exit(found ? 0 : 1) }
+  ' "$gate" || fail "$relative_gate: source-contract job does not publish '$required_status_check'"
+done
+[ "$repository_workflow_count" -eq "$manifest_workflow_count" ] \
+  || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 echo "workflow contract passed"
