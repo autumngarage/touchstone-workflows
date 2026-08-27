@@ -106,7 +106,7 @@ assert_active_line "$workflow" \
   "printf 'TOUCHSTONE_ENGINE_PATH=%s\\n' \"\$validator\" >>\"\$GITHUB_ENV\"" \
   "source-contract validator handoff"
 
-if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ]; then
+if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   [ -f "$TOUCHSTONE_ENGINE_PATH" ] || fail "declared validation engine is missing: $TOUCHSTONE_ENGINE_PATH"
   if command -v sha256sum >/dev/null 2>&1; then
     actual_engine_sha256="$(sha256sum "$TOUCHSTONE_ENGINE_PATH" | awk '{print $1}')"
@@ -508,6 +508,18 @@ done
   || fail "source contract manifest names $manifest_workflow_count workflows, repository has $repository_workflow_count"
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  fixture="$(mktemp -d)"
+  trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+  mkdir -p "$fixture/.github"
+  cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+  cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+  if ! TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 \
+    TOUCHSTONE_ENGINE_PATH=/missing/recursive-engine bash "$0" >"$fixture/self-test.out" 2>&1; then
+    cat "$fixture/self-test.out" >&2
+    fail "recursive source-contract checks reran top-level validation-engine fixtures"
+  fi
+  rm -r "$fixture"
+
   expression_status="\${{ '$required_status_check' }}"
   for job_indent in '    ' '      '; do
     for status_key in name "'name'" '"name"' '"na\u006de"'; do
