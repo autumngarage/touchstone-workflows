@@ -1,5 +1,6 @@
 {
   "contractVersion": 1,
+  "gateBehaviorContractVersion": 1,
   "requiredStatusCheck": "source contract",
   "sourceRepository": "autumngarage/touchstone-workflows",
   "statusJob": "source-contract",

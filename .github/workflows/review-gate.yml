@@ -59,17 +59,75 @@ jobs:
           mkdir -p "$tmp"
 
           # Which pull request? A queue commit names it in its branch.
-          case "${GITHUB_EVENT_NAME}" in
-            pull_request)
-              number="$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")"
-              ;;
-            merge_group)
-              queue_ref="$(jq -r '.merge_group.head_ref' "$GITHUB_EVENT_PATH")"
-              number="$(printf '%s' "$queue_ref" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-fA-F]{40}$#\1#p')"
-              [ -n "$number" ] || { echo "ERROR: merge group ref '$queue_ref' names no pull request." >&2; exit 1; }
-              ;;
-            *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
-          esac
+          # touchstone:pr-coordinate:start
+          event_pull_request_coordinates() {
+            case "${GITHUB_EVENT_NAME}" in
+              pull_request)
+                jq -ec '
+                  {
+                    mode: "pull_request",
+                    number: .pull_request.number,
+                    headSha: .pull_request.head.sha,
+                    baseSha: .pull_request.base.sha,
+                    baseRef: .pull_request.base.ref
+                  }
+                  | select(
+                      (.number | type == "number" and floor == . and . >= 1)
+                      and (.headSha | type == "string" and test("^[0-9a-fA-F]{40}$"))
+                      and (.baseSha | type == "string" and test("^[0-9a-fA-F]{40}$"))
+                      and (.baseRef | type == "string" and length > 0)
+                    )
+                ' "$GITHUB_EVENT_PATH"
+                ;;
+              merge_group)
+                queue_ref="$(jq -r '.merge_group.head_ref' "$GITHUB_EVENT_PATH")"
+                number="$(printf '%s' "$queue_ref" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-fA-F]{40}$#\1#p')"
+                ref_base="$(printf '%s' "$queue_ref" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-[0-9]+-([0-9a-fA-F]{40})$#\1#p')"
+                head="$(jq -r '.merge_group.head_sha' "$GITHUB_EVENT_PATH")"
+                base="$(jq -r '.merge_group.base_sha' "$GITHUB_EVENT_PATH")"
+                [ -n "$number" ] || { echo "ERROR: merge group ref '$queue_ref' names no pull request." >&2; return 1; }
+                jq -en --argjson number "$number" --arg head "$head" --arg base "$base" --arg refBase "$ref_base" '
+                  {
+                    mode: "merge_group",
+                    number: $number,
+                    headSha: $head,
+                    baseSha: $base,
+                    baseRef: ""
+                  }
+                  | select(
+                      (.headSha | test("^[0-9a-fA-F]{40}$"))
+                      and (.baseSha | test("^[0-9a-fA-F]{40}$"))
+                      and .baseSha == $refBase
+                    )
+                '
+                ;;
+              *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; return 1 ;;
+            esac
+          }
+
+          fetch_pull_request() {
+            mode="$1"
+            requested_number="$2"
+            expected_head="$3"
+            expected_base_ref="$4"
+            output="$5"
+            gh api "repos/$REPO/pulls/$requested_number" >"$output"
+            jq -e --arg mode "$mode" --argjson requested "$requested_number" --arg head "$expected_head" --arg baseRef "$expected_base_ref" '
+              .number == $requested
+              and (.head.sha | type == "string" and test("^[0-9a-fA-F]{40}$"))
+              and (.base.sha | type == "string" and test("^[0-9a-fA-F]{40}$"))
+              and ($mode != "pull_request" or (.head.sha == $head and .base.ref == $baseRef))
+            ' "$output" >/dev/null || {
+              echo "ERROR: pull request coordinates do not match event PR $requested_number." >&2
+              return 1
+            }
+          }
+          # touchstone:pr-coordinate:end
+          event_pull_request_coordinates >"$tmp/event-pr.json"
+          event_mode="$(jq -r .mode "$tmp/event-pr.json")"
+          number="$(jq -r .number "$tmp/event-pr.json")"
+          event_head="$(jq -r .headSha "$tmp/event-pr.json")"
+          event_base_ref="$(jq -r .baseRef "$tmp/event-pr.json")"
 
           # touchstone:permission-collector:start
           api_array() { gh api --paginate "$1" | jq -s 'add // []' >"$2"; }
@@ -118,7 +176,7 @@ jobs:
           }
           # touchstone:permission-collector:end
 
-          gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"
+          fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"
           head="$(jq -r '.head.sha' "$tmp/pr.json")"
           base="$(jq -r '.base.sha' "$tmp/pr.json")"
           # When did this SHA last become the head? Its commit date, or the

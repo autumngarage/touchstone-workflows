@@ -19,6 +19,14 @@ assert_count() {
   [ "$actual" -eq "$expected" ] || fail "expected $expected match(es) for $pattern, found $actual"
 }
 
+assert_active_line() {
+  file="$1"
+  expected="$2"
+  label="$3"
+  actual="$(sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$file" | grep -Fxc -- "$expected" || true)"
+  [ "$actual" -eq 1 ] || fail "$file: $label must be one active command"
+}
+
 assert_count 1 'name: validate \(ubuntu-latest\)'
 assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
@@ -56,6 +64,179 @@ for gate in "$review_gate" "$delivery_evidence"; do
   if grep -Eq 'uses: actions/checkout' "$gate" && ! grep -q "github.repository == 'autumngarage/touchstone-workflows'" "$gate"; then fail "$gate: checks out target code"; fi
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
+
+# Behavior v1 binds each immutable fetch to the variable it pins and to an
+# executed checksum command. Retaining those strings in comments or unused
+# assignments is not evidence that the workflow enforces them.
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$workflow" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \' \
+  "validator fetch"
+assert_active_line "$workflow" \
+  "printf '%s  %s\\n' \"\$touchstone_sha256\" \"\$validator\" | sha256sum --check --strict" \
+  "validator checksum"
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$review_gate" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \' \
+  "review evaluator fetch"
+# shellcheck disable=SC2016
+assert_active_line "$review_gate" \
+  'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict' \
+  "review evaluator checksum"
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$delivery_evidence" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
+  "delivery evaluator fetch"
+# shellcheck disable=SC2016
+assert_active_line "$delivery_evidence" \
+  'echo "${evaluator_sha256}  $RUNNER_TEMP/check-delivery-evidence.sh" | sha256sum --check --strict' \
+  "delivery evaluator checksum"
+# shellcheck disable=SC2016
+assert_active_line "$review_gate" \
+  'fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"' \
+  "production coordinate validation"
+
+echo "==> behavior-v1 workflows use root PR/queue triggers and read-only permissions"
+for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
+  ruby -rpsych -e '
+    pairs = lambda do |node, label|
+      raise "#{label} must be a mapping" unless node.is_a?(Psych::Nodes::Mapping)
+      node.children.each_slice(2).to_a
+    end
+    scalar = lambda do |node, label|
+      raise "#{label} must be a scalar" unless node.is_a?(Psych::Nodes::Scalar)
+      node.value
+    end
+    one = lambda do |entries, name, label|
+      matches = entries.select { |key, _| scalar.call(key, label) == name }
+      raise "#{label} must declare #{name} exactly once" unless matches.length == 1
+      matches.first.fetch(1)
+    end
+
+    root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
+    triggers = pairs.call(one.call(root, "on", "workflow"), "on")
+    pull_request = one.call(triggers, "pull_request", "on")
+    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty? && pull_request.plain
+      fields = pairs.call(pull_request, "pull_request")
+      raise "pull_request must declare only types" unless fields.length == 1
+      types = one.call(fields, "types", "pull_request")
+      raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
+      actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
+      required = %w[edited opened ready_for_review reopened synchronize]
+      raise "pull_request types must cover #{required.join(", ")}" unless actual == required
+    end
+
+    merge_group = pairs.call(one.call(triggers, "merge_group", "on"), "merge_group")
+    raise "merge_group must declare only types" unless merge_group.length == 1
+    merge_types = one.call(merge_group, "types", "merge_group")
+    raise "merge_group types must be a sequence" unless merge_types.is_a?(Psych::Nodes::Sequence)
+    actual_merge_types = merge_types.children.map { |node| scalar.call(node, "merge_group type") }
+    raise "merge_group types must be checks_requested" unless actual_merge_types == ["checks_requested"]
+
+    permissions = pairs.call(one.call(root, "permissions", "workflow"), "permissions")
+    raise "permissions must not be empty" if permissions.empty?
+    declared_permissions = []
+    permissions.each do |key, value|
+      name = scalar.call(key, "permission name")
+      level = scalar.call(value, "permission #{name}")
+      raise "permission #{name} must be read-only" unless level == "read"
+      declared_permissions << name
+    end
+    required_permissions = case File.basename(ARGV.fetch(0))
+      when "review-gate.yml" then %w[contents issues pull-requests]
+      when "delivery-evidence.yml" then %w[contents pull-requests]
+      when "validate.yml" then %w[contents]
+      else raise "unexpected behavior-v1 workflow"
+    end
+    missing_permissions = required_permissions - declared_permissions
+    raise "missing read permissions: #{missing_permissions.join(", ")}" unless missing_permissions.empty?
+
+    jobs = pairs.call(one.call(root, "jobs", "workflow"), "jobs")
+    jobs.each do |job_key, configuration|
+      job = scalar.call(job_key, "job ID")
+      fields = pairs.call(configuration, "job #{job}")
+      if fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
+        raise "job #{job} must not override permissions"
+      end
+    end
+  ' "$gate" || fail "$gate: violates behavior-v1 trigger or permission invariants"
+done
+echo "  OK: triggers and effective permissions are structurally bound"
+
+echo "==> review-gate binds evidence to event PR coordinates"
+coordinate_fixture="$(mktemp -d)"
+trap 'rm -rf "$coordinate_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:pr-coordinate:start/ { copying = 1; next }
+  /touchstone:pr-coordinate:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$coordinate_fixture/coordinate.sh"
+# shellcheck source=/dev/null
+source "$coordinate_fixture/coordinate.sh"
+REPO=example/project
+GITHUB_EVENT_PATH="$coordinate_fixture/event.json"
+requested_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+requested_base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jq -n --arg head "$requested_head" --arg base "$requested_base" \
+  '{pull_request:{number:17,head:{sha:$head},base:{sha:$base,ref:"main"}}}' >"$GITHUB_EVENT_PATH"
+# Referenced by the sourced production function.
+# shellcheck disable=SC2034
+GITHUB_EVENT_NAME=pull_request
+event_pull_request_coordinates >"$coordinate_fixture/coordinates.json"
+jq -e --arg head "$requested_head" --arg base "$requested_base" \
+  '. == {mode:"pull_request",number:17,headSha:$head,baseSha:$base,baseRef:"main"}' "$coordinate_fixture/coordinates.json" >/dev/null \
+  || fail "pull_request event selected the wrong coordinates"
+queue_head=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+jq -n --arg head "$queue_head" --arg base "$requested_base" \
+  '{merge_group:{head_ref:("refs/heads/gh-readonly-queue/main/pr-23-" + $base),head_sha:$head,base_sha:$base}}' >"$GITHUB_EVENT_PATH"
+# Referenced by the sourced production function.
+# shellcheck disable=SC2034
+GITHUB_EVENT_NAME=merge_group
+event_pull_request_coordinates >"$coordinate_fixture/coordinates.json"
+jq -e --arg head "$queue_head" --arg base "$requested_base" \
+  '. == {mode:"merge_group",number:23,headSha:$head,baseSha:$base,baseRef:""}' "$coordinate_fixture/coordinates.json" >/dev/null \
+  || fail "merge_group event selected the wrong coordinates"
+jq -n --arg head "$queue_head" --arg base "$requested_base" \
+  '{merge_group:{head_ref:("refs/heads/gh-readonly-queue/main/pr-23-" + $head),head_sha:$head,base_sha:$base}}' >"$GITHUB_EVENT_PATH"
+if event_pull_request_coordinates >/dev/null 2>&1; then
+  fail "merge_group event accepted a queue ref not bound to its base"
+fi
+
+# Called by the sourced production function.
+# shellcheck disable=SC2329
+gh() {
+  [ "$1" = api ] || return 99
+  jq -n --argjson number "${GH_FIXTURE_NUMBER:-17}" \
+    --arg head "${GH_FIXTURE_HEAD:-$requested_head}" --arg base "${GH_FIXTURE_BASE:-$requested_base}" \
+    --arg baseRef "${GH_FIXTURE_BASE_REF:-main}" \
+    '{number:$number,head:{sha:$head},base:{sha:$base,ref:$baseRef}}'
+}
+fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
+  || fail "matching PR coordinates were rejected"
+for mismatch in number head base-ref; do
+  unset GH_FIXTURE_NUMBER GH_FIXTURE_HEAD GH_FIXTURE_BASE GH_FIXTURE_BASE_REF
+  case "$mismatch" in
+    number) GH_FIXTURE_NUMBER=18 ;;
+    head) GH_FIXTURE_HEAD=cccccccccccccccccccccccccccccccccccccccc ;;
+    base-ref) GH_FIXTURE_BASE_REF=release ;;
+  esac
+  if fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" >/dev/null 2>&1; then
+    fail "review gate accepted mismatched $mismatch coordinates"
+  fi
+done
+unset GH_FIXTURE_NUMBER GH_FIXTURE_HEAD GH_FIXTURE_BASE GH_FIXTURE_BASE_REF
+GH_FIXTURE_BASE=dddddddddddddddddddddddddddddddddddddddd
+fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
+  || fail "pull-request event rejected an advanced base SHA on the same ref"
+unset GH_FIXTURE_BASE
+GH_FIXTURE_HEAD=cccccccccccccccccccccccccccccccccccccccc
+GH_FIXTURE_BASE=dddddddddddddddddddddddddddddddddddddddd
+fetch_pull_request merge_group 17 "$queue_head" "" "$coordinate_fixture/pr.json" \
+  || fail "merge-group event mistook queue coordinates for PR head/base"
+unset GH_FIXTURE_HEAD GH_FIXTURE_BASE
+rm -rf "$coordinate_fixture"
+trap - EXIT HUP INT TERM
+echo "  OK: PR head/ref and queue coordinates fail closed without freezing an advancing base SHA"
 
 echo "==> review-gate collects effective permission once per potential driver author"
 collector_fixture="$(mktemp -d)"
@@ -159,6 +340,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
+  and .gateBehaviorContractVersion == 1
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -332,6 +514,98 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fi
     grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
       || fail "trailing newline in $manifest_identifier did not fail manifest validation"
+    rm -r "$fixture"
+  done
+
+  for invalid_behavior_version in null '"1"' 2; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    jq --argjson version "$invalid_behavior_version" \
+      '.gateBehaviorContractVersion = $version' \
+      "$source_contract" >"$fixture/.touchstone-source-contract.json"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted gate behavior contract version $invalid_behavior_version"
+    fi
+    grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
+      || fail "invalid gate behavior contract version did not fail manifest validation"
+    rm -r "$fixture"
+  done
+
+  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    case "$validation_mutation" in
+      missing-pull-request)
+        sed '/^  pull_request:$/d' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      quoted-empty-pr)
+        sed 's/^  pull_request:$/  pull_request: ""/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      pr-closed)
+        sed 's/^  pull_request:$/  pull_request:\
+    types: [closed]/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      pr-filtered)
+        sed 's/^  pull_request:$/  pull_request:\
+    branches: [release]/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      merge-group-destroyed)
+        sed 's/types: \[checks_requested\]/types: [destroyed]/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      quoted-write)
+        sed 's/^  contents: read$/  contents: "write"/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      job-write-all)
+        sed '/^    runs-on:/i\
+    permissions: write-all' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+    esac
+    mv "$fixture/validate.next" "$fixture/$status_publisher"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted validation mutation $validation_mutation"
+    fi
+    rm -r "$fixture"
+  done
+
+  for behavior_mutation in commented-checksum moving-evaluator-ref bypass-coordinate-validation missing-review-scope missing-delivery-scope; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    mutation_workflow="$fixture/.github/workflows/review-gate.yml"
+    case "$behavior_mutation" in
+      commented-checksum)
+        awk '$0 == "          echo \"${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq\" | sha256sum --check --strict" { print "          : # checksum disabled"; next } { print }' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+      moving-evaluator-ref)
+        # shellcheck disable=SC2016
+        sed 's#/${touchstone_revision}/.github/review-gate/#/main/.github/review-gate/#' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+      bypass-coordinate-validation)
+        # shellcheck disable=SC2016
+        sed 's#^          fetch_pull_request .*#          gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"#' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+      missing-review-scope)
+        sed '/^  issues: read$/d' "$mutation_workflow" >"$fixture/review-gate.next"
+        ;;
+      missing-delivery-scope)
+        mutation_workflow="$fixture/.github/workflows/delivery-evidence.yml"
+        sed '/^  pull-requests: read$/d' "$mutation_workflow" >"$fixture/review-gate.next"
+        ;;
+    esac
+    mv "$fixture/review-gate.next" "$mutation_workflow"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted behavior mutation $behavior_mutation"
+    fi
     rm -r "$fixture"
   done
 
