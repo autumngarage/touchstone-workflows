@@ -159,6 +159,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
+  and .gateBehaviorContractVersion == 1
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -332,6 +333,22 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fi
     grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
       || fail "trailing newline in $manifest_identifier did not fail manifest validation"
+    rm -r "$fixture"
+  done
+
+  for invalid_behavior_version in null '"1"' 2; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    jq --argjson version "$invalid_behavior_version" \
+      '.gateBehaviorContractVersion = $version' \
+      "$source_contract" >"$fixture/.touchstone-source-contract.json"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted gate behavior contract version $invalid_behavior_version"
+    fi
+    grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
+      || fail "invalid gate behavior contract version did not fail manifest validation"
     rm -r "$fixture"
   done
 
