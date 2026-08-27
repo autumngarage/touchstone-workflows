@@ -47,7 +47,9 @@ jobs:
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
       REVIEW_REQUEST_WAIT_SECONDS: 120
       REVIEW_EVIDENCE_WAIT_SECONDS: 3600
-      REVIEW_POLL_SECONDS: 60
+      # Scale boundary: 3 concurrent PRs * 20 polls/hour * a conservative
+      # 12 REST requests/evaluation = 720 of the token's 1,000 requests/hour.
+      REVIEW_POLL_SECONDS: 180
     steps:
       - name: Fetch pinned evaluator
         run: |

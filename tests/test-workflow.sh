@@ -175,7 +175,7 @@ assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
   "review evidence wait bound"
 assert_active_line "$review_gate" \
-  'REVIEW_POLL_SECONDS: 60' \
+  'REVIEW_POLL_SECONDS: 180' \
   "review poll interval"
 assert_active_line "$review_gate" \
   'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
@@ -263,6 +263,17 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
   ' "$gate" || fail "$gate: violates behavior-v2 trigger or permission invariants"
 done
 echo "  OK: triggers and effective permissions are structurally bound"
+
+echo "==> review polling preserves repository API headroom at concurrent scale"
+production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+standard_hourly_budget=1000
+reserved_budget=$((standard_hourly_budget / 5))
+concurrent_waiting_prs=3
+requests_per_evaluation=12
+projected_requests=$((concurrent_waiting_prs * (3600 / production_poll_seconds) * requests_per_evaluation))
+[ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
+  || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
+echo "  OK: $projected_requests requests/hour leaves $((standard_hourly_budget - projected_requests)) for unrelated work"
 
 echo "==> review-gate waits only for pull-request evidence states"
 wait_fixture="$(mktemp -d)"
