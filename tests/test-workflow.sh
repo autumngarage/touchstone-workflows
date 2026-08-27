@@ -77,7 +77,7 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
     root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
     triggers = pairs.call(one.call(root, "on", "workflow"), "on")
     pull_request = one.call(triggers, "pull_request", "on")
-    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty?
+    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty? && pull_request.plain
       fields = pairs.call(pull_request, "pull_request")
       raise "pull_request must declare only types" unless fields.length == 1
       types = one.call(fields, "types", "pull_request")
@@ -484,7 +484,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for validation_mutation in missing-pull-request pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
+  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -493,6 +493,9 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     case "$validation_mutation" in
       missing-pull-request)
         sed '/^  pull_request:$/d' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      quoted-empty-pr)
+        sed 's/^  pull_request:$/  pull_request: ""/' "$fixture/$status_publisher" >"$fixture/validate.next"
         ;;
       pr-closed)
         sed 's/^  pull_request:$/  pull_request:\
