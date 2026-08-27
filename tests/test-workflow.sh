@@ -57,6 +57,122 @@ for gate in "$review_gate" "$delivery_evidence"; do
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
+echo "==> behavior-v1 workflows use root PR/queue triggers and read-only permissions"
+for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
+  ruby -rpsych -e '
+    pairs = lambda do |node, label|
+      raise "#{label} must be a mapping" unless node.is_a?(Psych::Nodes::Mapping)
+      node.children.each_slice(2).to_a
+    end
+    scalar = lambda do |node, label|
+      raise "#{label} must be a scalar" unless node.is_a?(Psych::Nodes::Scalar)
+      node.value
+    end
+    one = lambda do |entries, name, label|
+      matches = entries.select { |key, _| scalar.call(key, label) == name }
+      raise "#{label} must declare #{name} exactly once" unless matches.length == 1
+      matches.first.fetch(1)
+    end
+
+    root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
+    triggers = pairs.call(one.call(root, "on", "workflow"), "on")
+    %w[pull_request merge_group].each { |event| one.call(triggers, event, "on") }
+
+    permissions = pairs.call(one.call(root, "permissions", "workflow"), "permissions")
+    raise "permissions must not be empty" if permissions.empty?
+    permissions.each do |key, value|
+      name = scalar.call(key, "permission name")
+      level = scalar.call(value, "permission #{name}")
+      raise "permission #{name} must be read-only" unless level == "read"
+    end
+
+    jobs = pairs.call(one.call(root, "jobs", "workflow"), "jobs")
+    jobs.each do |job_key, configuration|
+      job = scalar.call(job_key, "job ID")
+      fields = pairs.call(configuration, "job #{job}")
+      if fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
+        raise "job #{job} must not override permissions"
+      end
+    end
+  ' "$gate" || fail "$gate: violates behavior-v1 trigger or permission invariants"
+done
+echo "  OK: triggers and effective permissions are structurally bound"
+
+echo "==> review-gate binds evidence to event PR coordinates"
+coordinate_fixture="$(mktemp -d)"
+trap 'rm -rf "$coordinate_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:pr-coordinate:start/ { copying = 1; next }
+  /touchstone:pr-coordinate:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$coordinate_fixture/coordinate.sh"
+# shellcheck source=/dev/null
+source "$coordinate_fixture/coordinate.sh"
+REPO=example/project
+GITHUB_EVENT_PATH="$coordinate_fixture/event.json"
+requested_head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+requested_base=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+jq -n --arg head "$requested_head" --arg base "$requested_base" \
+  '{pull_request:{number:17,head:{sha:$head},base:{sha:$base,ref:"main"}}}' >"$GITHUB_EVENT_PATH"
+# Referenced by the sourced production function.
+# shellcheck disable=SC2034
+GITHUB_EVENT_NAME=pull_request
+event_pull_request_coordinates >"$coordinate_fixture/coordinates.json"
+jq -e --arg head "$requested_head" --arg base "$requested_base" \
+  '. == {mode:"pull_request",number:17,headSha:$head,baseSha:$base,baseRef:"main"}' "$coordinate_fixture/coordinates.json" >/dev/null \
+  || fail "pull_request event selected the wrong coordinates"
+queue_head=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+jq -n --arg head "$queue_head" --arg base "$requested_base" \
+  '{merge_group:{head_ref:("refs/heads/gh-readonly-queue/main/pr-23-" + $base),head_sha:$head,base_sha:$base}}' >"$GITHUB_EVENT_PATH"
+# Referenced by the sourced production function.
+# shellcheck disable=SC2034
+GITHUB_EVENT_NAME=merge_group
+event_pull_request_coordinates >"$coordinate_fixture/coordinates.json"
+jq -e --arg head "$queue_head" --arg base "$requested_base" \
+  '. == {mode:"merge_group",number:23,headSha:$head,baseSha:$base,baseRef:""}' "$coordinate_fixture/coordinates.json" >/dev/null \
+  || fail "merge_group event selected the wrong coordinates"
+jq -n --arg head "$queue_head" --arg base "$requested_base" \
+  '{merge_group:{head_ref:("refs/heads/gh-readonly-queue/main/pr-23-" + $head),head_sha:$head,base_sha:$base}}' >"$GITHUB_EVENT_PATH"
+if event_pull_request_coordinates >/dev/null 2>&1; then
+  fail "merge_group event accepted a queue ref not bound to its base"
+fi
+
+# Called by the sourced production function.
+# shellcheck disable=SC2329
+gh() {
+  [ "$1" = api ] || return 99
+  jq -n --argjson number "${GH_FIXTURE_NUMBER:-17}" \
+    --arg head "${GH_FIXTURE_HEAD:-$requested_head}" --arg base "${GH_FIXTURE_BASE:-$requested_base}" \
+    --arg baseRef "${GH_FIXTURE_BASE_REF:-main}" \
+    '{number:$number,head:{sha:$head},base:{sha:$base,ref:$baseRef}}'
+}
+fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
+  || fail "matching PR coordinates were rejected"
+for mismatch in number head base-ref; do
+  unset GH_FIXTURE_NUMBER GH_FIXTURE_HEAD GH_FIXTURE_BASE GH_FIXTURE_BASE_REF
+  case "$mismatch" in
+    number) GH_FIXTURE_NUMBER=18 ;;
+    head) GH_FIXTURE_HEAD=cccccccccccccccccccccccccccccccccccccccc ;;
+    base-ref) GH_FIXTURE_BASE_REF=release ;;
+  esac
+  if fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" >/dev/null 2>&1; then
+    fail "review gate accepted mismatched $mismatch coordinates"
+  fi
+done
+unset GH_FIXTURE_NUMBER GH_FIXTURE_HEAD GH_FIXTURE_BASE GH_FIXTURE_BASE_REF
+GH_FIXTURE_BASE=dddddddddddddddddddddddddddddddddddddddd
+fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
+  || fail "pull-request event rejected an advanced base SHA on the same ref"
+unset GH_FIXTURE_BASE
+GH_FIXTURE_HEAD=cccccccccccccccccccccccccccccccccccccccc
+GH_FIXTURE_BASE=dddddddddddddddddddddddddddddddddddddddd
+fetch_pull_request merge_group 17 "$queue_head" "" "$coordinate_fixture/pr.json" \
+  || fail "merge-group event mistook queue coordinates for PR head/base"
+unset GH_FIXTURE_HEAD GH_FIXTURE_BASE
+rm -rf "$coordinate_fixture"
+trap - EXIT HUP INT TERM
+echo "  OK: PR head/ref and queue coordinates fail closed without freezing an advancing base SHA"
+
 echo "==> review-gate collects effective permission once per potential driver author"
 collector_fixture="$(mktemp -d)"
 trap 'rm -rf "$collector_fixture"' EXIT HUP INT TERM
@@ -349,6 +465,31 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fi
     grep -Fq "source contract manifest is malformed" "$fixture/self-test.out" \
       || fail "invalid gate behavior contract version did not fail manifest validation"
+    rm -r "$fixture"
+  done
+
+  for validation_mutation in missing-pull-request quoted-write job-write-all; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    case "$validation_mutation" in
+      missing-pull-request)
+        sed '/^  pull_request:$/d' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      quoted-write)
+        sed 's/^  contents: read$/  contents: "write"/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      job-write-all)
+        sed '/^    runs-on:/i\
+    permissions: write-all' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+    esac
+    mv "$fixture/validate.next" "$fixture/$status_publisher"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted validation mutation $validation_mutation"
+    fi
     rm -r "$fixture"
   done
 

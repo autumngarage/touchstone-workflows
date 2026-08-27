@@ -21,7 +21,9 @@ required-check name. Its `gateBehaviorContractVersion` declares the behavior
 contract implemented by the pinned workflows. Version 1 means that validation,
 review evidence, and delivery evidence are checksum-pinned, read-only required
 workflows that run for pull requests and merge groups; the review gate binds
-trusted review and answered findings to the exact pull-request coordinates.
+trusted review and answered findings to the PR-event number, head, and base
+ref (the base SHA may advance by ancestry), while a merge-group run binds the
+queue commit and base to the PR number in its ref.
 `tests/test-workflow.sh` refuses missing, extra, nested, or duplicate workflow
 declarations, verifies that only the declared publisher owns the status, and
 guards those version-1 behavior invariants.
