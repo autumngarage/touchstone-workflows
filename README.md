@@ -29,10 +29,12 @@ groups; the review gate binds
 trusted review and answered findings to the PR-event number, head, and base
 ref (the base SHA may advance by ancestry), while a merge-group run binds the
 queue commit and base to the PR number in its ref. Pull-request review gates
-poll only evaluator-declared waiting states until their bounded deadline. The
-three-minute cadence budgets for three concurrent waiting pull requests at a
-conservative 12 REST calls per evaluation, leaving more than 20% of the
-standard repository token's hourly API budget for unrelated work. Terminal
+poll only evaluator-declared waiting states until their bounded deadline.
+Every REST path, including pagination and per-record evidence lookups, crosses
+an enforced 20-request evaluation limit. The five-minute cadence budgets for
+three concurrent waiting pull requests at that limit (720 requests/hour),
+leaving more than 20% of the standard repository token's hourly API budget for
+unrelated work. Evidence that exceeds the limit fails closed. Terminal
 failures and merge-group runs remain immediate.
 `tests/test-workflow.sh` refuses missing, extra, nested, or duplicate workflow
 declarations, verifies that only the declared publisher owns the status,

@@ -175,7 +175,10 @@ assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
   "review evidence wait bound"
 assert_active_line "$review_gate" \
-  'REVIEW_POLL_SECONDS: 180' \
+  'REST_REQUEST_LIMIT: 20' \
+  "review REST request bound"
+assert_active_line "$review_gate" \
+  'REVIEW_POLL_SECONDS: 300' \
   "review poll interval"
 assert_active_line "$review_gate" \
   'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
@@ -266,14 +269,43 @@ echo "  OK: triggers and effective permissions are structurally bound"
 
 echo "==> review polling preserves repository API headroom at concurrent scale"
 production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+production_request_limit="$(sed -n 's/^[[:space:]]*REST_REQUEST_LIMIT: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 standard_hourly_budget=1000
 reserved_budget=$((standard_hourly_budget / 5))
 concurrent_waiting_prs=3
-requests_per_evaluation=12
-projected_requests=$((concurrent_waiting_prs * (3600 / production_poll_seconds) * requests_per_evaluation))
+projected_requests=$((concurrent_waiting_prs * (3600 / production_poll_seconds) * production_request_limit))
 [ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
   || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
-echo "  OK: $projected_requests requests/hour leaves $((standard_hourly_budget - projected_requests)) for unrelated work"
+direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'gh api "\$@"' | grep -v 'gh api graphql' || true)"
+[ -z "$direct_rest_calls" ] \
+  || fail "review evidence bypasses the enforced REST request boundary: $direct_rest_calls"
+
+budget_fixture="$(mktemp -d)"
+awk '
+  /touchstone:permission-collector:start/ { copying = 1; next }
+  /touchstone:permission-collector:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$budget_fixture/budget.sh"
+# shellcheck source=/dev/null
+source "$budget_fixture/budget.sh"
+tmp="$budget_fixture/evidence"
+mkdir -p "$tmp"
+printf '0\n' >"$tmp/rest-request-count"
+REST_REQUEST_LIMIT=2
+budget_calls="$budget_fixture/calls"
+: >"$budget_calls"
+gh() { printf '%s\n' "$*" >>"$budget_calls"; printf '{}\n'; }
+rest_api first >/dev/null || fail "REST budget rejected its first request"
+rest_api second >/dev/null || fail "REST budget rejected its boundary request"
+if rest_api third >/dev/null 2>&1; then
+  fail "REST budget allowed a request beyond its enforced limit"
+fi
+[ -f "$tmp/rest-budget-exhausted" ] \
+  || fail "REST budget exhaustion did not leave a fail-closed signal for optional evidence lookups"
+[ "$(wc -l <"$budget_calls" | tr -d ' ')" -eq 2 ] \
+  || fail "REST budget invoked gh after reaching its enforced limit"
+rm -rf "$budget_fixture"
+echo "  OK: enforced $production_request_limit-request evaluations consume at most $projected_requests requests/hour and leave $((standard_hourly_budget - projected_requests)) for unrelated work"
 
 echo "==> review-gate waits only for pull-request evidence states"
 wait_fixture="$(mktemp -d)"
@@ -302,7 +334,7 @@ run_wait_case() {
   event_mode="$event"
   REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
   REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
-  REVIEW_POLL_SECONDS=60
+  REVIEW_POLL_SECONDS="${8:-60}"
 
   evaluate_once() {
     index="$WAIT_CALLS"
@@ -327,8 +359,9 @@ run_wait_case() {
 run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
 run_wait_case "terminal-failure" "failure" pull_request failure 1
 run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
-run_wait_case "request-deadline" "waiting-request" pull_request failure 3
-run_wait_case "review-deadline" "waiting-review" pull_request failure 3
+run_wait_case "request-deadline" "waiting-request" pull_request failure 2
+run_wait_case "review-deadline" "waiting-review" pull_request failure 2
+run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request failure 1 120 120 180
 run_wait_case "unknown-state" "unknown" pull_request failure 1
 rm -rf "$wait_fixture"
 
@@ -380,6 +413,7 @@ gh() {
     --arg baseRef "${GH_FIXTURE_BASE_REF:-main}" \
     '{number:$number,head:{sha:$head},base:{sha:$base,ref:$baseRef}}'
 }
+rest_api() { gh api "$@"; }
 fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
   || fail "matching PR coordinates were rejected"
 for mismatch in number head base-ref; do
@@ -422,26 +456,27 @@ tmp="$collector_fixture/evidence"
 # shellcheck disable=SC2034
 REPO=example/project
 mkdir -p "$tmp"
+REST_REQUEST_LIMIT=20
+printf '0\n' >"$tmp/rest-request-count"
 mock_calls="$collector_fixture/calls"
 : >"$mock_calls"
 
 gh() {
   [ "$1" = api ] || return 99
   case "$2" in
-    --paginate)
-      case "$3" in
-        *issues/*/comments*)
-          printf '%s\n' \
-            '[{"body":"@codex review","user":{"login":"admin"}},{"body":"ordinary discussion","user":{"login":"ignored"}}]' \
-            '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
-          ;;
-        *pulls/*/comments*)
-          printf '%s\n' \
-            '[{"in_reply_to_id":7,"user":{"login":"writer"}},{"in_reply_to_id":null,"user":{"login":"finding"}}]' \
-            '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
-          ;;
-        *) return 98 ;;
-      esac
+    *issues/*/comments*page=1)
+      jq -cn '[range(0;98) | {body:"ordinary discussion",user:{login:"ignored"}}]
+        + [{body:"@codex review",user:{login:"admin"}},{body:"ordinary discussion",user:{login:"ignored"}}]'
+      ;;
+    *issues/*/comments*page=2)
+      printf '%s\n' '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
+      ;;
+    *pulls/*/comments*page=1)
+      jq -cn '[range(0;98) | {in_reply_to_id:null,user:{login:"finding"}}]
+        + [{in_reply_to_id:7,user:{login:"writer"}},{in_reply_to_id:null,user:{login:"finding"}}]'
+      ;;
+    *pulls/*/comments*page=2)
+      printf '%s\n' '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
       ;;
     --include)
       login="${3%/permission}"
