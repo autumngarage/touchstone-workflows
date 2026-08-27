@@ -17,7 +17,11 @@ copy the validator or own the authoritative workflow.
 `.touchstone-source-contract.json` is the versioned boundary between this
 repository and Touchstone's source policy. It names every top-level workflow,
 the workflow and job that publish the `source contract` status, and the exact
-required-check name. Its `gateBehaviorContractVersion` declares the behavior
+required-check name. Its `validationEngine` declaration binds the consumer
+workflow's Touchstone repository, path, revision, checksum, and supported
+project schemas; the source-contract job executes schema-1 and schema-2
+fixtures with those exact bytes before an engine-pin change can land. Its
+`gateBehaviorContractVersion` declares the behavior
 contract implemented by the pinned workflows. Version 1 means that validation,
 review evidence, and delivery evidence are checksum-pinned, read-only required
 workflows that run for pull requests and merge groups; the review gate binds
@@ -25,7 +29,8 @@ trusted review and answered findings to the PR-event number, head, and base
 ref (the base SHA may advance by ancestry), while a merge-group run binds the
 queue commit and base to the PR number in its ref.
 `tests/test-workflow.sh` refuses missing, extra, nested, or duplicate workflow
-declarations, verifies that only the declared publisher owns the status, and
+declarations, verifies that only the declared publisher owns the status,
+refuses engine-pin drift between the manifest and consumer workflow, and
 guards those version-1 behavior invariants.
 
 Pull requests land through the repository's merge queue only after the source

@@ -35,6 +35,19 @@ jobs:
       - name: Checkout workflow source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Fetch declared validation engine
+        run: |
+          set -euo pipefail
+          engine_revision="$(jq -er '.validationEngine.revision' .touchstone-source-contract.json)"
+          engine_sha256="$(jq -er '.validationEngine.sha256' .touchstone-source-contract.json)"
+          engine_path="$(jq -er '.validationEngine.path' .touchstone-source-contract.json)"
+          validator="$RUNNER_TEMP/touchstone-run.sh"
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${engine_revision}/${engine_path}" \
+            --output "$validator"
+          printf '%s  %s\n' "$engine_sha256" "$validator" | sha256sum --check --strict
+          printf 'TOUCHSTONE_ENGINE_PATH=%s\n' "$validator" >>"$GITHUB_ENV"
+
       - name: Test workflow contract
         run: bash tests/test-workflow.sh
 
@@ -60,8 +73,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="62d84f17e775a14c743d3951bf6979006e2ccb40"
-          touchstone_sha256="d2934fe2d887b47c9ecde83cc8f70ff7363df2a957b3311dd69cd67ac2ac32da"
+          touchstone_revision="ef2934d6baff508464d565d557f7ddf487e012e2"
+          touchstone_sha256="51daa8d4e543260c258613e7f14faa77c7d54eb310c22fb83c505e2c33376e1e"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
