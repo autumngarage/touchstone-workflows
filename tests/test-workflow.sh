@@ -136,12 +136,23 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ]; then
       'command = "true"' \
       'required = true' >"$project/.touchstone.toml"
     if [ "$schema" -eq 2 ]; then
-      printf '%s\n' 'stage = "commit"' >>"$project/.touchstone.toml"
+      printf '%s\n' \
+        '' \
+        '[[validation.tasks]]' \
+        'name = "authoring-guard"' \
+        'target = "root"' \
+        'stage = "commit"' \
+        'command = "true"' \
+        'required = true' >>"$project/.touchstone.toml"
     fi
     bash "$TOUCHSTONE_ENGINE_PATH" validate --project "$project" --check-contract --json >"$project/result.json" \
       || fail "declared validation engine rejected project schema $schema"
     jq -e --argjson schema "$schema" '.schema == $schema and .verdict == "valid"' "$project/result.json" >/dev/null \
       || fail "declared validation engine reported the wrong result for project schema $schema"
+    bash "$TOUCHSTONE_ENGINE_PATH" validate --project "$project" --json >"$project/execution.json" \
+      || fail "declared validation engine failed project schema $schema through the production path"
+    jq -e '.verdict == "passed" and .ran == 1 and .skipped == 0 and .failed == 0' "$project/execution.json" >/dev/null \
+      || fail "declared validation engine reported the wrong production result for project schema $schema"
   done
   rm -rf "$engine_fixture"
   echo "  OK: declared validation engine accepts project schemas 1 and 2"
