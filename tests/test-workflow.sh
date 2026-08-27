@@ -19,6 +19,14 @@ assert_count() {
   [ "$actual" -eq "$expected" ] || fail "expected $expected match(es) for $pattern, found $actual"
 }
 
+assert_active_line() {
+  file="$1"
+  expected="$2"
+  label="$3"
+  actual="$(sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$file" | grep -Fxc -- "$expected" || true)"
+  [ "$actual" -eq 1 ] || fail "$file: $label must be one active command"
+}
+
 assert_count 1 'name: validate \(ubuntu-latest\)'
 assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
@@ -56,6 +64,37 @@ for gate in "$review_gate" "$delivery_evidence"; do
   if grep -Eq 'uses: actions/checkout' "$gate" && ! grep -q "github.repository == 'autumngarage/touchstone-workflows'" "$gate"; then fail "$gate: checks out target code"; fi
 done
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
+
+# Behavior v1 binds each immutable fetch to the variable it pins and to an
+# executed checksum command. Retaining those strings in comments or unused
+# assignments is not evidence that the workflow enforces them.
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$workflow" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \' \
+  "validator fetch"
+assert_active_line "$workflow" \
+  "printf '%s  %s\\n' \"\$touchstone_sha256\" \"\$validator\" | sha256sum --check --strict" \
+  "validator checksum"
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$review_gate" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \' \
+  "review evaluator fetch"
+# shellcheck disable=SC2016
+assert_active_line "$review_gate" \
+  'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict' \
+  "review evaluator checksum"
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$delivery_evidence" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
+  "delivery evaluator fetch"
+# shellcheck disable=SC2016
+assert_active_line "$delivery_evidence" \
+  'echo "${evaluator_sha256}  $RUNNER_TEMP/check-delivery-evidence.sh" | sha256sum --check --strict' \
+  "delivery evaluator checksum"
+# shellcheck disable=SC2016
+assert_active_line "$review_gate" \
+  'fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"' \
+  "production coordinate validation"
 
 echo "==> behavior-v1 workflows use root PR/queue triggers and read-only permissions"
 for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
@@ -519,6 +558,35 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     mv "$fixture/validate.next" "$fixture/$status_publisher"
     if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
       fail "source contract accepted validation mutation $validation_mutation"
+    fi
+    rm -r "$fixture"
+  done
+
+  for behavior_mutation in commented-checksum moving-evaluator-ref bypass-coordinate-validation; do
+    fixture="$(mktemp -d)"
+    trap 'rm -rf "$fixture"' EXIT HUP INT TERM
+    mkdir -p "$fixture/.github"
+    cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
+    cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    case "$behavior_mutation" in
+      commented-checksum)
+        awk '$0 == "          echo \"${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq\" | sha256sum --check --strict" { print "          : # checksum disabled"; next } { print }' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+      moving-evaluator-ref)
+        # shellcheck disable=SC2016
+        sed 's#/${touchstone_revision}/.github/review-gate/#/main/.github/review-gate/#' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+      bypass-coordinate-validation)
+        # shellcheck disable=SC2016
+        sed 's#^          fetch_pull_request .*#          gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"#' \
+          "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
+        ;;
+    esac
+    mv "$fixture/review-gate.next" "$fixture/.github/workflows/review-gate.yml"
+    if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
+      fail "source contract accepted behavior mutation $behavior_mutation"
     fi
     rm -r "$fixture"
   done
