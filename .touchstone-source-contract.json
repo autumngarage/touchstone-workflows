@@ -1,6 +1,14 @@
 {
   "contractVersion": 1,
   "gateBehaviorContractVersion": 1,
+  "validationEngine": {
+    "contractVersion": 1,
+    "repository": "autumngarage/touchstone",
+    "path": "scripts/touchstone-run.sh",
+    "revision": "ef2934d6baff508464d565d557f7ddf487e012e2",
+    "sha256": "51daa8d4e543260c258613e7f14faa77c7d54eb310c22fb83c505e2c33376e1e",
+    "supportedProjectSchemas": [1, 2]
+  },
   "requiredStatusCheck": "source contract",
   "sourceRepository": "autumngarage/touchstone-workflows",
   "statusJob": "source-contract",

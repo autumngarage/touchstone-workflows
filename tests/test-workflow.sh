@@ -31,8 +31,8 @@ assert_count 1 'name: validate \(ubuntu-latest\)'
 assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
 assert_count 1 'touchstone_sha256="[0-9a-f]{64}"'
-assert_count 1 'raw\.githubusercontent\.com/autumngarage/touchstone/'
-assert_count 1 'sha256sum --check --strict'
+assert_count 2 'raw\.githubusercontent\.com/autumngarage/touchstone/'
+assert_count 2 'sha256sum --check --strict'
 assert_count 1 'touchstone-run\.sh" validate'
 # The workflow must pass the runner-provided variable literally.
 # shellcheck disable=SC2016
@@ -75,6 +75,74 @@ assert_active_line "$workflow" \
 assert_active_line "$workflow" \
   "printf '%s  %s\\n' \"\$touchstone_sha256\" \"\$validator\" | sha256sum --check --strict" \
   "validator checksum"
+# The source manifest owns engine compatibility. The consumer workflow keeps
+# the immutable values inline because required workflows execute in a target
+# checkout, while this test makes drift between the two declarations fatal.
+jq -e '
+  .validationEngine.contractVersion == 1
+  and (.validationEngine | keys == ["contractVersion", "path", "repository", "revision", "sha256", "supportedProjectSchemas"])
+  and .validationEngine.repository == "autumngarage/touchstone"
+  and .validationEngine.path == "scripts/touchstone-run.sh"
+  and (.validationEngine.revision | test("^[0-9a-f]{40}$"))
+  and (.validationEngine.sha256 | test("^[0-9a-f]{64}$"))
+  and .validationEngine.supportedProjectSchemas == [1, 2]
+' "$source_contract" >/dev/null || fail "$source_contract: invalid validation-engine contract"
+manifest_engine_revision="$(jq -r '.validationEngine.revision' "$source_contract")"
+manifest_engine_sha256="$(jq -r '.validationEngine.sha256' "$source_contract")"
+workflow_engine_revision="$(sed -n 's/^[[:space:]]*touchstone_revision="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow")"
+workflow_engine_sha256="$(sed -n 's/^[[:space:]]*touchstone_sha256="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow")"
+[ "$workflow_engine_revision" = "$manifest_engine_revision" ] \
+  || fail "$workflow: validator revision differs from $source_contract"
+[ "$workflow_engine_sha256" = "$manifest_engine_sha256" ] \
+  || fail "$workflow: validator checksum differs from $source_contract"
+# shellcheck disable=SC1003,SC2016
+assert_active_line "$workflow" \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${engine_revision}/${engine_path}" \' \
+  "source-contract validator fetch"
+assert_active_line "$workflow" \
+  "printf '%s  %s\\n' \"\$engine_sha256\" \"\$validator\" | sha256sum --check --strict" \
+  "source-contract validator checksum"
+assert_active_line "$workflow" \
+  "printf 'TOUCHSTONE_ENGINE_PATH=%s\\n' \"\$validator\" >>\"\$GITHUB_ENV\"" \
+  "source-contract validator handoff"
+
+if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ]; then
+  [ -f "$TOUCHSTONE_ENGINE_PATH" ] || fail "declared validation engine is missing: $TOUCHSTONE_ENGINE_PATH"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_engine_sha256="$(sha256sum "$TOUCHSTONE_ENGINE_PATH" | awk '{print $1}')"
+  else
+    actual_engine_sha256="$(shasum -a 256 "$TOUCHSTONE_ENGINE_PATH" | awk '{print $1}')"
+  fi
+  [ "$actual_engine_sha256" = "$manifest_engine_sha256" ] \
+    || fail "declared validation engine checksum differs from $source_contract"
+
+  engine_fixture="$(mktemp -d)"
+  for schema in 1 2; do
+    project="$engine_fixture/schema-$schema"
+    mkdir -p "$project"
+    printf '%s\n' \
+      "schema = $schema" \
+      '' \
+      '[validation]' \
+      'runtime = "bash"' \
+      '' \
+      '[[validation.targets]]' \
+      'name = "root"' \
+      'path = "."' \
+      '' \
+      '[[validation.tasks]]' \
+      'name = "contract"' \
+      'target = "root"' \
+      'command = "true"' \
+      'required = true' >"$project/.touchstone.toml"
+    bash "$TOUCHSTONE_ENGINE_PATH" validate --project "$project" --check-contract --json >"$project/result.json" \
+      || fail "declared validation engine rejected project schema $schema"
+    jq -e --argjson schema "$schema" '.schema == $schema and .verdict == "valid"' "$project/result.json" >/dev/null \
+      || fail "declared validation engine reported the wrong result for project schema $schema"
+  done
+  rm -rf "$engine_fixture"
+  echo "  OK: declared validation engine accepts project schemas 1 and 2"
+fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$review_gate" \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \' \
