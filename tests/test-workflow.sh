@@ -165,6 +165,27 @@ assert_active_line "$review_gate" \
 assert_active_line "$review_gate" \
   'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict' \
   "review evaluator checksum"
+assert_active_line "$review_gate" \
+  'timeout-minutes: 65' \
+  "review wait job timeout"
+assert_active_line "$review_gate" \
+  'REVIEW_REQUEST_WAIT_SECONDS: 120' \
+  "review request wait bound"
+assert_active_line "$review_gate" \
+  'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
+  "review evidence wait bound"
+assert_active_line "$review_gate" \
+  'REVIEW_POLL_SECONDS: 60' \
+  "review poll interval"
+assert_active_line "$review_gate" \
+  'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
+  "review run concurrency identity"
+assert_active_line "$review_gate" \
+  'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
+  "pull-request review run replacement"
+assert_active_line "$review_gate" \
+  'wait_for_review_gate' \
+  "production waiting-state loop"
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$delivery_evidence" \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
@@ -178,7 +199,7 @@ assert_active_line "$review_gate" \
   'fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"' \
   "production coordinate validation"
 
-echo "==> behavior-v1 workflows use root PR/queue triggers and read-only permissions"
+echo "==> behavior-v2 workflows share refresh triggers and use read-only permissions"
 for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
   ruby -rpsych -e '
     pairs = lambda do |node, label|
@@ -198,15 +219,13 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
     root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
     triggers = pairs.call(one.call(root, "on", "workflow"), "on")
     pull_request = one.call(triggers, "pull_request", "on")
-    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty? && pull_request.plain
-      fields = pairs.call(pull_request, "pull_request")
-      raise "pull_request must declare only types" unless fields.length == 1
-      types = one.call(fields, "types", "pull_request")
-      raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
-      actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
-      required = %w[edited opened ready_for_review reopened synchronize]
-      raise "pull_request types must cover #{required.join(", ")}" unless actual == required
-    end
+    fields = pairs.call(pull_request, "pull_request")
+    raise "pull_request must declare only types" unless fields.length == 1
+    types = one.call(fields, "types", "pull_request")
+    raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
+    actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
+    required = %w[edited opened ready_for_review reopened synchronize]
+    raise "pull_request types must cover #{required.join(", ")}" unless actual == required
 
     merge_group = pairs.call(one.call(triggers, "merge_group", "on"), "merge_group")
     raise "merge_group must declare only types" unless merge_group.length == 1
@@ -228,7 +247,7 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
       when "review-gate.yml" then %w[contents issues pull-requests]
       when "delivery-evidence.yml" then %w[contents pull-requests]
       when "validate.yml" then %w[contents]
-      else raise "unexpected behavior-v1 workflow"
+      else raise "unexpected behavior-v2 workflow"
     end
     missing_permissions = required_permissions - declared_permissions
     raise "missing read permissions: #{missing_permissions.join(", ")}" unless missing_permissions.empty?
@@ -241,9 +260,66 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
         raise "job #{job} must not override permissions"
       end
     end
-  ' "$gate" || fail "$gate: violates behavior-v1 trigger or permission invariants"
+  ' "$gate" || fail "$gate: violates behavior-v2 trigger or permission invariants"
 done
 echo "  OK: triggers and effective permissions are structurally bound"
+
+echo "==> review-gate waits only for pull-request evidence states"
+wait_fixture="$(mktemp -d)"
+trap 'rm -rf "$wait_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:review-wait:start/ { copying = 1; next }
+  /touchstone:review-wait:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$wait_fixture/wait.sh"
+# shellcheck source=/dev/null
+source "$wait_fixture/wait.sh"
+
+run_wait_case() {
+  label="$1"
+  sequence="$2"
+  event="$3"
+  expected_result="$4"
+  expected_calls="$5"
+  request_wait="${6:-120}"
+  evidence_wait="${7:-120}"
+  tmp="$wait_fixture/$label"
+  mkdir -p "$tmp"
+  IFS=, read -r -a WAIT_STATES <<<"$sequence"
+  WAIT_CALLS=0
+  MOCK_NOW=0
+  event_mode="$event"
+  REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
+  REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
+  REVIEW_POLL_SECONDS=60
+
+  evaluate_once() {
+    index="$WAIT_CALLS"
+    if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
+    state="${WAIT_STATES[$index]}"
+    WAIT_CALLS=$((WAIT_CALLS + 1))
+    jq -n --arg state "$state" '{state: $state, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
+  }
+  review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
+  review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
+
+  if [ "$expected_result" = success ]; then
+    wait_for_review_gate >"$tmp/output" 2>&1 || fail "$label: expected success"
+  elif wait_for_review_gate >"$tmp/output" 2>&1; then
+    fail "$label: expected failure"
+  fi
+  [ "$WAIT_CALLS" -eq "$expected_calls" ] \
+    || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
+  echo "  OK: $label"
+}
+
+run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
+run_wait_case "terminal-failure" "failure" pull_request failure 1
+run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
+run_wait_case "request-deadline" "waiting-request" pull_request failure 3
+run_wait_case "review-deadline" "waiting-review" pull_request failure 3
+run_wait_case "unknown-state" "unknown" pull_request failure 1
+rm -rf "$wait_fixture"
 
 echo "==> review-gate binds evidence to event PR coordinates"
 coordinate_fixture="$(mktemp -d)"
@@ -422,7 +498,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
-  and .gateBehaviorContractVersion == 1
+  and .gateBehaviorContractVersion == 2
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -611,7 +687,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for invalid_behavior_version in null '"1"' 2; do
+  for invalid_behavior_version in null '"2"' 1; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"

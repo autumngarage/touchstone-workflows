@@ -22,16 +22,19 @@ workflow's Touchstone repository, path, revision, checksum, and supported
 project schemas; the source-contract job executes schema-1 and schema-2
 fixtures with those exact bytes before an engine-pin change can land. Its
 `gateBehaviorContractVersion` declares the behavior
-contract implemented by the pinned workflows. Version 1 means that validation,
+contract implemented by the pinned workflows. Version 2 means that validation,
 review evidence, and delivery evidence are checksum-pinned, read-only required
-workflows that run for pull requests and merge groups; the review gate binds
+workflows with aligned refresh triggers that run for pull requests and merge
+groups; the review gate binds
 trusted review and answered findings to the PR-event number, head, and base
 ref (the base SHA may advance by ancestry), while a merge-group run binds the
-queue commit and base to the PR number in its ref.
+queue commit and base to the PR number in its ref. Pull-request review gates
+poll only evaluator-declared waiting states until their bounded deadline;
+terminal failures and merge-group runs remain immediate.
 `tests/test-workflow.sh` refuses missing, extra, nested, or duplicate workflow
 declarations, verifies that only the declared publisher owns the status,
 refuses engine-pin drift between the manifest and consumer workflow, and
-guards those version-1 behavior invariants.
+guards those version-2 behavior invariants.
 
 Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required

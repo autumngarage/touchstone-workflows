@@ -8,9 +8,9 @@ name: review-gate
 # conclusion is the verdict, and no workflow in the target repository can
 # forge it.
 #
-# Re-evaluation after evidence changes (a review landing, an answer posted)
-# is requested by the driver with `gh run rerun`; the merge queue always
-# re-evaluates the merged result before landing.
+# Pull-request runs keep an explicit waiting state alive while trusted review
+# evidence can still arrive. Terminal evidence failures stop immediately. The
+# merge queue never waits: it re-evaluates the complete merged result once.
 #
 # DEPENDENCY CONTRACT: the runner image, the target repository, github.com.
 
@@ -19,6 +19,10 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   merge_group:
     types: [checks_requested]
+
+concurrency:
+  group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -36,17 +40,20 @@ jobs:
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: review-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 65
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
+      REVIEW_REQUEST_WAIT_SECONDS: 120
+      REVIEW_EVIDENCE_WAIT_SECONDS: 3600
+      REVIEW_POLL_SECONDS: 60
     steps:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="e85157b8df4050f21b8c01140e579989a8ec00fa"
-          evaluator_sha256="079f5184c29c3acbd216f302cf9ba78d70caa2009a06bfbeb5211f833f890ff7"
+          touchstone_revision="0faa4c691a0a9b70a6045bfe39f8011401b2443f"
+          evaluator_sha256="e646d86342830f5db462417127d1f821a9c7ea020418d5dc896d93e74c07c44c"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
             -o "$RUNNER_TEMP/evaluate.jq"
@@ -176,6 +183,7 @@ jobs:
           }
           # touchstone:permission-collector:end
 
+          evaluate_once() {
           fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"
           head="$(jq -r '.head.sha' "$tmp/pr.json")"
           base="$(jq -r '.base.sha' "$tmp/pr.json")"
@@ -241,6 +249,62 @@ jobs:
               issueComments: $issueComments[0], reviews: $reviews[0], reviewComments: $reviewComments[0]
             }' >"$tmp/evidence.json"
 
-          verdict="$(jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json")"
-          jq -r '.summary' <<<"$verdict"
-          [ "$(jq -r .conclusion <<<"$verdict")" = success ]
+          jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
+          }
+
+          # touchstone:review-wait:start
+          review_gate_now() { date +%s; }
+          review_gate_sleep() { sleep "$1"; }
+
+          wait_for_review_gate() {
+            now="$(review_gate_now)"
+            request_deadline=$((now + REVIEW_REQUEST_WAIT_SECONDS))
+            review_deadline=0
+            previous_state=""
+
+            while :; do
+              evaluate_once
+              state="$(jq -er '.state | select(type == "string" and length > 0)' "$tmp/verdict.json")"
+
+              if [ "$state" != "$previous_state" ]; then
+                jq -r '.summary' "$tmp/verdict.json"
+                previous_state="$state"
+              fi
+
+              case "$state" in
+                success) return 0 ;;
+                failure) return 1 ;;
+                waiting-request | waiting-review) ;;
+                *) echo "ERROR: evaluator returned unsupported state '$state'." >&2; return 1 ;;
+              esac
+
+              if [ "$event_mode" != pull_request ]; then
+                echo "ERROR: merge-group review evidence is incomplete; queue evaluation never waits." >&2
+                return 1
+              fi
+
+              now="$(review_gate_now)"
+              case "$state" in
+                waiting-request)
+                  deadline="$request_deadline"
+                  ;;
+                waiting-review)
+                  if [ "$review_deadline" -eq 0 ]; then
+                    review_deadline=$((now + REVIEW_EVIDENCE_WAIT_SECONDS))
+                  fi
+                  deadline="$review_deadline"
+                  ;;
+              esac
+              remaining=$((deadline - now))
+              if [ "$remaining" -le 0 ]; then
+                echo "ERROR: review gate remained '$state' until its evidence deadline." >&2
+                return 1
+              fi
+
+              echo "Review gate is '$state'; re-evaluating in ${REVIEW_POLL_SECONDS}s (${remaining}s remain)."
+              review_gate_sleep "$REVIEW_POLL_SECONDS"
+            done
+          }
+          # touchstone:review-wait:end
+
+          wait_for_review_gate
