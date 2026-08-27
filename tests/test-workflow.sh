@@ -135,11 +135,21 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
 
     permissions = pairs.call(one.call(root, "permissions", "workflow"), "permissions")
     raise "permissions must not be empty" if permissions.empty?
+    declared_permissions = []
     permissions.each do |key, value|
       name = scalar.call(key, "permission name")
       level = scalar.call(value, "permission #{name}")
       raise "permission #{name} must be read-only" unless level == "read"
+      declared_permissions << name
     end
+    required_permissions = case File.basename(ARGV.fetch(0))
+      when "review-gate.yml" then %w[contents issues pull-requests]
+      when "delivery-evidence.yml" then %w[contents pull-requests]
+      when "validate.yml" then %w[contents]
+      else raise "unexpected behavior-v1 workflow"
+    end
+    missing_permissions = required_permissions - declared_permissions
+    raise "missing read permissions: #{missing_permissions.join(", ")}" unless missing_permissions.empty?
 
     jobs = pairs.call(one.call(root, "jobs", "workflow"), "jobs")
     jobs.each do |job_key, configuration|
@@ -562,12 +572,13 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for behavior_mutation in commented-checksum moving-evaluator-ref bypass-coordinate-validation; do
+  for behavior_mutation in commented-checksum moving-evaluator-ref bypass-coordinate-validation missing-review-scope missing-delivery-scope; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
     cp -R "$repo_root/.github/workflows" "$fixture/.github/workflows"
     cp "$source_contract" "$fixture/.touchstone-source-contract.json"
+    mutation_workflow="$fixture/.github/workflows/review-gate.yml"
     case "$behavior_mutation" in
       commented-checksum)
         awk '$0 == "          echo \"${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq\" | sha256sum --check --strict" { print "          : # checksum disabled"; next } { print }' \
@@ -583,8 +594,15 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
         sed 's#^          fetch_pull_request .*#          gh api "repos/$REPO/pulls/$number" >"$tmp/pr.json"#' \
           "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
         ;;
+      missing-review-scope)
+        sed '/^  issues: read$/d' "$mutation_workflow" >"$fixture/review-gate.next"
+        ;;
+      missing-delivery-scope)
+        mutation_workflow="$fixture/.github/workflows/delivery-evidence.yml"
+        sed '/^  pull-requests: read$/d' "$mutation_workflow" >"$fixture/review-gate.next"
+        ;;
     esac
-    mv "$fixture/review-gate.next" "$fixture/.github/workflows/review-gate.yml"
+    mv "$fixture/review-gate.next" "$mutation_workflow"
     if TOUCHSTONE_CONTRACT_ROOT="$fixture" TOUCHSTONE_CONTRACT_SELF_TEST=1 bash "$0" >"$fixture/self-test.out" 2>&1; then
       fail "source contract accepted behavior mutation $behavior_mutation"
     fi
