@@ -135,6 +135,9 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ]; then
       'target = "root"' \
       'command = "true"' \
       'required = true' >"$project/.touchstone.toml"
+    if [ "$schema" -eq 2 ]; then
+      printf '%s\n' 'stage = "commit"' >>"$project/.touchstone.toml"
+    fi
     bash "$TOUCHSTONE_ENGINE_PATH" validate --project "$project" --check-contract --json >"$project/result.json" \
       || fail "declared validation engine rejected project schema $schema"
     jq -e --argjson schema "$schema" '.schema == $schema and .verdict == "valid"' "$project/result.json" >/dev/null \
