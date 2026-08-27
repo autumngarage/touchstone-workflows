@@ -76,7 +76,23 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
 
     root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
     triggers = pairs.call(one.call(root, "on", "workflow"), "on")
-    %w[pull_request merge_group].each { |event| one.call(triggers, event, "on") }
+    pull_request = one.call(triggers, "pull_request", "on")
+    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty?
+      fields = pairs.call(pull_request, "pull_request")
+      raise "pull_request must declare only types" unless fields.length == 1
+      types = one.call(fields, "types", "pull_request")
+      raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
+      actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
+      required = %w[edited opened ready_for_review reopened synchronize]
+      raise "pull_request types must cover #{required.join(", ")}" unless actual == required
+    end
+
+    merge_group = pairs.call(one.call(triggers, "merge_group", "on"), "merge_group")
+    raise "merge_group must declare only types" unless merge_group.length == 1
+    merge_types = one.call(merge_group, "types", "merge_group")
+    raise "merge_group types must be a sequence" unless merge_types.is_a?(Psych::Nodes::Sequence)
+    actual_merge_types = merge_types.children.map { |node| scalar.call(node, "merge_group type") }
+    raise "merge_group types must be checks_requested" unless actual_merge_types == ["checks_requested"]
 
     permissions = pairs.call(one.call(root, "permissions", "workflow"), "permissions")
     raise "permissions must not be empty" if permissions.empty?
@@ -468,7 +484,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for validation_mutation in missing-pull-request quoted-write job-write-all; do
+  for validation_mutation in missing-pull-request pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -477,6 +493,17 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     case "$validation_mutation" in
       missing-pull-request)
         sed '/^  pull_request:$/d' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      pr-closed)
+        sed 's/^  pull_request:$/  pull_request:\
+    types: [closed]/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      pr-filtered)
+        sed 's/^  pull_request:$/  pull_request:\
+    branches: [release]/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      merge-group-destroyed)
+        sed 's/types: \[checks_requested\]/types: [destroyed]/' "$fixture/$status_publisher" >"$fixture/validate.next"
         ;;
       quoted-write)
         sed 's/^  contents: read$/  contents: "write"/' "$fixture/$status_publisher" >"$fixture/validate.next"
