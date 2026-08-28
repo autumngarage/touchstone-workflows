@@ -1005,14 +1005,18 @@ if collect_fix_reachability "$reach_head" "$reach_fixture/flaky.json" \
 fi
 grep -q "HTTP 502" "$reach_fixture/flaky.err" \
   || fail "an operational comparison failure was not diagnosed: $(cat "$reach_fixture/flaky.err")"
-: >"$tmp/rest-budget-exhausted"
-gh() { return 1; }
+# The budget guard lives in rest_api, which refuses before calling gh. Setting
+# the exhausted marker by hand would only re-run the transport-failure path
+# above, so drive the counter to the limit and let any call be the failure.
+printf '%s\n' "$REST_REQUEST_LIMIT" >"$tmp/rest-request-count"
+gh() { fail "reachability called gh after the REST budget was exhausted"; }
 if collect_fix_reachability "$reach_head" "$reach_fixture/issues.json" \
   "$reach_fixture/review-comments.json" "$reach_fixture/prior-issues.json" \
   "$reach_fixture/permissions.json" \
   "$reach_fixture/reachability.json" >/dev/null 2>&1; then
   fail "reachability collection survived an exhausted REST budget"
 fi
+printf '0\n' >"$tmp/rest-request-count"
 rm -f "$tmp/rest-budget-exhausted"
 unset -f gh
 echo "  OK: authorization, head identity, dedupe, and definitive-vs-operational failures are explicit"
