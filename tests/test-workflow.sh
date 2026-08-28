@@ -189,6 +189,35 @@ assert_active_line "$review_gate" \
 assert_active_line "$review_gate" \
   'wait_for_review_gate' \
   "production waiting-state loop"
+# Deadline evaluation must reconstruct mutable issue-comment bodies from the
+# last complete poll rather than treating GitHub's current body as historical.
+assert_active_line "$review_gate" \
+  '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' \
+  "prior issue-comment snapshot input"
+assert_active_line "$review_gate" \
+  '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' \
+  "prior review-comment snapshot input"
+assert_active_line "$review_gate" \
+  'issueComments: $issueComments[0], priorIssueComments: $priorIssueComments[0],' \
+  "prior issue-comment snapshot evidence"
+assert_active_line "$review_gate" \
+  'reviews: $reviews[0], reviewComments: $reviewComments[0], priorReviewComments: $priorReviewComments[0]' \
+  "prior review-comment snapshot evidence"
+assert_active_line "$review_gate" \
+  'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' \
+  "prior issue-comment snapshot refresh"
+assert_active_line "$review_gate" \
+  'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' \
+  "prior review-comment snapshot refresh"
+snapshot_input_line="$(grep -nF -- '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' "$review_gate" | cut -d: -f1)"
+evaluation_line="$(grep -nF -- 'jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"' "$review_gate" | cut -d: -f1)"
+snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' "$review_gate" | cut -d: -f1)"
+[ "$snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$snapshot_refresh_line" ] \
+  || fail "$review_gate: snapshot must be consumed before evaluation and refreshed only afterward"
+review_snapshot_input_line="$(grep -nF -- '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' "$review_gate" | cut -d: -f1)"
+review_snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' "$review_gate" | cut -d: -f1)"
+[ "$review_snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$review_snapshot_refresh_line" ] \
+  || fail "$review_gate: review snapshot must be consumed before evaluation and refreshed only afterward"
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$delivery_evidence" \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
@@ -335,14 +364,20 @@ run_wait_case() {
   REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
   REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
   REVIEW_POLL_SECONDS="${8:-60}"
+  expected_cutoff="${9:-false}"
+  EVALUATION_SECONDS="${10:-0}"
+  WAIT_CUTOFFS=()
 
   evaluate_once() {
+    WAIT_CUTOFFS[$WAIT_CALLS]="${1:-}"
     index="$WAIT_CALLS"
     if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
     state="${WAIT_STATES[$index]}"
     WAIT_CALLS=$((WAIT_CALLS + 1))
     jq -n --arg state "$state" '{state: $state, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
+    MOCK_NOW=$((MOCK_NOW + EVALUATION_SECONDS))
   }
+  refresh_evidence_snapshots() { :; }
   review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
   review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
 
@@ -353,15 +388,25 @@ run_wait_case() {
   fi
   [ "$WAIT_CALLS" -eq "$expected_calls" ] \
     || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
+  last_call=$((WAIT_CALLS - 1))
+  if [ "$expected_cutoff" = true ]; then
+    [ -n "${WAIT_CUTOFFS[$last_call]}" ] \
+      || fail "$label: final deadline evaluation had no evidence cutoff"
+  else
+    [ -z "${WAIT_CUTOFFS[$last_call]}" ] \
+      || fail "$label: ordinary evaluation unexpectedly had an evidence cutoff"
+  fi
   echo "  OK: $label"
 }
 
 run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
 run_wait_case "terminal-failure" "failure" pull_request failure 1
 run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
-run_wait_case "request-deadline" "waiting-request" pull_request failure 2
-run_wait_case "review-deadline" "waiting-review" pull_request failure 2
-run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request failure 1 120 120 180
+run_wait_case "request-deadline" "waiting-request" pull_request failure 3 120 120 60 true
+run_wait_case "review-deadline" "waiting-review" pull_request failure 3 120 120 60 true
+run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180 true
+run_wait_case "request-cutoff-starts-review-window" "waiting-request,waiting-review,success" pull_request success 3 120 120 180 true
+run_wait_case "collection-crosses-request-cutoff" "waiting-request,success,waiting-review,success" pull_request success 4 120 120 60 true 40
 run_wait_case "unknown-state" "unknown" pull_request failure 1
 rm -rf "$wait_fixture"
 

@@ -55,8 +55,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="0faa4c691a0a9b70a6045bfe39f8011401b2443f"
-          evaluator_sha256="e646d86342830f5db462417127d1f821a9c7ea020418d5dc896d93e74c07c44c"
+          touchstone_revision="429cb86237d6c86396e435888e4bbc340e1c6618"
+          evaluator_sha256="6759081110893326dc323c80c09c1f185ec0055bd05f1c5cbdc0f0d5346bfc73"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
             -o "$RUNNER_TEMP/evaluate.jq"
@@ -222,8 +222,11 @@ jobs:
           # touchstone:permission-collector:end
 
           evaluate_once() {
+          evidence_cutoff_at="${1:-}"
           rm -f "$tmp/rest-budget-exhausted"
           printf '0\n' >"$tmp/rest-request-count"
+          [ -f "$tmp/prior-issue-comments.json" ] || printf '[]\n' >"$tmp/prior-issue-comments.json"
+          [ -f "$tmp/prior-review-comments.json" ] || printf '[]\n' >"$tmp/prior-review-comments.json"
           fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"
           head="$(jq -r '.head.sha' "$tmp/pr.json")"
           base="$(jq -r '.base.sha' "$tmp/pr.json")"
@@ -279,10 +282,13 @@ jobs:
 
           jq -n \
             --slurpfile pr "$tmp/pr.json" --slurpfile issueComments "$tmp/issues-resolved.json" \
+            --slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \
+            --slurpfile priorReviewComments "$tmp/prior-review-comments.json" \
             --slurpfile reviews "$tmp/reviews.json" --slurpfile reviewComments "$tmp/review-comments.json" \
             --slurpfile headPulls "$tmp/head-pulls.json" --slurpfile bases "$tmp/bases.json" \
             --slurpfile authorPermissions "$tmp/author-permissions.json" \
             --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" --arg currentSince "$head_current_since" --arg retargetedAt "$base_retargeted_at" \
+            --arg evidenceCutoffAt "$evidence_cutoff_at" \
             '($pr[0]) as $pr | {
               contractVersion: 3, complete: true,
               trustedAuthors: ($trusted | split(",")),
@@ -290,10 +296,16 @@ jobs:
               pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha, baseRef: $pr.base.ref, baseSha: $pr.base.sha,
                    acceptableBaseShas: $bases[0], headCurrentSince: $currentSince, baseRetargetedAt: $retargetedAt,
                    openHeadPulls: [$headPulls[0][] | select(.state == "open" and .base.repo.full_name == $repo and .head.sha == $pr.head.sha) | .number]},
-              issueComments: $issueComments[0], reviews: $reviews[0], reviewComments: $reviewComments[0]
-            }' >"$tmp/evidence.json"
+              issueComments: $issueComments[0], priorIssueComments: $priorIssueComments[0],
+              reviews: $reviews[0], reviewComments: $reviewComments[0], priorReviewComments: $priorReviewComments[0]
+            } + (if $evidenceCutoffAt == "" then {} else {evidenceCutoffAt: $evidenceCutoffAt} end)' >"$tmp/evidence.json"
 
           jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
+          }
+
+          refresh_evidence_snapshots() {
+          cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"
+          cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"
           }
 
           # touchstone:review-wait:start
@@ -308,14 +320,26 @@ jobs:
             deadline=0
 
             while :; do
+              evidence_cutoff_at=""
+              cutoff_previous_state="$previous_state"
               if [ "$deadline" -gt 0 ]; then
                 now="$(review_gate_now)"
                 if [ "$now" -ge "$deadline" ]; then
-                  echo "ERROR: review gate remained '$previous_state' until its evidence deadline." >&2
-                  return 1
+                  evidence_cutoff_at="$(jq -nr --argjson deadline "$deadline" '$deadline | todateiso8601')"
                 fi
               fi
-              evaluate_once
+              evaluate_once "$evidence_cutoff_at"
+              if [ -z "$evidence_cutoff_at" ] && [ "$deadline" -gt 0 ]; then
+                now="$(review_gate_now)"
+                if [ "$now" -ge "$deadline" ]; then
+                  # The evidence read itself crossed the boundary. Re-evaluate
+                  # the same current responses against the last pre-cutoff
+                  # snapshot before that snapshot is refreshed.
+                  evidence_cutoff_at="$(jq -nr --argjson deadline "$deadline" '$deadline | todateiso8601')"
+                  evaluate_once "$evidence_cutoff_at"
+                fi
+              fi
+              refresh_evidence_snapshots
               state="$(jq -er '.state | select(type == "string" and length > 0)' "$tmp/verdict.json")"
 
               if [ "$state" != "$previous_state" ]; then
@@ -329,6 +353,18 @@ jobs:
                 waiting-request | waiting-review) ;;
                 *) echo "ERROR: evaluator returned unsupported state '$state'." >&2; return 1 ;;
               esac
+
+              if [ -n "$evidence_cutoff_at" ]; then
+                if [ "$cutoff_previous_state" = waiting-request ] && [ "$state" = waiting-review ]; then
+                  # A request that existed by the request cutoff earns the
+                  # complete review window even when a long poll first sees
+                  # it in the boundary evaluation.
+                  review_deadline=$((deadline + REVIEW_EVIDENCE_WAIT_SECONDS))
+                else
+                  echo "ERROR: review gate remained '$state' through its evidence deadline $evidence_cutoff_at." >&2
+                  return 1
+                fi
+              fi
 
               if [ "$event_mode" != pull_request ]; then
                 echo "ERROR: merge-group review evidence is incomplete; queue evaluation never waits." >&2
