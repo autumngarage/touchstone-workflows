@@ -1,6 +1,6 @@
 {
   "contractVersion": 1,
-  "gateBehaviorContractVersion": 1,
+  "gateBehaviorContractVersion": 2,
   "validationEngine": {
     "contractVersion": 1,
     "repository": "autumngarage/touchstone",

@@ -9,6 +9,7 @@ name: validate
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
     branches: [main]
   # The merge queue tests the merged result on a temporary commit; the

@@ -165,6 +165,59 @@ assert_active_line "$review_gate" \
 assert_active_line "$review_gate" \
   'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict' \
   "review evaluator checksum"
+assert_active_line "$review_gate" \
+  'timeout-minutes: 65' \
+  "review wait job timeout"
+assert_active_line "$review_gate" \
+  'REVIEW_REQUEST_WAIT_SECONDS: 120' \
+  "review request wait bound"
+assert_active_line "$review_gate" \
+  'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
+  "review evidence wait bound"
+assert_active_line "$review_gate" \
+  'REST_REQUEST_LIMIT: 20' \
+  "review REST request bound"
+assert_active_line "$review_gate" \
+  'REVIEW_POLL_SECONDS: 300' \
+  "review poll interval"
+assert_active_line "$review_gate" \
+  'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
+  "review run concurrency identity"
+assert_active_line "$review_gate" \
+  'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
+  "pull-request review run replacement"
+assert_active_line "$review_gate" \
+  'wait_for_review_gate' \
+  "production waiting-state loop"
+# Deadline evaluation must reconstruct mutable issue-comment bodies from the
+# last complete poll rather than treating GitHub's current body as historical.
+assert_active_line "$review_gate" \
+  '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' \
+  "prior issue-comment snapshot input"
+assert_active_line "$review_gate" \
+  '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' \
+  "prior review-comment snapshot input"
+assert_active_line "$review_gate" \
+  'issueComments: $issueComments[0], priorIssueComments: $priorIssueComments[0],' \
+  "prior issue-comment snapshot evidence"
+assert_active_line "$review_gate" \
+  'reviews: $reviews[0], reviewComments: $reviewComments[0], priorReviewComments: $priorReviewComments[0]' \
+  "prior review-comment snapshot evidence"
+assert_active_line "$review_gate" \
+  'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' \
+  "prior issue-comment snapshot refresh"
+assert_active_line "$review_gate" \
+  'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' \
+  "prior review-comment snapshot refresh"
+snapshot_input_line="$(grep -nF -- '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' "$review_gate" | cut -d: -f1)"
+evaluation_line="$(grep -nF -- 'jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"' "$review_gate" | cut -d: -f1)"
+snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' "$review_gate" | cut -d: -f1)"
+[ "$snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$snapshot_refresh_line" ] \
+  || fail "$review_gate: snapshot must be consumed before evaluation and refreshed only afterward"
+review_snapshot_input_line="$(grep -nF -- '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' "$review_gate" | cut -d: -f1)"
+review_snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' "$review_gate" | cut -d: -f1)"
+[ "$review_snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$review_snapshot_refresh_line" ] \
+  || fail "$review_gate: review snapshot must be consumed before evaluation and refreshed only afterward"
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$delivery_evidence" \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
@@ -178,7 +231,7 @@ assert_active_line "$review_gate" \
   'fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"' \
   "production coordinate validation"
 
-echo "==> behavior-v1 workflows use root PR/queue triggers and read-only permissions"
+echo "==> behavior-v2 workflows share refresh triggers and use read-only permissions"
 for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
   ruby -rpsych -e '
     pairs = lambda do |node, label|
@@ -198,15 +251,13 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
     root = pairs.call(Psych.parse_file(ARGV.fetch(0)).root, "workflow")
     triggers = pairs.call(one.call(root, "on", "workflow"), "on")
     pull_request = one.call(triggers, "pull_request", "on")
-    unless pull_request.is_a?(Psych::Nodes::Scalar) && pull_request.value.empty? && pull_request.plain
-      fields = pairs.call(pull_request, "pull_request")
-      raise "pull_request must declare only types" unless fields.length == 1
-      types = one.call(fields, "types", "pull_request")
-      raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
-      actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
-      required = %w[edited opened ready_for_review reopened synchronize]
-      raise "pull_request types must cover #{required.join(", ")}" unless actual == required
-    end
+    fields = pairs.call(pull_request, "pull_request")
+    raise "pull_request must declare only types" unless fields.length == 1
+    types = one.call(fields, "types", "pull_request")
+    raise "pull_request types must be a sequence" unless types.is_a?(Psych::Nodes::Sequence)
+    actual = types.children.map { |node| scalar.call(node, "pull_request type") }.sort
+    required = %w[edited opened ready_for_review reopened synchronize]
+    raise "pull_request types must cover #{required.join(", ")}" unless actual == required
 
     merge_group = pairs.call(one.call(triggers, "merge_group", "on"), "merge_group")
     raise "merge_group must declare only types" unless merge_group.length == 1
@@ -228,7 +279,7 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
       when "review-gate.yml" then %w[contents issues pull-requests]
       when "delivery-evidence.yml" then %w[contents pull-requests]
       when "validate.yml" then %w[contents]
-      else raise "unexpected behavior-v1 workflow"
+      else raise "unexpected behavior-v2 workflow"
     end
     missing_permissions = required_permissions - declared_permissions
     raise "missing read permissions: #{missing_permissions.join(", ")}" unless missing_permissions.empty?
@@ -241,9 +292,123 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
         raise "job #{job} must not override permissions"
       end
     end
-  ' "$gate" || fail "$gate: violates behavior-v1 trigger or permission invariants"
+  ' "$gate" || fail "$gate: violates behavior-v2 trigger or permission invariants"
 done
 echo "  OK: triggers and effective permissions are structurally bound"
+
+echo "==> review polling preserves repository API headroom at concurrent scale"
+production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+production_request_limit="$(sed -n 's/^[[:space:]]*REST_REQUEST_LIMIT: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+standard_hourly_budget=1000
+reserved_budget=$((standard_hourly_budget / 5))
+concurrent_waiting_prs=3
+projected_requests=$((concurrent_waiting_prs * (3600 / production_poll_seconds) * production_request_limit))
+[ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
+  || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
+direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'gh api "\$@"' | grep -v 'gh api graphql' || true)"
+[ -z "$direct_rest_calls" ] \
+  || fail "review evidence bypasses the enforced REST request boundary: $direct_rest_calls"
+
+budget_fixture="$(mktemp -d)"
+awk '
+  /touchstone:permission-collector:start/ { copying = 1; next }
+  /touchstone:permission-collector:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$budget_fixture/budget.sh"
+# shellcheck source=/dev/null
+source "$budget_fixture/budget.sh"
+tmp="$budget_fixture/evidence"
+mkdir -p "$tmp"
+printf '0\n' >"$tmp/rest-request-count"
+REST_REQUEST_LIMIT=2
+budget_calls="$budget_fixture/calls"
+: >"$budget_calls"
+gh() { printf '%s\n' "$*" >>"$budget_calls"; printf '{}\n'; }
+rest_api first >/dev/null || fail "REST budget rejected its first request"
+rest_api second >/dev/null || fail "REST budget rejected its boundary request"
+if rest_api third >/dev/null 2>&1; then
+  fail "REST budget allowed a request beyond its enforced limit"
+fi
+[ -f "$tmp/rest-budget-exhausted" ] \
+  || fail "REST budget exhaustion did not leave a fail-closed signal for optional evidence lookups"
+[ "$(wc -l <"$budget_calls" | tr -d ' ')" -eq 2 ] \
+  || fail "REST budget invoked gh after reaching its enforced limit"
+rm -rf "$budget_fixture"
+echo "  OK: enforced $production_request_limit-request evaluations consume at most $projected_requests requests/hour and leave $((standard_hourly_budget - projected_requests)) for unrelated work"
+
+echo "==> review-gate waits only for pull-request evidence states"
+wait_fixture="$(mktemp -d)"
+trap 'rm -rf "$wait_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:review-wait:start/ { copying = 1; next }
+  /touchstone:review-wait:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$wait_fixture/wait.sh"
+# shellcheck source=/dev/null
+source "$wait_fixture/wait.sh"
+
+run_wait_case() {
+  label="$1"
+  sequence="$2"
+  event="$3"
+  expected_result="$4"
+  expected_calls="$5"
+  request_wait="${6:-120}"
+  evidence_wait="${7:-120}"
+  tmp="$wait_fixture/$label"
+  mkdir -p "$tmp"
+  IFS=, read -r -a WAIT_STATES <<<"$sequence"
+  WAIT_CALLS=0
+  MOCK_NOW=0
+  event_mode="$event"
+  REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
+  REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
+  REVIEW_POLL_SECONDS="${8:-60}"
+  expected_cutoff="${9:-false}"
+  EVALUATION_SECONDS="${10:-0}"
+  WAIT_CUTOFFS=()
+
+  evaluate_once() {
+    WAIT_CUTOFFS[$WAIT_CALLS]="${1:-}"
+    index="$WAIT_CALLS"
+    if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
+    state="${WAIT_STATES[$index]}"
+    WAIT_CALLS=$((WAIT_CALLS + 1))
+    jq -n --arg state "$state" '{state: $state, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
+    MOCK_NOW=$((MOCK_NOW + EVALUATION_SECONDS))
+  }
+  refresh_evidence_snapshots() { :; }
+  review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
+  review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
+
+  if [ "$expected_result" = success ]; then
+    wait_for_review_gate >"$tmp/output" 2>&1 || fail "$label: expected success"
+  elif wait_for_review_gate >"$tmp/output" 2>&1; then
+    fail "$label: expected failure"
+  fi
+  [ "$WAIT_CALLS" -eq "$expected_calls" ] \
+    || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
+  last_call=$((WAIT_CALLS - 1))
+  if [ "$expected_cutoff" = true ]; then
+    [ -n "${WAIT_CUTOFFS[$last_call]}" ] \
+      || fail "$label: final deadline evaluation had no evidence cutoff"
+  else
+    [ -z "${WAIT_CUTOFFS[$last_call]}" ] \
+      || fail "$label: ordinary evaluation unexpectedly had an evidence cutoff"
+  fi
+  echo "  OK: $label"
+}
+
+run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
+run_wait_case "terminal-failure" "failure" pull_request failure 1
+run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
+run_wait_case "request-deadline" "waiting-request" pull_request failure 3 120 120 60 true
+run_wait_case "review-deadline" "waiting-review" pull_request failure 3 120 120 60 true
+run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180 true
+run_wait_case "request-cutoff-starts-review-window" "waiting-request,waiting-review,success" pull_request success 3 120 120 180 true
+run_wait_case "collection-crosses-request-cutoff" "waiting-request,success,waiting-review,success" pull_request success 4 120 120 60 true 40
+run_wait_case "unknown-state" "unknown" pull_request failure 1
+rm -rf "$wait_fixture"
 
 echo "==> review-gate binds evidence to event PR coordinates"
 coordinate_fixture="$(mktemp -d)"
@@ -293,6 +458,7 @@ gh() {
     --arg baseRef "${GH_FIXTURE_BASE_REF:-main}" \
     '{number:$number,head:{sha:$head},base:{sha:$base,ref:$baseRef}}'
 }
+rest_api() { gh api "$@"; }
 fetch_pull_request pull_request 17 "$requested_head" main "$coordinate_fixture/pr.json" \
   || fail "matching PR coordinates were rejected"
 for mismatch in number head base-ref; do
@@ -335,26 +501,27 @@ tmp="$collector_fixture/evidence"
 # shellcheck disable=SC2034
 REPO=example/project
 mkdir -p "$tmp"
+REST_REQUEST_LIMIT=20
+printf '0\n' >"$tmp/rest-request-count"
 mock_calls="$collector_fixture/calls"
 : >"$mock_calls"
 
 gh() {
   [ "$1" = api ] || return 99
   case "$2" in
-    --paginate)
-      case "$3" in
-        *issues/*/comments*)
-          printf '%s\n' \
-            '[{"body":"@codex review","user":{"login":"admin"}},{"body":"ordinary discussion","user":{"login":"ignored"}}]' \
-            '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
-          ;;
-        *pulls/*/comments*)
-          printf '%s\n' \
-            '[{"in_reply_to_id":7,"user":{"login":"writer"}},{"in_reply_to_id":null,"user":{"login":"finding"}}]' \
-            '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
-          ;;
-        *) return 98 ;;
-      esac
+    *issues/*/comments*page=1)
+      jq -cn '[range(0;98) | {body:"ordinary discussion",user:{login:"ignored"}}]
+        + [{body:"@codex review",user:{login:"admin"}},{body:"ordinary discussion",user:{login:"ignored"}}]'
+      ;;
+    *issues/*/comments*page=2)
+      printf '%s\n' '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
+      ;;
+    *pulls/*/comments*page=1)
+      jq -cn '[range(0;98) | {in_reply_to_id:null,user:{login:"finding"}}]
+        + [{in_reply_to_id:7,user:{login:"writer"}},{in_reply_to_id:null,user:{login:"finding"}}]'
+      ;;
+    *pulls/*/comments*page=2)
+      printf '%s\n' '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
       ;;
     --include)
       login="${3%/permission}"
@@ -422,7 +589,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
-  and .gateBehaviorContractVersion == 1
+  and .gateBehaviorContractVersion == 2
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -611,7 +778,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for invalid_behavior_version in null '"1"' 2; do
+  for invalid_behavior_version in null '"2"' 1; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
