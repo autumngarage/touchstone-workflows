@@ -249,21 +249,29 @@ jobs:
           }
           # touchstone:fix-reachability:end
 
+          # The prior issue-comment snapshot is read alongside the current one:
+          # under a cutoff the evaluator judges a comment's reconstructed
+          # pre-deadline body, and it fails closed when an author it selected
+          # that way has no permission entry. Collecting only from current
+          # bodies therefore wedges a timely, authorized answer whose comment
+          # was edited afterwards. The snapshot repeats most comments, so
+          # deduplicating logins keeps the added cost near zero.
           collect_author_permissions() {
             issue_comments="$1"
             review_comments="$2"
-            output="$3"
+            prior_issue_comments="$3"
+            output="$4"
             printf '{}\n' >"$output"
 
             jq -r -s '
-              ([.[0][]?
-                | select(
+              (([.[0][]?] + [.[2][]?])
+                | map(select(
                     ((.body // "") | test("^[[:space:]]*@codex[[:space:]]+review([[:space:]]|$)"; "i"))
-                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer[[:space:]]")))
-                | .user.login // empty]
-               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty])
+                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer[[:space:]]"))))
+                | map(.user.login // empty))
+               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty]
               | unique[]
-            ' "$issue_comments" "$review_comments" |
+            ' "$issue_comments" "$review_comments" "$prior_issue_comments" |
               while IFS= read -r login; do
                 response="$tmp/permission-response.json"
                 error="$tmp/permission-error.txt"
@@ -311,7 +319,8 @@ jobs:
 
           api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
           api_array "repos/$REPO/pulls/$number/comments?per_page=100" "$tmp/review-comments.json"
-          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
+          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+            "$tmp/prior-issue-comments.json" "$tmp/author-permissions.json"
           api_array "repos/$REPO/commits/$head/pulls?per_page=100" "$tmp/head-pulls.json"
           # shellcheck disable=SC2016
           gh api graphql --paginate \

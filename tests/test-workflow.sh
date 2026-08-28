@@ -530,6 +530,7 @@ gh() {
       case "$login" in
         admin) permission="admin" ;;
         writer) permission="write" ;;
+        deputy) permission="write" ;;
         maintainer) permission="maintain" ;;
         outsider)
           printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}\n'
@@ -555,10 +556,13 @@ gh() {
 
 api_array 'repos/example/project/issues/1/comments?per_page=100' "$tmp/issues.json"
 api_array 'repos/example/project/pulls/1/comments?per_page=100' "$tmp/review-comments.json"
-collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
-jq -e '. == {admin:"admin", maintainer:"maintain", outsider:"none", writer:"write"}' \
-  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, or expected 404"
-for login in admin writer maintainer outsider; do
+printf '%s\n' '[{"body":"Fixed. <!-- touchstone:review-answer v=1 id=7 disposition=no-code-change -->","user":{"login":"deputy"}},{"body":"@codex review","user":{"login":"admin"}}]' \
+  >"$tmp/prior-issues.json"
+collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/author-permissions.json"
+jq -e '. == {admin:"admin", deputy:"write", maintainer:"maintain", outsider:"none", writer:"write"}' \
+  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, snapshot author, or expected 404"
+for login in admin writer maintainer outsider deputy; do
   [ "$(grep -Fxc "$login" "$mock_calls")" -eq 1 ] || fail "$login permission was not looked up exactly once"
 done
 if grep -Eq '^(ignored|finding)$' "$mock_calls"; then
@@ -567,13 +571,16 @@ fi
 
 printf '[{"body":"@codex review","user":{"login":"denied"}}]\n' >"$tmp/issues.json"
 printf '[]\n' >"$tmp/review-comments.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
+printf '[]\n' >"$tmp/prior-issues.json"
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
   fail "an authorization failure did not fail permission collection closed"
 fi
 grep -Fq "HTTP 403" "$tmp/denied.err" || fail "authorization failure lost its HTTP context"
 
 printf '[{"body":"@codex review","user":{"login":"transport"}}]\n' >"$tmp/issues.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
   fail "a transport failure did not fail permission collection closed"
 fi
 grep -Fq "transport failure" "$tmp/transport.err" || fail "transport failure lost its diagnostic context"
