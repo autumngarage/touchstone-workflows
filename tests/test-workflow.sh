@@ -530,6 +530,7 @@ gh() {
       case "$login" in
         admin) permission="admin" ;;
         writer) permission="write" ;;
+        deputy) permission="write" ;;
         maintainer) permission="maintain" ;;
         outsider)
           printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}\n'
@@ -555,10 +556,13 @@ gh() {
 
 api_array 'repos/example/project/issues/1/comments?per_page=100' "$tmp/issues.json"
 api_array 'repos/example/project/pulls/1/comments?per_page=100' "$tmp/review-comments.json"
-collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
-jq -e '. == {admin:"admin", maintainer:"maintain", outsider:"none", writer:"write"}' \
-  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, or expected 404"
-for login in admin writer maintainer outsider; do
+printf '%s\n' '[{"body":"Fixed. <!-- touchstone:review-answer v=1 id=7 disposition=no-code-change -->","user":{"login":"deputy"}},{"body":"@codex review","user":{"login":"admin"}}]' \
+  >"$tmp/prior-issues.json"
+collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/author-permissions.json"
+jq -e '. == {admin:"admin", deputy:"write", maintainer:"maintain", outsider:"none", writer:"write"}' \
+  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, snapshot author, or expected 404"
+for login in admin writer maintainer outsider deputy; do
   [ "$(grep -Fxc "$login" "$mock_calls")" -eq 1 ] || fail "$login permission was not looked up exactly once"
 done
 if grep -Eq '^(ignored|finding)$' "$mock_calls"; then
@@ -567,13 +571,16 @@ fi
 
 printf '[{"body":"@codex review","user":{"login":"denied"}}]\n' >"$tmp/issues.json"
 printf '[]\n' >"$tmp/review-comments.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
+printf '[]\n' >"$tmp/prior-issues.json"
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
   fail "an authorization failure did not fail permission collection closed"
 fi
 grep -Fq "HTTP 403" "$tmp/denied.err" || fail "authorization failure lost its HTTP context"
 
 printf '[{"body":"@codex review","user":{"login":"transport"}}]\n' >"$tmp/issues.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
+if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+  "$tmp/prior-issues.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
   fail "a transport failure did not fail permission collection closed"
 fi
 grep -Fq "transport failure" "$tmp/transport.err" || fail "transport failure lost its diagnostic context"
@@ -897,5 +904,129 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   fi
   rm -r "$fixture"
 fi
+
+echo "==> review-gate proves a claimed fix reaches the evaluated head"
+reach_fixture="$(mktemp -d)"
+trap 'rm -rf "$reach_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:permission-collector:start/ { copying = 1; next }
+  /touchstone:permission-collector:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$reach_fixture/deps.sh"
+awk '
+  /touchstone:fix-reachability:start/ { copying = 1; next }
+  /touchstone:fix-reachability:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$reach_fixture/collector.sh"
+# shellcheck source=/dev/null
+source "$reach_fixture/deps.sh"
+# shellcheck source=/dev/null
+source "$reach_fixture/collector.sh"
+tmp="$reach_fixture/evidence"
+# Used by the sourced production collector.
+# shellcheck disable=SC2034
+REPO=example/project
+mkdir -p "$tmp"
+REST_REQUEST_LIMIT=20
+printf '0\n' >"$tmp/rest-request-count"
+reach_head=1111111111111111111111111111111111111111
+reach_in=2222222222222222222222222222222222222222
+reach_out=3333333333333333333333333333333333333333
+reach_unknown=4444444444444444444444444444444444444444
+reach_flaky=5555555555555555555555555555555555555555
+reach_hostile=6666666666666666666666666666666666666666
+reach_prior=7777777777777777777777777777777777777777
+printf '{"driver":"admin","helper":"write","stranger":"read","ghost":"none"}\n' \
+  >"$reach_fixture/permissions.json"
+reach_calls="$reach_fixture/calls"
+: >"$reach_calls"
+gh() {
+  [ "$1" = api ] || return 99
+  [ "$2" = --include ] || return 98
+  printf '%s\n' "$3" >>"$reach_calls"
+  case "$3" in
+    *"compare/$reach_in...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"ahead"}\n' ;;
+    *"compare/$reach_out...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"diverged"}\n' ;;
+    *"compare/$reach_unknown...$reach_head") printf 'HTTP/2 404\r\n\r\n{}\n'; return 1 ;;
+    *"compare/$reach_flaky...$reach_head") printf 'HTTP/2 502\r\n\r\n{}\n'; return 1 ;;
+    *"compare/$reach_prior...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"identical"}\n' ;;
+    *) return 1 ;;
+  esac
+}
+# An answer on the head itself, one behind it, one off it, one GitHub has
+# never heard of, and the same SHA claimed twice. Prose naming a commit is not
+# a claim, a no-code answer names none, and -- the budget-exhaustion shape --
+# a pile of distinct SHAs arrives from accounts with no write access.
+cat >"$reach_fixture/issues.json" <<EOF_ISSUES
+[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=1 disposition=fixed fix=$reach_head -->"},
+ {"user":{"login":"driver"},"body":"Fixed in $reach_out, honest."},
+ {"user":{"login":"driver"},"body":"None needed. <!-- touchstone:review-answer v=1 id=2 disposition=no-code-change -->"},
+ {"user":{"login":"stranger"},"body":"a <!-- touchstone:review-answer v=1 id=90 disposition=fixed fix=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --> b <!-- touchstone:review-answer v=1 id=91 disposition=fixed fix=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --> c <!-- touchstone:review-answer v=1 id=92 disposition=fixed fix=cccccccccccccccccccccccccccccccccccccccc -->"},
+ {"user":{"login":"ghost"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=93 disposition=fixed fix=$reach_hostile -->"}]
+EOF_ISSUES
+cat >"$reach_fixture/review-comments.json" <<EOF_COMMENTS
+[{"user":{"login":"helper"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=3 disposition=fixed fix=$reach_in -->"},
+ {"user":{"login":"driver"},"body":"Also fixed. <!-- touchstone:review-answer v=1 id=4 disposition=fixed fix=$reach_in -->"},
+ {"user":{"login":"helper"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=5 disposition=fixed fix=$reach_out -->"},
+ {"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=6 disposition=fixed fix=$reach_unknown -->"}]
+EOF_COMMENTS
+# Under a cutoff the evaluator judges an issue comment's reconstructed
+# pre-deadline body, so a SHA a later edit removed must still be compared.
+cat >"$reach_fixture/prior-issues.json" <<EOF_PRIOR
+[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=1 disposition=fixed fix=$reach_in -->"},
+ {"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=8 disposition=fixed fix=$reach_prior -->"}]
+EOF_PRIOR
+collect_fix_reachability "$reach_head" "$reach_fixture/issues.json" \
+  "$reach_fixture/review-comments.json" "$reach_fixture/prior-issues.json" \
+  "$reach_fixture/permissions.json" "$reach_fixture/reachability.json" \
+  || fail "fix reachability collection failed"
+jq -e --arg head "$reach_head" --arg in "$reach_in" --arg out "$reach_out" \
+  --arg unknown "$reach_unknown" --arg prior "$reach_prior" '
+  .[$head] == true and .[$in] == true and .[$out] == false and .[$unknown] == false
+  and .[$prior] == true
+  and (keys | length) == 5
+' "$reach_fixture/reachability.json" >/dev/null \
+  || fail "reachability verdicts are wrong: $(cat "$reach_fixture/reachability.json")"
+# The head needs no request, a repeated SHA needs no second one, prose naming
+# a commit is not a claim, and an unauthorized author's markers are not worth
+# a request at all -- three, not nine.
+# A SHA repeated between the snapshot and the current bodies is still one
+# request -- four, not eleven.
+[ "$(wc -l <"$reach_calls" | tr -d ' ')" -eq 4 ] \
+  || fail "reachability spent $(wc -l <"$reach_calls" | tr -d ' ') REST requests, expected 4: $(cat "$reach_calls")"
+grep -q "compare/$reach_head" "$reach_calls" \
+  && fail "reachability compared the head against itself"
+grep -qE "compare/(aaaaaaaa|bbbbbbbb|cccccccc|$reach_hostile)" "$reach_calls" \
+  && fail "an unauthorized author's marker spent a REST request"
+# An operational failure is not a verdict: it aborts the evaluation so the
+# poll continues, instead of reporting the finding as unanswered.
+cat >"$reach_fixture/flaky.json" <<EOF_FLAKY
+[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=7 disposition=fixed fix=$reach_flaky -->"}]
+EOF_FLAKY
+printf "[]\n" >"$reach_fixture/empty.json"
+if collect_fix_reachability "$reach_head" "$reach_fixture/flaky.json" \
+  "$reach_fixture/empty.json" "$reach_fixture/empty.json" \
+  "$reach_fixture/permissions.json" \
+  "$reach_fixture/flaky-out.json" >/dev/null 2>"$reach_fixture/flaky.err"; then
+  fail "a 502 comparison was recorded as a verdict instead of aborting"
+fi
+grep -q "HTTP 502" "$reach_fixture/flaky.err" \
+  || fail "an operational comparison failure was not diagnosed: $(cat "$reach_fixture/flaky.err")"
+# The budget guard lives in rest_api, which refuses before calling gh. Setting
+# the exhausted marker by hand would only re-run the transport-failure path
+# above, so drive the counter to the limit and let any call be the failure.
+printf '%s\n' "$REST_REQUEST_LIMIT" >"$tmp/rest-request-count"
+gh() { fail "reachability called gh after the REST budget was exhausted"; }
+if collect_fix_reachability "$reach_head" "$reach_fixture/issues.json" \
+  "$reach_fixture/review-comments.json" "$reach_fixture/prior-issues.json" \
+  "$reach_fixture/permissions.json" \
+  "$reach_fixture/reachability.json" >/dev/null 2>&1; then
+  fail "reachability collection survived an exhausted REST budget"
+fi
+printf '0\n' >"$tmp/rest-request-count"
+rm -f "$tmp/rest-budget-exhausted"
+unset -f gh
+echo "  OK: authorization, head identity, dedupe, and definitive-vs-operational failures are explicit"
+rm -rf "$reach_fixture"
 
 echo "workflow contract passed"

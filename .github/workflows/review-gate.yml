@@ -55,8 +55,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="429cb86237d6c86396e435888e4bbc340e1c6618"
-          evaluator_sha256="6759081110893326dc323c80c09c1f185ec0055bd05f1c5cbdc0f0d5346bfc73"
+          touchstone_revision="729fb89faa53851a3da967e88807fc5848e02b8d"
+          evaluator_sha256="8213bd5097807944750f0d64c3bd04d4634f352a429d01441bf7bcf96088fdcc"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
             -o "$RUNNER_TEMP/evaluate.jq"
@@ -181,21 +181,97 @@ jobs:
             awk 'body { print; next } { line = $0; sub(/\r$/, "", line); if (line == "") body = 1 }' "$1"
           }
 
+          # touchstone:fix-reachability:start
+          # Contract 4: an answer claiming a fix is evidence only while its
+          # commit is reachable from the head being evaluated. The gate proves
+          # that here, from GitHub, instead of trusting the marker's author --
+          # the client's proof was made against the head it captured, which is
+          # not necessarily the head under evaluation.
+          #
+          # Cost is bounded by the enforced per-evaluation REST budget, so the
+          # common case must not spend it: a fix SHA equal to the head is
+          # reachable by identity and needs no request at all. Distinct SHAs
+          # are deduplicated, and each unresolvable comparison records false
+          # rather than a guess.
+          collect_fix_reachability() {
+            local head="$1" issues="$2" review_comments="$3" prior_issues="$4"
+            local permissions="$5" output="$6"
+            local fix_sha reachable status response error
+            printf '{}\n' >"$output"
+            while IFS= read -r fix_sha; do
+              [ -n "$fix_sha" ] || continue
+              if [ "$fix_sha" = "$head" ]; then
+                reachable=true
+              else
+                reachable=false
+                response="$tmp/compare-response.json"
+                error="$tmp/compare-error.txt"
+                if rest_api --include "repos/$REPO/compare/$fix_sha...$head" >"$response" 2>"$error"; then
+                  if ! status="$(response_body "$response" | jq -er '.status | select(type == "string" and length > 0)')"; then
+                    echo "ERROR: malformed comparison response for fix $fix_sha." >&2
+                    return 1
+                  fi
+                  case "$status" in identical | ahead) reachable=true ;; esac
+                else
+                  status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response")"
+                  # 404 is the definitive answer that this repository has no
+                  # such commit, and 422 that the two cannot be compared:
+                  # both mean the claim is not reachable. Anything else is an
+                  # evidence-collection failure, and recording it as
+                  # unreachable would turn a rate limit or a 5xx into a
+                  # terminal unanswered finding that stops the poll.
+                  case "$status" in
+                    404 | 422) ;;
+                    *)
+                      echo "ERROR: cannot compare fix $fix_sha with head $head (HTTP ${status:-transport failure})." >&2
+                      cat "$error" >&2
+                      return 1
+                      ;;
+                  esac
+                fi
+              fi
+              jq --arg sha "$fix_sha" --argjson reachable "$reachable" '. + {($sha): $reachable}' \
+                "$output" >"$output.next" && mv "$output.next" "$output"
+            # Only an authorized author's marker is worth a request. Without
+            # this, one comment from any account on a public repository can
+            # carry a dozen syntactically valid markers naming distinct SHAs
+            # and exhaust the per-evaluation budget, failing the gate for as
+            # long as the comment exists. The evaluator applies the same
+            # permission test before such a marker can answer anything.
+            done < <(jq -r --slurpfile permissions "$permissions" '
+                $permissions[0] as $p
+                | .[]
+                | select((($p[(.user.login // "")] // "") | . == "write" or . == "maintain" or . == "admin"))
+                | (.body // "")
+                | [scan("<!--[ \t]*touchstone:review-answer[ \t]+v=1[ \t]+id=[0-9]+[ \t]+disposition=fixed[ \t]+fix=([0-9a-fA-F]{40})[ \t]*-->")]
+                | .[][]' "$issues" "$review_comments" "$prior_issues" \
+              | tr 'A-F' 'a-f' | sort -u)
+          }
+          # touchstone:fix-reachability:end
+
+          # The prior issue-comment snapshot is read alongside the current one:
+          # under a cutoff the evaluator judges a comment's reconstructed
+          # pre-deadline body, and it fails closed when an author it selected
+          # that way has no permission entry. Collecting only from current
+          # bodies therefore wedges a timely, authorized answer whose comment
+          # was edited afterwards. The snapshot repeats most comments, so
+          # deduplicating logins keeps the added cost near zero.
           collect_author_permissions() {
             issue_comments="$1"
             review_comments="$2"
-            output="$3"
+            prior_issue_comments="$3"
+            output="$4"
             printf '{}\n' >"$output"
 
             jq -r -s '
-              ([.[0][]?
-                | select(
+              (([.[0][]?] + [.[2][]?])
+                | map(select(
                     ((.body // "") | test("^[[:space:]]*@codex[[:space:]]+review([[:space:]]|$)"; "i"))
-                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer id=[0-9]+[[:space:]]*-->")))
-                | .user.login // empty]
-               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty])
+                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer[[:space:]]"))))
+                | map(.user.login // empty))
+               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty]
               | unique[]
-            ' "$issue_comments" "$review_comments" |
+            ' "$issue_comments" "$review_comments" "$prior_issue_comments" |
               while IFS= read -r login; do
                 response="$tmp/permission-response.json"
                 error="$tmp/permission-error.txt"
@@ -243,7 +319,8 @@ jobs:
 
           api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
           api_array "repos/$REPO/pulls/$number/comments?per_page=100" "$tmp/review-comments.json"
-          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" "$tmp/author-permissions.json"
+          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
+            "$tmp/prior-issue-comments.json" "$tmp/author-permissions.json"
           api_array "repos/$REPO/commits/$head/pulls?per_page=100" "$tmp/head-pulls.json"
           # shellcheck disable=SC2016
           gh api graphql --paginate \
@@ -280,6 +357,10 @@ jobs:
             esac
           done < <(jq -r '.[] | (.body // "") | capture("touchstone:pr-open head=[0-9a-fA-F]{40} base=[^ ]+ base_sha=(?<b>[0-9a-fA-F]{40})")? | .b' "$tmp/issues.json" | sort -u)
 
+          collect_fix_reachability "$head" "$tmp/issues.json" "$tmp/review-comments.json" \
+            "$tmp/prior-issue-comments.json" "$tmp/author-permissions.json" \
+            "$tmp/fix-reachability.json" || return 1
+
           jq -n \
             --slurpfile pr "$tmp/pr.json" --slurpfile issueComments "$tmp/issues-resolved.json" \
             --slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \
@@ -287,12 +368,14 @@ jobs:
             --slurpfile reviews "$tmp/reviews.json" --slurpfile reviewComments "$tmp/review-comments.json" \
             --slurpfile headPulls "$tmp/head-pulls.json" --slurpfile bases "$tmp/bases.json" \
             --slurpfile authorPermissions "$tmp/author-permissions.json" \
+            --slurpfile fixReachability "$tmp/fix-reachability.json" \
             --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" --arg currentSince "$head_current_since" --arg retargetedAt "$base_retargeted_at" \
             --arg evidenceCutoffAt "$evidence_cutoff_at" \
             '($pr[0]) as $pr | {
-              contractVersion: 3, complete: true,
+              contractVersion: 4, complete: true,
               trustedAuthors: ($trusted | split(",")),
               authorPermissions: $authorPermissions[0],
+              fixCommitReachability: $fixReachability[0],
               pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha, baseRef: $pr.base.ref, baseSha: $pr.base.sha,
                    acceptableBaseShas: $bases[0], headCurrentSince: $currentSince, baseRetargetedAt: $retargetedAt,
                    openHeadPulls: [$headPulls[0][] | select(.state == "open" and .base.repo.full_name == $repo and .head.sha == $pr.head.sha) | .number]},
