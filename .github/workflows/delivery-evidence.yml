@@ -37,8 +37,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="0e4eda3432671246d1e259b3bca0ce9e16c986a0"
-          evaluator_sha256="7bfd51b1aa3d25c3826657b37abc21b4a46baa08a9e7e5e432787c41ee071be6"
+          touchstone_revision="47d27d6219b3676392081789caa172d74f732d2f"
+          evaluator_sha256="dd0cfa2637e462d96bf68218ae75cb7fda8bfb244967cad6f361a5036185b8fb"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \
             -o "$RUNNER_TEMP/check-delivery-evidence.sh"
