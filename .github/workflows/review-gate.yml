@@ -47,10 +47,17 @@ jobs:
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
       REVIEW_REQUEST_WAIT_SECONDS: 120
       REVIEW_EVIDENCE_WAIT_SECONDS: 3600
-      # Scale boundary: 3 concurrent PRs * 12 polls/hour * the enforced
-      # 20 REST requests/evaluation = 720 of the token's 1,000 requests/hour.
-      REST_REQUEST_LIMIT: 20
-      REVIEW_POLL_SECONDS: 300
+      # Scale boundary: 3 concurrent PRs * 6 polls/hour * the enforced
+      # 44 REST requests/evaluation = 792 of the token's 1,000 requests/hour.
+      #
+      # The ceiling is per EVALUATION and the gate spends roughly one request
+      # per answered review thread, so it scales with how thoroughly a pull
+      # request was reviewed: at 20 a heavily reviewed PR could not be
+      # evaluated at all and became unmergeable (AUT-1106). Raised to cover
+      # that, with the poll interval slowed to keep the hourly projection
+      # inside the same budget — the two are one number, not two.
+      REST_REQUEST_LIMIT: 44
+      REVIEW_POLL_SECONDS: 600
     steps:
       - name: Fetch pinned evaluator
         run: |
