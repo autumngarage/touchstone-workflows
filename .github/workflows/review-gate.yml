@@ -1,16 +1,24 @@
 name: review-gate
 
-# Central required review gate for Touchstone consumers. GitHub runs this
-# pinned source against the target pull request and against the merge
-# queue's commit, outside the PR's control. It reads evidence with the
-# read-only token, runs the pure evaluator fetched from Touchstone at a
-# pinned revision, and passes or fails. It publishes nothing: the job's own
-# conclusion is the verdict, and no workflow in the target repository can
-# forge it.
+# Central required review gate for Touchstone consumers, gate behavior
+# contract version 3. GitHub runs this pinned source against the target pull
+# request and against the merge queue's commit, outside the PR's control. It
+# reads the current review surface with the read-only token, runs the pure
+# evaluator fetched from Touchstone at a pinned revision, and passes or
+# fails. It publishes nothing: the job's own conclusion is the verdict, and
+# no workflow in the target repository can forge it.
+#
+# The contract: one trusted, explicit reviewer verdict bound to the current
+# head. Only an unedited clean result succeeds. The gate never adjudicates
+# whether historical findings were answered — GitHub's conversation
+# resolution rule owns threads, and the merge queue owns the prospective
+# merged result — so evidence collection is O(pages of current surfaces),
+# never O(review history) (AUT-1132; the 20-request capacity failure this
+# replaces was AUT-1106).
 #
 # Pull-request runs keep an explicit waiting state alive while trusted review
 # evidence can still arrive. Terminal evidence failures stop immediately. The
-# merge queue never waits: it re-evaluates the complete merged result once.
+# merge queue never waits: it re-evaluates the PR's current-head verdict once.
 #
 # DEPENDENCY CONTRACT: the runner image, the target repository, github.com.
 
@@ -47,27 +55,28 @@ jobs:
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
       REVIEW_REQUEST_WAIT_SECONDS: 120
       REVIEW_EVIDENCE_WAIT_SECONDS: 3600
-      # Scale boundary: 3 concurrent PRs * 6 polls/hour * the enforced
-      # 44 REST requests/evaluation = 792 of the token's 1,000 requests/hour.
+      # Scale boundary: 3 concurrent PRs * 12 polls/hour * the enforced
+      # 12 REST requests/evaluation = 432 of the token's 1,000 requests/hour.
       #
-      # The ceiling is per EVALUATION and the gate spends roughly one request
-      # per answered review thread, so it scales with how thoroughly a pull
-      # request was reviewed: at 20 a heavily reviewed PR could not be
-      # evaluated at all and became unmergeable (AUT-1106). Raised to cover
-      # that, with the poll interval slowed to keep the hourly projection
-      # inside the same budget — the two are one number, not two.
-      REST_REQUEST_LIMIT: 44
-      REVIEW_POLL_SECONDS: 600
+      # The ceiling is per EVALUATION and is O(pages), independent of how
+      # much review history the pull request carries: 2 fixed reads, up to
+      # MAX_EVIDENCE_PAGES each of timeline and issue-comment pages, and one
+      # resolution per trusted head-prefix result candidate (normally one).
+      # A page bound, unlike the historical per-record work it replaces,
+      # cannot be exhausted by accumulating review rounds (AUT-1106).
+      REST_REQUEST_LIMIT: 12
+      MAX_EVIDENCE_PAGES: 4
+      REVIEW_POLL_SECONDS: 300
     steps:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="729fb89faa53851a3da967e88807fc5848e02b8d"
-          evaluator_sha256="8213bd5097807944750f0d64c3bd04d4634f352a429d01441bf7bcf96088fdcc"
+          touchstone_revision="aadd2b3d6b83971ca4802b3eee2effac97bd7ce6"
+          evaluator_sha256="3b509ed496fd6de055da62a595f21936cc8846be84b8741dee321e09641d64dc"
           curl -fsSL --retry 3 --retry-delay 2 \
-            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \
-            -o "$RUNNER_TEMP/evaluate.jq"
-          echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate-v3.jq" \
+            -o "$RUNNER_TEMP/evaluate-v3.jq"
+          echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate-v3.jq" | sha256sum --check --strict
 
       - name: Evaluate review evidence for the pull request
         run: |
@@ -146,22 +155,21 @@ jobs:
           event_head="$(jq -r .headSha "$tmp/event-pr.json")"
           event_base_ref="$(jq -r .baseRef "$tmp/event-pr.json")"
 
-          # touchstone:permission-collector:start
+          # touchstone:rest-budget:start
           # Every REST request crosses this hard budget boundary, including
-          # explicit pagination and dynamic per-record lookups. The counter is
-          # file-backed because command substitutions run functions in a
-          # subshell; the budget must survive those calls.
+          # explicit pagination and the bounded per-candidate resolutions. The
+          # counter is file-backed because command substitutions run functions
+          # in a subshell; the budget must survive those calls.
           rest_api() {
             local count
             count="$(cat "$tmp/rest-request-count")"
             case "$count" in
-              '' | *[!0-9]*) : >"$tmp/rest-budget-exhausted"; echo "ERROR: invalid REST request counter." >&2; return 1 ;;
+              '' | *[!0-9]*) echo "ERROR: invalid REST request counter." >&2; return 1 ;;
             esac
             case "$REST_REQUEST_LIMIT" in
-              '' | *[!0-9]* | 0) : >"$tmp/rest-budget-exhausted"; echo "ERROR: invalid REST request limit." >&2; return 1 ;;
+              '' | *[!0-9]* | 0) echo "ERROR: invalid REST request limit." >&2; return 1 ;;
             esac
             if [ "$count" -ge "$REST_REQUEST_LIMIT" ]; then
-              : >"$tmp/rest-budget-exhausted"
               echo "ERROR: review evidence requires more than the enforced $REST_REQUEST_LIMIT REST requests per evaluation." >&2
               return 1
             fi
@@ -169,11 +177,18 @@ jobs:
             gh api "$@"
           }
 
+          # Paginated collection of one GitHub-owned current surface. The page
+          # bound is the supported evidence scale: exceeding it is a distinct
+          # budget failure, never a truncated success.
           api_array() {
             local endpoint="$1" output="$2" page=1 page_output page_count
             shift 2
             printf '[]\n' >"$output"
             while :; do
+              if [ "$page" -gt "$MAX_EVIDENCE_PAGES" ]; then
+                echo "ERROR: ${endpoint%%\?*} exceeds the supported bound of $MAX_EVIDENCE_PAGES evidence pages." >&2
+                return 1
+              fi
               page_output="$tmp/rest-page.json"
               rest_api "${endpoint}&page=$page" "$@" >"$page_output"
               page_count="$(jq -er 'if type == "array" then length else error("expected an array") end' "$page_output")"
@@ -183,219 +198,93 @@ jobs:
               page=$((page + 1))
             done
           }
+          # touchstone:rest-budget:end
 
-          response_body() {
-            awk 'body { print; next } { line = $0; sub(/\r$/, "", line); if (line == "") body = 1 }' "$1"
-          }
-
-          # touchstone:fix-reachability:start
-          # Contract 4: an answer claiming a fix is evidence only while its
-          # commit is reachable from the head being evaluated. The gate proves
-          # that here, from GitHub, instead of trusting the marker's author --
-          # the client's proof was made against the head it captured, which is
-          # not necessarily the head under evaluation.
-          #
-          # Cost is bounded by the enforced per-evaluation REST budget, so the
-          # common case must not spend it: a fix SHA equal to the head is
-          # reachable by identity and needs no request at all. Distinct SHAs
-          # are deduplicated, and each unresolvable comparison records false
-          # rather than a guess.
-          collect_fix_reachability() {
-            local head="$1" issues="$2" review_comments="$3" prior_issues="$4"
-            local permissions="$5" output="$6"
-            local fix_sha reachable status response error
-            printf '{}\n' >"$output"
-            while IFS= read -r fix_sha; do
-              [ -n "$fix_sha" ] || continue
-              if [ "$fix_sha" = "$head" ]; then
-                reachable=true
-              else
-                reachable=false
-                response="$tmp/compare-response.json"
-                error="$tmp/compare-error.txt"
-                if rest_api --include "repos/$REPO/compare/$fix_sha...$head" >"$response" 2>"$error"; then
-                  if ! status="$(response_body "$response" | jq -er '.status | select(type == "string" and length > 0)')"; then
-                    echo "ERROR: malformed comparison response for fix $fix_sha." >&2
-                    return 1
-                  fi
-                  case "$status" in identical | ahead) reachable=true ;; esac
-                else
-                  status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response")"
-                  # 404 is the definitive answer that this repository has no
-                  # such commit, and 422 that the two cannot be compared:
-                  # both mean the claim is not reachable. Anything else is an
-                  # evidence-collection failure, and recording it as
-                  # unreachable would turn a rate limit or a 5xx into a
-                  # terminal unanswered finding that stops the poll.
-                  case "$status" in
-                    404 | 422) ;;
-                    *)
-                      echo "ERROR: cannot compare fix $fix_sha with head $head (HTTP ${status:-transport failure})." >&2
-                      cat "$error" >&2
-                      return 1
-                      ;;
-                  esac
-                fi
+          # touchstone:abbrev-resolution:start
+          # A trusted result comment names an abbreviated commit. Only an
+          # abbreviation that is a prefix of the evaluated head is a verdict
+          # candidate, and only those candidates are resolved -- normally one
+          # per evaluation, never O(result comments). The evaluator accepts a
+          # candidate only when its resolution equals the full head, so a
+          # mined prefix collision resolves to its true commit and is stale;
+          # an unresolvable candidate fails closed there, not here.
+          resolve_head_prefix_candidates() {
+            local head="$1" issues="$2" output="$3"
+            local abbrev resolved
+            cp "$issues" "$output"
+            while IFS= read -r abbrev; do
+              [ -n "$abbrev" ] || continue
+              if ! resolved="$(rest_api "repos/$REPO/commits/$abbrev" --jq .sha 2>/dev/null)"; then
+                resolved=""
               fi
-              jq --arg sha "$fix_sha" --argjson reachable "$reachable" '. + {($sha): $reachable}' \
-                "$output" >"$output.next" && mv "$output.next" "$output"
-            # Only an authorized author's marker is worth a request. Without
-            # this, one comment from any account on a public repository can
-            # carry a dozen syntactically valid markers naming distinct SHAs
-            # and exhaust the per-evaluation budget, failing the gate for as
-            # long as the comment exists. The evaluator applies the same
-            # permission test before such a marker can answer anything.
-            done < <(jq -r --slurpfile permissions "$permissions" '
-                $permissions[0] as $p
+              jq --arg abbrev "$abbrev" --arg resolved "$resolved" --arg trusted "$TRUSTED_REVIEWERS" '
+                ($trusted | split(",")) as $trusted_authors
+                | map((.user.login // "") as $login
+                    | if (($trusted_authors | index($login)) != null)
+                      and (((.body // "") | (capture("Reviewed commit:[*]*[[:space:]]*`(?<sha>[0-9a-fA-F]{7,40})`")? // {sha:""}) | .sha | ascii_downcase) == $abbrev)
+                    then . + {resolved_review_sha: $resolved}
+                    else . end)' "$output" >"$output.next"
+              mv "$output.next" "$output"
+            done < <(jq -r --arg trusted "$TRUSTED_REVIEWERS" --arg head "$head" '
+                ($head | ascii_downcase) as $h
+                | ($trusted | split(",")) as $trusted_authors
                 | .[]
-                | select((($p[(.user.login // "")] // "") | . == "write" or . == "maintain" or . == "admin"))
-                | (.body // "")
-                | [scan("<!--[ \t]*touchstone:review-answer[ \t]+v=1[ \t]+id=[0-9]+[ \t]+disposition=fixed[ \t]+fix=([0-9a-fA-F]{40})[ \t]*-->")]
-                | .[][]' "$issues" "$review_comments" "$prior_issues" \
-              | tr 'A-F' 'a-f' | sort -u)
+                | (.user.login // "") as $login
+                | select(($trusted_authors | index($login)) != null)
+                | ((.body // "") | (capture("Reviewed commit:[*]*[[:space:]]*`(?<sha>[0-9a-fA-F]{7,40})`")? // {sha:""}) | .sha | ascii_downcase) as $a
+                | select($a != "" and ($a | length) < 40 and ($h | startswith($a)))
+                | $a' "$issues" \
+              | sort -u)
           }
-          # touchstone:fix-reachability:end
-
-          # The prior issue-comment snapshot is read alongside the current one:
-          # under a cutoff the evaluator judges a comment's reconstructed
-          # pre-deadline body, and it fails closed when an author it selected
-          # that way has no permission entry. Collecting only from current
-          # bodies therefore wedges a timely, authorized answer whose comment
-          # was edited afterwards. The snapshot repeats most comments, so
-          # deduplicating logins keeps the added cost near zero.
-          collect_author_permissions() {
-            issue_comments="$1"
-            review_comments="$2"
-            prior_issue_comments="$3"
-            output="$4"
-            printf '{}\n' >"$output"
-
-            jq -r -s '
-              (([.[0][]?] + [.[2][]?])
-                | map(select(
-                    ((.body // "") | test("^[[:space:]]*@codex[[:space:]]+review([[:space:]]|$)"; "i"))
-                    or ((.body // "") | test("<!--[[:space:]]*touchstone:review-answer[[:space:]]"))))
-                | map(.user.login // empty))
-               + [.[1][]? | select(.in_reply_to_id != null) | .user.login // empty]
-              | unique[]
-            ' "$issue_comments" "$review_comments" "$prior_issue_comments" |
-              while IFS= read -r login; do
-                response="$tmp/permission-response.json"
-                error="$tmp/permission-error.txt"
-                if rest_api --include "repos/$REPO/collaborators/$login/permission" >"$response" 2>"$error"; then
-                  if ! permission="$(response_body "$response" | jq -er '.permission | select(type == "string" and length > 0)')"; then
-                    echo "ERROR: malformed effective permission response for '$login'." >&2
-                    return 1
-                  fi
-                else
-                  status="$(sed -n '1s/^HTTP\/[^ ]* \([0-9][0-9][0-9]\).*/\1/p' "$response")"
-                  if [ "$status" = 404 ]; then
-                    permission=none
-                  else
-                    echo "ERROR: cannot resolve effective repository permission for '$login' (HTTP ${status:-transport failure})." >&2
-                    cat "$error" >&2
-                    return 1
-                  fi
-                fi
-                jq --arg login "$login" --arg permission "$permission" \
-                  '. + {($login): $permission}' "$output" >"$output.next"
-                mv "$output.next" "$output"
-              done
-          }
-          # touchstone:permission-collector:end
+          # touchstone:abbrev-resolution:end
 
           evaluate_once() {
-          evidence_cutoff_at="${1:-}"
-          rm -f "$tmp/rest-budget-exhausted"
           printf '0\n' >"$tmp/rest-request-count"
-          [ -f "$tmp/prior-issue-comments.json" ] || printf '[]\n' >"$tmp/prior-issue-comments.json"
-          [ -f "$tmp/prior-review-comments.json" ] || printf '[]\n' >"$tmp/prior-review-comments.json"
           fetch_pull_request "$event_mode" "$number" "$event_head" "$event_base_ref" "$tmp/pr.json"
           head="$(jq -r '.head.sha' "$tmp/pr.json")"
-          base="$(jq -r '.base.sha' "$tmp/pr.json")"
-          # When did this SHA last become the head? Its commit date, or the
-          # force-push that restored it -- a bare request binds only a head
-          # current when it was posted. And a bare request cannot outlive a
-          # base retarget: the reviewer never saw the new base's diff.
-          head_committed_at="$(rest_api "repos/$REPO/commits/$head" --jq '.commit.committer.date')"
+
           api_array "repos/$REPO/issues/$number/timeline?per_page=100" "$tmp/timeline.json" \
             -H 'Accept: application/vnd.github+json'
-          head_current_since="$(jq -r --arg committed "$head_committed_at" \
-            '([.[] | select(.event == "head_ref_force_pushed") | .created_at] + [$committed]) | max' "$tmp/timeline.json")"
           base_retargeted_at="$(jq -r '[.[] | select(.event == "base_ref_changed") | .created_at] | max // ""' "$tmp/timeline.json")"
 
           api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
-          api_array "repos/$REPO/pulls/$number/comments?per_page=100" "$tmp/review-comments.json"
-          collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
-            "$tmp/prior-issue-comments.json" "$tmp/author-permissions.json"
-          api_array "repos/$REPO/commits/$head/pulls?per_page=100" "$tmp/head-pulls.json"
+          resolve_head_prefix_candidates "$head" "$tmp/issues.json" "$tmp/issues-resolved.json"
+
+          # One head must belong to exactly one open pull request.
+          rest_api "repos/$REPO/commits/$head/pulls?per_page=100" >"$tmp/head-pulls.json"
+
+          # Formal reviews, bound by GitHub to their commit. One page covers
+          # the supported scale; more is a distinct budget failure.
           # shellcheck disable=SC2016
-          gh api graphql --paginate \
-            -f query='query($owner:String!,$repo:String!,$number:Int!,$endCursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviews(first:100,after:$endCursor){nodes{databaseId body state submittedAt updatedAt commit{oid} author{login}} pageInfo{hasNextPage endCursor}}}}}' \
-            -F owner="${REPO%%/*}" -F repo="${REPO#*/}" -F number="$number" \
-            | jq -s '[.[].data.repository.pullRequest.reviews.nodes[] | {id: .databaseId, body, state, submitted_at: .submittedAt, updated_at: .updatedAt, commit_id: .commit.oid, user: {login: .author.login}}]' \
-            >"$tmp/reviews.json"
-
-          # Trusted result comments name an abbreviated commit; resolve it so
-          # the evaluator compares full SHAs.
-          printf '{}\n' >"$tmp/resolved.json"
-          while IFS=$'\t' read -r id abbreviated || [ -n "$id" ]; do
-            [ -n "$id" ] || continue
-            if [ "${#abbreviated}" -eq 40 ]; then resolved="$abbreviated"
-            elif ! resolved="$(rest_api "repos/$REPO/commits/$abbreviated" --jq .sha 2>/dev/null)"; then
-              [ ! -f "$tmp/rest-budget-exhausted" ] || return 1
-              echo "WARNING: trusted comment $id names unresolvable commit $abbreviated; ignored." >&2; resolved=""
-            fi
-            jq --arg id "$id" --arg sha "$resolved" '. + {($id): $sha}' "$tmp/resolved.json" >"$tmp/resolved.next" && mv "$tmp/resolved.next" "$tmp/resolved.json"
-          done < <(jq -r --arg trusted "$TRUSTED_REVIEWERS" '.[] | (.user.login // "") as $login | select(($trusted | split(",") | index($login)) != null) | ((.body // "") | capture("Reviewed commit:[*]*[[:space:]]*`(?<sha>[0-9a-fA-F]{7,40})`")?) as $m | select($m != null) | [(.id | tostring), $m.sha] | @tsv' "$tmp/issues.json")
-          jq --slurpfile resolved "$tmp/resolved.json" 'map(. + {resolved_review_sha: ($resolved[0][(.id | tostring)] // "")})' "$tmp/issues.json" >"$tmp/issues-resolved.json"
-
-          # A request binds the base it was made against or any ancestor of
-          # the current tip; the default branch advancing does not unmake it.
-          printf '["%s"]' "$base" >"$tmp/bases.json"
-          while IFS= read -r request_base; do
-            [ -n "$request_base" ] && [ "$request_base" != "$base" ] || continue
-            if ! status="$(rest_api "repos/$REPO/compare/$request_base...$base" --jq .status 2>/dev/null)"; then
-              [ ! -f "$tmp/rest-budget-exhausted" ] || return 1
-              status=unknown
-            fi
-            case "$status" in identical | ahead)
-              jq --arg sha "$request_base" '. + [$sha]' "$tmp/bases.json" >"$tmp/bases.next" && mv "$tmp/bases.next" "$tmp/bases.json" ;;
-            esac
-          done < <(jq -r '.[] | (.body // "") | capture("touchstone:pr-open head=[0-9a-fA-F]{40} base=[^ ]+ base_sha=(?<b>[0-9a-fA-F]{40})")? | .b' "$tmp/issues.json" | sort -u)
-
-          collect_fix_reachability "$head" "$tmp/issues.json" "$tmp/review-comments.json" \
-            "$tmp/prior-issue-comments.json" "$tmp/author-permissions.json" \
-            "$tmp/fix-reachability.json" || return 1
+          gh api graphql \
+            -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviews(first:100){nodes{databaseId body state submittedAt updatedAt commit{oid} author{login}} pageInfo{hasNextPage}}}}}' \
+            -F owner="${REPO%%/*}" -F repo="${REPO#*/}" -F number="$number" >"$tmp/reviews-response.json"
+          jq -e '.data.repository.pullRequest.reviews.pageInfo.hasNextPage == false' "$tmp/reviews-response.json" >/dev/null || {
+            echo "ERROR: more than 100 formal reviews exceeds the supported evidence bound." >&2
+            return 1
+          }
+          jq '[.data.repository.pullRequest.reviews.nodes[] | {id: .databaseId, body, state, submitted_at: .submittedAt, updated_at: .updatedAt, commit_id: .commit.oid, user: {login: .author.login}}]' \
+            "$tmp/reviews-response.json" >"$tmp/reviews.json"
 
           jq -n \
-            --slurpfile pr "$tmp/pr.json" --slurpfile issueComments "$tmp/issues-resolved.json" \
-            --slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \
-            --slurpfile priorReviewComments "$tmp/prior-review-comments.json" \
-            --slurpfile reviews "$tmp/reviews.json" --slurpfile reviewComments "$tmp/review-comments.json" \
-            --slurpfile headPulls "$tmp/head-pulls.json" --slurpfile bases "$tmp/bases.json" \
-            --slurpfile authorPermissions "$tmp/author-permissions.json" \
-            --slurpfile fixReachability "$tmp/fix-reachability.json" \
-            --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" --arg currentSince "$head_current_since" --arg retargetedAt "$base_retargeted_at" \
-            --arg evidenceCutoffAt "$evidence_cutoff_at" \
+            --slurpfile pr "$tmp/pr.json" \
+            --slurpfile issueComments "$tmp/issues-resolved.json" \
+            --slurpfile reviews "$tmp/reviews.json" \
+            --slurpfile headPulls "$tmp/head-pulls.json" \
+            --arg trusted "$TRUSTED_REVIEWERS" --arg repo "$REPO" \
+            --arg retargetedAt "$base_retargeted_at" \
             '($pr[0]) as $pr | {
-              contractVersion: 4, complete: true,
+              gateBehaviorContractVersion: 3, complete: true,
               trustedAuthors: ($trusted | split(",")),
-              authorPermissions: $authorPermissions[0],
-              fixCommitReachability: $fixReachability[0],
-              pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha, baseRef: $pr.base.ref, baseSha: $pr.base.sha,
-                   acceptableBaseShas: $bases[0], headCurrentSince: $currentSince, baseRetargetedAt: $retargetedAt,
+              pr: {number: $pr.number, state: $pr.state, headSha: $pr.head.sha,
+                   baseRef: $pr.base.ref, baseSha: $pr.base.sha,
+                   baseRetargetedAt: $retargetedAt,
                    openHeadPulls: [$headPulls[0][] | select(.state == "open" and .base.repo.full_name == $repo and .head.sha == $pr.head.sha) | .number]},
-              issueComments: $issueComments[0], priorIssueComments: $priorIssueComments[0],
-              reviews: $reviews[0], reviewComments: $reviewComments[0], priorReviewComments: $priorReviewComments[0]
-            } + (if $evidenceCutoffAt == "" then {} else {evidenceCutoffAt: $evidenceCutoffAt} end)' >"$tmp/evidence.json"
+              issueComments: $issueComments[0],
+              reviews: $reviews[0]
+            }' >"$tmp/evidence.json"
 
-          jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
-          }
-
-          refresh_evidence_snapshots() {
-          cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"
-          cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"
+          jq -f "$RUNNER_TEMP/evaluate-v3.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
           }
 
           # touchstone:review-wait:start
@@ -407,29 +296,9 @@ jobs:
             request_deadline=$((now + REVIEW_REQUEST_WAIT_SECONDS))
             review_deadline=0
             previous_state=""
-            deadline=0
 
             while :; do
-              evidence_cutoff_at=""
-              cutoff_previous_state="$previous_state"
-              if [ "$deadline" -gt 0 ]; then
-                now="$(review_gate_now)"
-                if [ "$now" -ge "$deadline" ]; then
-                  evidence_cutoff_at="$(jq -nr --argjson deadline "$deadline" '$deadline | todateiso8601')"
-                fi
-              fi
-              evaluate_once "$evidence_cutoff_at"
-              if [ -z "$evidence_cutoff_at" ] && [ "$deadline" -gt 0 ]; then
-                now="$(review_gate_now)"
-                if [ "$now" -ge "$deadline" ]; then
-                  # The evidence read itself crossed the boundary. Re-evaluate
-                  # the same current responses against the last pre-cutoff
-                  # snapshot before that snapshot is refreshed.
-                  evidence_cutoff_at="$(jq -nr --argjson deadline "$deadline" '$deadline | todateiso8601')"
-                  evaluate_once "$evidence_cutoff_at"
-                fi
-              fi
-              refresh_evidence_snapshots
+              evaluate_once
               state="$(jq -er '.state | select(type == "string" and length > 0)' "$tmp/verdict.json")"
 
               if [ "$state" != "$previous_state" ]; then
@@ -444,18 +313,6 @@ jobs:
                 *) echo "ERROR: evaluator returned unsupported state '$state'." >&2; return 1 ;;
               esac
 
-              if [ -n "$evidence_cutoff_at" ]; then
-                if [ "$cutoff_previous_state" = waiting-request ] && [ "$state" = waiting-review ]; then
-                  # A request that existed by the request cutoff earns the
-                  # complete review window even when a long poll first sees
-                  # it in the boundary evaluation.
-                  review_deadline=$((deadline + REVIEW_EVIDENCE_WAIT_SECONDS))
-                else
-                  echo "ERROR: review gate remained '$state' through its evidence deadline $evidence_cutoff_at." >&2
-                  return 1
-                fi
-              fi
-
               if [ "$event_mode" != pull_request ]; then
                 echo "ERROR: merge-group review evidence is incomplete; queue evaluation never waits." >&2
                 return 1
@@ -467,6 +324,8 @@ jobs:
                   deadline="$request_deadline"
                   ;;
                 waiting-review)
+                  # A request grants the complete review window from the
+                  # moment the gate first observes it.
                   if [ "$review_deadline" -eq 0 ]; then
                     review_deadline=$((now + REVIEW_EVIDENCE_WAIT_SECONDS))
                   fi

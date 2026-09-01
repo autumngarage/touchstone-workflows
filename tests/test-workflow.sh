@@ -159,11 +159,11 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
 fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$review_gate" \
-  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate.jq" \' \
+  '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate-v3.jq" \' \
   "review evaluator fetch"
 # shellcheck disable=SC2016
 assert_active_line "$review_gate" \
-  'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq" | sha256sum --check --strict' \
+  'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate-v3.jq" | sha256sum --check --strict' \
   "review evaluator checksum"
 assert_active_line "$review_gate" \
   'timeout-minutes: 65' \
@@ -175,10 +175,13 @@ assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
   "review evidence wait bound"
 assert_active_line "$review_gate" \
-  'REST_REQUEST_LIMIT: 44' \
+  'REST_REQUEST_LIMIT: 12' \
   "review REST request bound"
 assert_active_line "$review_gate" \
-  'REVIEW_POLL_SECONDS: 600' \
+  'MAX_EVIDENCE_PAGES: 4' \
+  "review evidence page bound"
+assert_active_line "$review_gate" \
+  'REVIEW_POLL_SECONDS: 300' \
   "review poll interval"
 assert_active_line "$review_gate" \
   'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
@@ -189,35 +192,21 @@ assert_active_line "$review_gate" \
 assert_active_line "$review_gate" \
   'wait_for_review_gate' \
   "production waiting-state loop"
-# Deadline evaluation must reconstruct mutable issue-comment bodies from the
-# last complete poll rather than treating GitHub's current body as historical.
+# Behavior v3 evaluates only current GitHub surfaces: the evidence document,
+# the bounded resolver, and the pinned evaluator must each be one active
+# command, and no prior-snapshot machinery may reappear.
 assert_active_line "$review_gate" \
-  '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' \
-  "prior issue-comment snapshot input"
+  'gateBehaviorContractVersion: 3, complete: true,' \
+  "gate behavior contract version in evidence"
 assert_active_line "$review_gate" \
-  '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' \
-  "prior review-comment snapshot input"
+  'resolve_head_prefix_candidates "$head" "$tmp/issues.json" "$tmp/issues-resolved.json"' \
+  "bounded head-prefix resolution"
 assert_active_line "$review_gate" \
-  'issueComments: $issueComments[0], priorIssueComments: $priorIssueComments[0],' \
-  "prior issue-comment snapshot evidence"
-assert_active_line "$review_gate" \
-  'reviews: $reviews[0], reviewComments: $reviewComments[0], priorReviewComments: $priorReviewComments[0]' \
-  "prior review-comment snapshot evidence"
-assert_active_line "$review_gate" \
-  'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' \
-  "prior issue-comment snapshot refresh"
-assert_active_line "$review_gate" \
-  'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' \
-  "prior review-comment snapshot refresh"
-snapshot_input_line="$(grep -nF -- '--slurpfile priorIssueComments "$tmp/prior-issue-comments.json" \' "$review_gate" | cut -d: -f1)"
-evaluation_line="$(grep -nF -- 'jq -f "$RUNNER_TEMP/evaluate.jq" "$tmp/evidence.json" >"$tmp/verdict.json"' "$review_gate" | cut -d: -f1)"
-snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/issues-resolved.json" "$tmp/prior-issue-comments.json"' "$review_gate" | cut -d: -f1)"
-[ "$snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$snapshot_refresh_line" ] \
-  || fail "$review_gate: snapshot must be consumed before evaluation and refreshed only afterward"
-review_snapshot_input_line="$(grep -nF -- '--slurpfile priorReviewComments "$tmp/prior-review-comments.json" \' "$review_gate" | cut -d: -f1)"
-review_snapshot_refresh_line="$(grep -nF -- 'cp "$tmp/review-comments.json" "$tmp/prior-review-comments.json"' "$review_gate" | cut -d: -f1)"
-[ "$review_snapshot_input_line" -lt "$evaluation_line" ] && [ "$evaluation_line" -lt "$review_snapshot_refresh_line" ] \
-  || fail "$review_gate: review snapshot must be consumed before evaluation and refreshed only afterward"
+  'jq -f "$RUNNER_TEMP/evaluate-v3.jq" "$tmp/evidence.json" >"$tmp/verdict.json"' \
+  "pinned evaluator execution"
+if grep -Eq 'priorIssueComments|priorReviewComments|evidenceCutoffAt|fixCommitReachability|authorPermissions' "$review_gate"; then
+  fail "$review_gate: historical reconstruction machinery reappeared in behavior v3"
+fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$delivery_evidence" \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \' \
@@ -311,8 +300,8 @@ direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'g
 
 budget_fixture="$(mktemp -d)"
 awk '
-  /touchstone:permission-collector:start/ { copying = 1; next }
-  /touchstone:permission-collector:end/ { copying = 0 }
+  /touchstone:rest-budget:start/ { copying = 1; next }
+  /touchstone:rest-budget:end/ { copying = 0 }
   copying { sub(/^          /, ""); print }
 ' "$review_gate" >"$budget_fixture/budget.sh"
 # shellcheck source=/dev/null
@@ -329,12 +318,88 @@ rest_api second >/dev/null || fail "REST budget rejected its boundary request"
 if rest_api third >/dev/null 2>&1; then
   fail "REST budget allowed a request beyond its enforced limit"
 fi
-[ -f "$tmp/rest-budget-exhausted" ] \
-  || fail "REST budget exhaustion did not leave a fail-closed signal for optional evidence lookups"
 [ "$(wc -l <"$budget_calls" | tr -d ' ')" -eq 2 ] \
   || fail "REST budget invoked gh after reaching its enforced limit"
+REST_REQUEST_LIMIT=20
+MAX_EVIDENCE_PAGES=2
+printf '0\n' >"$tmp/rest-request-count"
+gh() { jq -cn '[range(0;100) | {}]'; }
+if api_array 'repos/example/project/issues/1/comments?per_page=100' "$budget_fixture/pages.json" >/dev/null 2>"$budget_fixture/pages.err"; then
+  fail "evidence pagination beyond MAX_EVIDENCE_PAGES did not fail closed"
+fi
+grep -Fq "supported bound of 2 evidence pages" "$budget_fixture/pages.err" \
+  || fail "page-bound failure lost its diagnostic: $(cat "$budget_fixture/pages.err")"
+unset -f gh
 rm -rf "$budget_fixture"
 echo "  OK: enforced $production_request_limit-request evaluations consume at most $projected_requests requests/hour and leave $((standard_hourly_budget - projected_requests)) for unrelated work"
+
+echo "==> review-gate resolves only trusted head-prefix result candidates"
+resolve_fixture="$(mktemp -d)"
+trap 'rm -rf "$resolve_fixture"' EXIT HUP INT TERM
+awk '
+  /touchstone:rest-budget:start/ { copying = 1; next }
+  /touchstone:rest-budget:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$resolve_fixture/budget.sh"
+awk '
+  /touchstone:abbrev-resolution:start/ { copying = 1; next }
+  /touchstone:abbrev-resolution:end/ { copying = 0 }
+  copying { sub(/^          /, ""); print }
+' "$review_gate" >"$resolve_fixture/resolver.sh"
+# shellcheck source=/dev/null
+source "$resolve_fixture/budget.sh"
+# shellcheck source=/dev/null
+source "$resolve_fixture/resolver.sh"
+tmp="$resolve_fixture/evidence"
+mkdir -p "$tmp"
+# Used by the sourced production resolver.
+# shellcheck disable=SC2034
+REPO=example/project
+# shellcheck disable=SC2034
+TRUSTED_REVIEWERS=trusted-bot
+REST_REQUEST_LIMIT=20
+MAX_EVIDENCE_PAGES=4
+printf '0\n' >"$tmp/rest-request-count"
+resolve_head=1111111abc111111111111111111111111111111
+resolve_calls="$resolve_fixture/calls"
+: >"$resolve_calls"
+gh() {
+  [ "$1" = api ] || return 99
+  printf '%s\n' "$2" >>"$resolve_calls"
+  case "$2" in
+    *commits/1111111abc) printf '%s\n' "$resolve_head" ;;
+    *commits/1111111) echo 'gh: ambiguous (HTTP 422)' >&2; return 1 ;;
+    *) return 98 ;;
+  esac
+}
+cat >"$resolve_fixture/issues.json" <<EOF_RESOLVE
+[{"id":1,"user":{"login":"trusted-bot"},"body":"Didn't find any major issues.\n\n**Reviewed commit:** \`1111111abc\`"},
+ {"id":2,"user":{"login":"trusted-bot"},"body":"Didn't find any major issues.\n\n**Reviewed commit:** \`1111111abc\`"},
+ {"id":3,"user":{"login":"trusted-bot"},"body":"Didn't find any major issues.\n\n**Reviewed commit:** \`1111111\`"},
+ {"id":4,"user":{"login":"trusted-bot"},"body":"Old result.\n\n**Reviewed commit:** \`9999999\`"},
+ {"id":5,"user":{"login":"impostor"},"body":"Didn't find any major issues.\n\n**Reviewed commit:** \`1111111abc\`"}]
+EOF_RESOLVE
+resolve_head_prefix_candidates "$resolve_head" "$resolve_fixture/issues.json" \
+  "$resolve_fixture/resolved.json" || fail "head-prefix resolution failed"
+jq -e --arg head "$resolve_head" '
+  .[0].resolved_review_sha == $head
+  and .[1].resolved_review_sha == $head
+  and .[2].resolved_review_sha == ""
+  and (.[3] | has("resolved_review_sha") | not)
+  and (.[4] | has("resolved_review_sha") | not)
+' "$resolve_fixture/resolved.json" >/dev/null \
+  || fail "resolution results are wrong: $(jq -c 'map(.resolved_review_sha)' "$resolve_fixture/resolved.json")"
+# One request per unique candidate abbreviation: a repeated abbreviation, a
+# stale prefix, and an untrusted author spend nothing beyond the two
+# candidates; the ambiguous one records failure instead of a verdict.
+[ "$(wc -l <"$resolve_calls" | tr -d ' ')" -eq 2 ] \
+  || fail "resolution spent $(wc -l <"$resolve_calls" | tr -d ' ') REST requests, expected 2: $(cat "$resolve_calls")"
+grep -q "commits/9999999" "$resolve_calls" \
+  && fail "a stale non-prefix abbreviation spent a REST request"
+unset -f gh
+rm -rf "$resolve_fixture"
+trap - EXIT HUP INT TERM
+echo "  OK: dedupe, stale prefixes, untrusted authors, and unresolvable candidates are explicit"
 
 echo "==> review-gate waits only for pull-request evidence states"
 wait_fixture="$(mktemp -d)"
@@ -364,12 +429,9 @@ run_wait_case() {
   REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
   REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
   REVIEW_POLL_SECONDS="${8:-60}"
-  expected_cutoff="${9:-false}"
-  EVALUATION_SECONDS="${10:-0}"
-  WAIT_CUTOFFS=()
+  EVALUATION_SECONDS="${9:-0}"
 
   evaluate_once() {
-    WAIT_CUTOFFS[$WAIT_CALLS]="${1:-}"
     index="$WAIT_CALLS"
     if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
     state="${WAIT_STATES[$index]}"
@@ -377,7 +439,6 @@ run_wait_case() {
     jq -n --arg state "$state" '{state: $state, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
     MOCK_NOW=$((MOCK_NOW + EVALUATION_SECONDS))
   }
-  refresh_evidence_snapshots() { :; }
   review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
   review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
 
@@ -388,25 +449,16 @@ run_wait_case() {
   fi
   [ "$WAIT_CALLS" -eq "$expected_calls" ] \
     || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
-  last_call=$((WAIT_CALLS - 1))
-  if [ "$expected_cutoff" = true ]; then
-    [ -n "${WAIT_CUTOFFS[$last_call]}" ] \
-      || fail "$label: final deadline evaluation had no evidence cutoff"
-  else
-    [ -z "${WAIT_CUTOFFS[$last_call]}" ] \
-      || fail "$label: ordinary evaluation unexpectedly had an evidence cutoff"
-  fi
   echo "  OK: $label"
 }
 
 run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
 run_wait_case "terminal-failure" "failure" pull_request failure 1
 run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
-run_wait_case "request-deadline" "waiting-request" pull_request failure 3 120 120 60 true
-run_wait_case "review-deadline" "waiting-review" pull_request failure 3 120 120 60 true
-run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180 true
-run_wait_case "request-cutoff-starts-review-window" "waiting-request,waiting-review,success" pull_request success 3 120 120 180 true
-run_wait_case "collection-crosses-request-cutoff" "waiting-request,success,waiting-review,success" pull_request success 4 120 120 60 true 40
+run_wait_case "request-deadline" "waiting-request" pull_request failure 3
+run_wait_case "review-deadline" "waiting-review" pull_request failure 3
+run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180
+run_wait_case "request-starts-full-review-window" "waiting-request,waiting-review,waiting-review,success" pull_request success 4 60 180 60
 run_wait_case "unknown-state" "unknown" pull_request failure 1
 rm -rf "$wait_fixture"
 
@@ -486,108 +538,6 @@ rm -rf "$coordinate_fixture"
 trap - EXIT HUP INT TERM
 echo "  OK: PR head/ref and queue coordinates fail closed without freezing an advancing base SHA"
 
-echo "==> review-gate collects effective permission once per potential driver author"
-collector_fixture="$(mktemp -d)"
-trap 'rm -rf "$collector_fixture"' EXIT HUP INT TERM
-awk '
-  /touchstone:permission-collector:start/ { copying = 1; next }
-  /touchstone:permission-collector:end/ { copying = 0 }
-  copying { sub(/^          /, ""); print }
-' "$review_gate" >"$collector_fixture/collector.sh"
-# shellcheck source=/dev/null
-source "$collector_fixture/collector.sh"
-tmp="$collector_fixture/evidence"
-# Used by the sourced production collector.
-# shellcheck disable=SC2034
-REPO=example/project
-mkdir -p "$tmp"
-REST_REQUEST_LIMIT=20
-printf '0\n' >"$tmp/rest-request-count"
-mock_calls="$collector_fixture/calls"
-: >"$mock_calls"
-
-gh() {
-  [ "$1" = api ] || return 99
-  case "$2" in
-    *issues/*/comments*page=1)
-      jq -cn '[range(0;98) | {body:"ordinary discussion",user:{login:"ignored"}}]
-        + [{body:"@codex review",user:{login:"admin"}},{body:"ordinary discussion",user:{login:"ignored"}}]'
-      ;;
-    *issues/*/comments*page=2)
-      printf '%s\n' '[{"body":" <!-- touchstone:review-answer id=7 -->","user":{"login":"writer"}},{"body":"@CODEX review again","user":{"login":"admin"}},{"body":"<!-- touchstone:review-answer id=8 -->","user":{"login":"outsider"}}]'
-      ;;
-    *pulls/*/comments*page=1)
-      jq -cn '[range(0;98) | {in_reply_to_id:null,user:{login:"finding"}}]
-        + [{in_reply_to_id:7,user:{login:"writer"}},{in_reply_to_id:null,user:{login:"finding"}}]'
-      ;;
-    *pulls/*/comments*page=2)
-      printf '%s\n' '[{"in_reply_to_id":8,"user":{"login":"maintainer"}}]'
-      ;;
-    --include)
-      login="${3%/permission}"
-      login="${login##*/}"
-      printf '%s\n' "$login" >>"$mock_calls"
-      case "$login" in
-        admin) permission="admin" ;;
-        writer) permission="write" ;;
-        deputy) permission="write" ;;
-        maintainer) permission="maintain" ;;
-        outsider)
-          printf 'HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}\n'
-          echo 'gh: Not Found (HTTP 404)' >&2
-          return 1
-          ;;
-        denied)
-          printf 'HTTP/2.0 403 Forbidden\r\nContent-Type: application/json\r\n\r\n{"message":"Forbidden"}\n'
-          echo 'gh: Forbidden (HTTP 403)' >&2
-          return 1
-          ;;
-        transport)
-          echo 'gh: connection reset' >&2
-          return 1
-          ;;
-        *) return 97 ;;
-      esac
-      printf 'HTTP/2.0 200 OK\r\nContent-Type: application/json\r\n\r\n{"permission":"%s"}\n' "$permission"
-      ;;
-    *) return 96 ;;
-  esac
-}
-
-api_array 'repos/example/project/issues/1/comments?per_page=100' "$tmp/issues.json"
-api_array 'repos/example/project/pulls/1/comments?per_page=100' "$tmp/review-comments.json"
-printf '%s\n' '[{"body":"Fixed. <!-- touchstone:review-answer v=1 id=7 disposition=no-code-change -->","user":{"login":"deputy"}},{"body":"@codex review","user":{"login":"admin"}}]' \
-  >"$tmp/prior-issues.json"
-collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
-  "$tmp/prior-issues.json" "$tmp/author-permissions.json"
-jq -e '. == {admin:"admin", deputy:"write", maintainer:"maintain", outsider:"none", writer:"write"}' \
-  "$tmp/author-permissions.json" >/dev/null || fail "permission map lost a page, driver path, snapshot author, or expected 404"
-for login in admin writer maintainer outsider deputy; do
-  [ "$(grep -Fxc "$login" "$mock_calls")" -eq 1 ] || fail "$login permission was not looked up exactly once"
-done
-if grep -Eq '^(ignored|finding)$' "$mock_calls"; then
-  fail "ordinary discussion or a top-level finding triggered a permission lookup"
-fi
-
-printf '[{"body":"@codex review","user":{"login":"denied"}}]\n' >"$tmp/issues.json"
-printf '[]\n' >"$tmp/review-comments.json"
-printf '[]\n' >"$tmp/prior-issues.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
-  "$tmp/prior-issues.json" "$tmp/denied.json" 2>"$tmp/denied.err"; then
-  fail "an authorization failure did not fail permission collection closed"
-fi
-grep -Fq "HTTP 403" "$tmp/denied.err" || fail "authorization failure lost its HTTP context"
-
-printf '[{"body":"@codex review","user":{"login":"transport"}}]\n' >"$tmp/issues.json"
-if collect_author_permissions "$tmp/issues.json" "$tmp/review-comments.json" \
-  "$tmp/prior-issues.json" "$tmp/transport.json" 2>"$tmp/transport.err"; then
-  fail "a transport failure did not fail permission collection closed"
-fi
-grep -Fq "transport failure" "$tmp/transport.err" || fail "transport failure lost its diagnostic context"
-rm -rf "$collector_fixture"
-trap - EXIT HUP INT TERM
-echo "  OK: pagination, unique lookup, non-collaborators, and failures are explicit"
-
 # The repository policy requires one literal status context. Keep that name in
 # a machine-readable manifest so the policy engine can compare its desired rule
 # with its one publisher instead of relying on an ambiguous duplicate context.
@@ -596,7 +546,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
-  and .gateBehaviorContractVersion == 2
+  and .gateBehaviorContractVersion == 3
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -785,7 +735,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for invalid_behavior_version in null '"2"' 1; do
+  for invalid_behavior_version in null '"3"' 2; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -849,7 +799,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     mutation_workflow="$fixture/.github/workflows/review-gate.yml"
     case "$behavior_mutation" in
       commented-checksum)
-        awk '$0 == "          echo \"${evaluator_sha256}  $RUNNER_TEMP/evaluate.jq\" | sha256sum --check --strict" { print "          : # checksum disabled"; next } { print }' \
+        awk '$0 == "          echo \"${evaluator_sha256}  $RUNNER_TEMP/evaluate-v3.jq\" | sha256sum --check --strict" { print "          : # checksum disabled"; next } { print }' \
           "$fixture/.github/workflows/review-gate.yml" >"$fixture/review-gate.next"
         ;;
       moving-evaluator-ref)
@@ -904,129 +854,5 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   fi
   rm -r "$fixture"
 fi
-
-echo "==> review-gate proves a claimed fix reaches the evaluated head"
-reach_fixture="$(mktemp -d)"
-trap 'rm -rf "$reach_fixture"' EXIT HUP INT TERM
-awk '
-  /touchstone:permission-collector:start/ { copying = 1; next }
-  /touchstone:permission-collector:end/ { copying = 0 }
-  copying { sub(/^          /, ""); print }
-' "$review_gate" >"$reach_fixture/deps.sh"
-awk '
-  /touchstone:fix-reachability:start/ { copying = 1; next }
-  /touchstone:fix-reachability:end/ { copying = 0 }
-  copying { sub(/^          /, ""); print }
-' "$review_gate" >"$reach_fixture/collector.sh"
-# shellcheck source=/dev/null
-source "$reach_fixture/deps.sh"
-# shellcheck source=/dev/null
-source "$reach_fixture/collector.sh"
-tmp="$reach_fixture/evidence"
-# Used by the sourced production collector.
-# shellcheck disable=SC2034
-REPO=example/project
-mkdir -p "$tmp"
-REST_REQUEST_LIMIT=20
-printf '0\n' >"$tmp/rest-request-count"
-reach_head=1111111111111111111111111111111111111111
-reach_in=2222222222222222222222222222222222222222
-reach_out=3333333333333333333333333333333333333333
-reach_unknown=4444444444444444444444444444444444444444
-reach_flaky=5555555555555555555555555555555555555555
-reach_hostile=6666666666666666666666666666666666666666
-reach_prior=7777777777777777777777777777777777777777
-printf '{"driver":"admin","helper":"write","stranger":"read","ghost":"none"}\n' \
-  >"$reach_fixture/permissions.json"
-reach_calls="$reach_fixture/calls"
-: >"$reach_calls"
-gh() {
-  [ "$1" = api ] || return 99
-  [ "$2" = --include ] || return 98
-  printf '%s\n' "$3" >>"$reach_calls"
-  case "$3" in
-    *"compare/$reach_in...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"ahead"}\n' ;;
-    *"compare/$reach_out...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"diverged"}\n' ;;
-    *"compare/$reach_unknown...$reach_head") printf 'HTTP/2 404\r\n\r\n{}\n'; return 1 ;;
-    *"compare/$reach_flaky...$reach_head") printf 'HTTP/2 502\r\n\r\n{}\n'; return 1 ;;
-    *"compare/$reach_prior...$reach_head") printf 'HTTP/2 200\r\n\r\n{"status":"identical"}\n' ;;
-    *) return 1 ;;
-  esac
-}
-# An answer on the head itself, one behind it, one off it, one GitHub has
-# never heard of, and the same SHA claimed twice. Prose naming a commit is not
-# a claim, a no-code answer names none, and -- the budget-exhaustion shape --
-# a pile of distinct SHAs arrives from accounts with no write access.
-cat >"$reach_fixture/issues.json" <<EOF_ISSUES
-[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=1 disposition=fixed fix=$reach_head -->"},
- {"user":{"login":"driver"},"body":"Fixed in $reach_out, honest."},
- {"user":{"login":"driver"},"body":"None needed. <!-- touchstone:review-answer v=1 id=2 disposition=no-code-change -->"},
- {"user":{"login":"stranger"},"body":"a <!-- touchstone:review-answer v=1 id=90 disposition=fixed fix=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --> b <!-- touchstone:review-answer v=1 id=91 disposition=fixed fix=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb --> c <!-- touchstone:review-answer v=1 id=92 disposition=fixed fix=cccccccccccccccccccccccccccccccccccccccc -->"},
- {"user":{"login":"ghost"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=93 disposition=fixed fix=$reach_hostile -->"}]
-EOF_ISSUES
-cat >"$reach_fixture/review-comments.json" <<EOF_COMMENTS
-[{"user":{"login":"helper"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=3 disposition=fixed fix=$reach_in -->"},
- {"user":{"login":"driver"},"body":"Also fixed. <!-- touchstone:review-answer v=1 id=4 disposition=fixed fix=$reach_in -->"},
- {"user":{"login":"helper"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=5 disposition=fixed fix=$reach_out -->"},
- {"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=6 disposition=fixed fix=$reach_unknown -->"}]
-EOF_COMMENTS
-# Under a cutoff the evaluator judges an issue comment's reconstructed
-# pre-deadline body, so a SHA a later edit removed must still be compared.
-cat >"$reach_fixture/prior-issues.json" <<EOF_PRIOR
-[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=1 disposition=fixed fix=$reach_in -->"},
- {"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=8 disposition=fixed fix=$reach_prior -->"}]
-EOF_PRIOR
-collect_fix_reachability "$reach_head" "$reach_fixture/issues.json" \
-  "$reach_fixture/review-comments.json" "$reach_fixture/prior-issues.json" \
-  "$reach_fixture/permissions.json" "$reach_fixture/reachability.json" \
-  || fail "fix reachability collection failed"
-jq -e --arg head "$reach_head" --arg in "$reach_in" --arg out "$reach_out" \
-  --arg unknown "$reach_unknown" --arg prior "$reach_prior" '
-  .[$head] == true and .[$in] == true and .[$out] == false and .[$unknown] == false
-  and .[$prior] == true
-  and (keys | length) == 5
-' "$reach_fixture/reachability.json" >/dev/null \
-  || fail "reachability verdicts are wrong: $(cat "$reach_fixture/reachability.json")"
-# The head needs no request, a repeated SHA needs no second one, prose naming
-# a commit is not a claim, and an unauthorized author's markers are not worth
-# a request at all -- three, not nine.
-# A SHA repeated between the snapshot and the current bodies is still one
-# request -- four, not eleven.
-[ "$(wc -l <"$reach_calls" | tr -d ' ')" -eq 4 ] \
-  || fail "reachability spent $(wc -l <"$reach_calls" | tr -d ' ') REST requests, expected 4: $(cat "$reach_calls")"
-grep -q "compare/$reach_head" "$reach_calls" \
-  && fail "reachability compared the head against itself"
-grep -qE "compare/(aaaaaaaa|bbbbbbbb|cccccccc|$reach_hostile)" "$reach_calls" \
-  && fail "an unauthorized author's marker spent a REST request"
-# An operational failure is not a verdict: it aborts the evaluation so the
-# poll continues, instead of reporting the finding as unanswered.
-cat >"$reach_fixture/flaky.json" <<EOF_FLAKY
-[{"user":{"login":"driver"},"body":"Fixed. <!-- touchstone:review-answer v=1 id=7 disposition=fixed fix=$reach_flaky -->"}]
-EOF_FLAKY
-printf "[]\n" >"$reach_fixture/empty.json"
-if collect_fix_reachability "$reach_head" "$reach_fixture/flaky.json" \
-  "$reach_fixture/empty.json" "$reach_fixture/empty.json" \
-  "$reach_fixture/permissions.json" \
-  "$reach_fixture/flaky-out.json" >/dev/null 2>"$reach_fixture/flaky.err"; then
-  fail "a 502 comparison was recorded as a verdict instead of aborting"
-fi
-grep -q "HTTP 502" "$reach_fixture/flaky.err" \
-  || fail "an operational comparison failure was not diagnosed: $(cat "$reach_fixture/flaky.err")"
-# The budget guard lives in rest_api, which refuses before calling gh. Setting
-# the exhausted marker by hand would only re-run the transport-failure path
-# above, so drive the counter to the limit and let any call be the failure.
-printf '%s\n' "$REST_REQUEST_LIMIT" >"$tmp/rest-request-count"
-gh() { fail "reachability called gh after the REST budget was exhausted"; }
-if collect_fix_reachability "$reach_head" "$reach_fixture/issues.json" \
-  "$reach_fixture/review-comments.json" "$reach_fixture/prior-issues.json" \
-  "$reach_fixture/permissions.json" \
-  "$reach_fixture/reachability.json" >/dev/null 2>&1; then
-  fail "reachability collection survived an exhausted REST budget"
-fi
-printf '0\n' >"$tmp/rest-request-count"
-rm -f "$tmp/rest-budget-exhausted"
-unset -f gh
-echo "  OK: authorization, head identity, dedupe, and definitive-vs-operational failures are explicit"
-rm -rf "$reach_fixture"
 
 echo "workflow contract passed"

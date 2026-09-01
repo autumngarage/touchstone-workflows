@@ -22,24 +22,28 @@ workflow's Touchstone repository, path, revision, checksum, and supported
 project schemas; the source-contract job executes schema-1 and schema-2
 fixtures with those exact bytes before an engine-pin change can land. Its
 `gateBehaviorContractVersion` declares the behavior
-contract implemented by the pinned workflows. Version 2 means that validation,
-review evidence, and delivery evidence are checksum-pinned, read-only required
-workflows with aligned refresh triggers that run for pull requests and merge
-groups; the review gate binds
-trusted review and answered findings to the PR-event number, head, and base
-ref (the base SHA may advance by ancestry), while a merge-group run binds the
-queue commit and base to the PR number in its ref. Pull-request review gates
-poll only evaluator-declared waiting states until their bounded deadline.
-Every REST path, including pagination and per-record evidence lookups, crosses
-an enforced 20-request evaluation limit. The five-minute cadence budgets for
-three concurrent waiting pull requests at that limit (720 requests/hour),
-leaving more than 20% of the standard repository token's hourly API budget for
-unrelated work. Evidence that exceeds the limit fails closed. Terminal
-failures and merge-group runs remain immediate.
-`tests/test-workflow.sh` refuses missing, extra, nested, or duplicate workflow
-declarations, verifies that only the declared publisher owns the status,
-refuses engine-pin drift between the manifest and consumer workflow, and
-guards those version-2 behavior invariants.
+contract implemented by the pinned workflows. Version 3 means that
+validation, review evidence, and delivery evidence are checksum-pinned,
+read-only required workflows with aligned refresh triggers that run for pull
+requests and merge groups; the review gate derives one trusted reviewer
+verdict for the exact current PR head — only an unedited, explicit clean
+result succeeds — and never adjudicates historical findings: threads belong
+to GitHub conversation resolution and the merged result to the merge queue
+(AUT-1132). A merge-group run binds the queue commit and base to the PR
+number in its ref and evaluates once, without waiting. Pull-request review
+gates poll only evaluator-declared waiting states until their bounded
+deadline. Evidence collection is O(pages of current surfaces): every REST
+path crosses an enforced 12-request evaluation limit with a four-page bound
+per surface, independent of how much review history the pull request
+carries. The five-minute cadence budgets for three concurrent waiting pull
+requests at that limit (432 requests/hour), leaving more than half of the
+standard repository token's hourly API budget for unrelated work. Evidence
+that exceeds a bound fails closed. Terminal failures and merge-group runs
+remain immediate.
+`tests/test-workflow.sh` refuses missing, extra, nested, or duplicate
+workflow declarations, verifies that only the declared publisher owns the
+status, refuses engine-pin drift between the manifest and consumer workflow,
+and guards those version-3 behavior invariants.
 
 Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
