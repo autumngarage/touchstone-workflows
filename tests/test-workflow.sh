@@ -175,10 +175,10 @@ assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
   "review evidence wait bound"
 assert_active_line "$review_gate" \
-  'REST_REQUEST_LIMIT: 20' \
+  'REST_REQUEST_LIMIT: 44' \
   "review REST request bound"
 assert_active_line "$review_gate" \
-  'REVIEW_POLL_SECONDS: 300' \
+  'REVIEW_POLL_SECONDS: 600' \
   "review poll interval"
 assert_active_line "$review_gate" \
   'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
