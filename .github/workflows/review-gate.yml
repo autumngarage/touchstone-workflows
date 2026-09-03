@@ -441,24 +441,49 @@ jobs:
             umask 077
             printf 'header = "Authorization: Bearer %s"\n' "$OPENROUTER_API" >"$work/curl.conf"
 
-            # One request. A retry on a metered model doubles spend for the
-            # same outage, so transport failure is terminal here.
-            http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
-              --config "$work/curl.conf" \
-              --connect-timeout "$FALLBACK_CONNECT_TIMEOUT" \
-              --max-time "$FALLBACK_REQUEST_TIMEOUT" \
-              -H "Content-Type: application/json" \
-              -X POST --data @"$work/request.json" \
-              "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
+            # Transport and metered failures are terminal: a retry doubles
+            # spend for the same outage. An empty completion is different --
+            # the request succeeded and was billed, and produced nothing, so
+            # the spend is already sunk. openrouter/auto selects per request,
+            # so a second attempt usually lands on a model that answers.
+            # Exactly one extra attempt, and only for that case.
+            body=""
+            attempt=1
+            while :; do
+              status=0
+              http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
+                --config "$work/curl.conf" \
+                --connect-timeout "$FALLBACK_CONNECT_TIMEOUT" \
+                --max-time "$FALLBACK_REQUEST_TIMEOUT" \
+                -H "Content-Type: application/json" \
+                -X POST --data @"$work/request.json" \
+                "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
+
+              if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
+                echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                rm -f "$work/curl.conf"
+                return 1
+              fi
+
+              body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
+              [ -n "$body" ] && break
+
+              # Name what answered and why it stopped; an unexplained empty
+              # completion is undiagnosable after the fact.
+              jq -r '"  model=" + (.model // "?") + " finish=" + (.choices[0].finish_reason // "?")
+                     + " native=" + (.choices[0].native_finish_reason // "?")
+                     + " error=" + ((.error // {}) | tostring | .[0:200])' \
+                "$work/response.json" 2>/dev/null >&2 || true
+
+              if [ "$attempt" -ge 2 ]; then
+                echo "Fallback reviewer: response carried no content after $attempt attempts." >&2
+                rm -f "$work/curl.conf"
+                return 1
+              fi
+              echo "Fallback reviewer: empty completion; one further attempt." >&2
+              attempt=$((attempt + 1))
+            done
             rm -f "$work/curl.conf"
-
-            if [ "${status:-0}" -ne 0 ] || [ "$http" != "200" ]; then
-              echo "Fallback reviewer: request failed (http=${http:-none})." >&2
-              return 1
-            fi
-
-            body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
-            [ -n "$body" ] || { echo "Fallback reviewer: response carried no content." >&2; return 1; }
 
             if ! printf '%s' "$body" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
               echo "Fallback reviewer: malformed review body; not a verdict." >&2

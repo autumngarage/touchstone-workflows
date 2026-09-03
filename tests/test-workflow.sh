@@ -965,6 +965,38 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     echo "  OK: $name is refused"
   done
 
+  # An empty completion is retried exactly once: openrouter/auto picks a model
+  # per request, and the billed request already produced nothing.
+  (
+    tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+    printf '0\n' >"$tmp/rest-request-count"
+    RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+    REST_REQUEST_LIMIT=12; OPENROUTER_API=k
+    FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
+    FALLBACK_COST_TIER=low; FALLBACK_MAX_INPUT_BYTES=100000
+    FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+    FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+    printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+    rest_api() { case "$1" in *compare*) printf 'diff --git a b\n' ;; *comments*) return 0 ;; esac; }
+    printf '0\n' >"$fallback_fixture/attempts"
+    curl() {
+      local out="" prev="" n
+      for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+      n=$(( $(cat "$fallback_fixture/attempts") + 1 )); printf '%s\n' "$n" >"$fallback_fixture/attempts"
+      if [ "$n" -eq 1 ]; then
+        [ -n "$out" ] && printf '%s' '{"model":"m","choices":[{"message":{"content":""},"finish_reason":"stop"}]}' >"$out"
+      else
+        [ -n "$out" ] && printf '%s' '{"choices":[{"message":{"content":"{\"summary\":\"ok\",\"findings\":[]}"}}]}' >"$out"
+      fi
+      printf '200'
+    }
+    # shellcheck source=/dev/null
+    . "$fallback_fixture/fallback.sh"
+    fallback_review abc123 def456 >/dev/null 2>&1 || exit 1
+    [ "$(cat "$fallback_fixture/attempts")" = "2" ] || exit 1
+  ) || fail "an empty completion was not retried into a usable verdict"
+  echo "  OK: an empty completion is retried once and can then succeed"
+
   if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
     fail "fallback reviewer passed the gate with no credential configured"
   fi
