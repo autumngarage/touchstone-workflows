@@ -997,6 +997,20 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   ) || fail "an empty completion was not retried into a usable verdict"
   echo "  OK: an empty completion is retried once and can then succeed"
 
+  # The badge is the bar, enforced by the gate rather than trusted to the
+  # agent: P0/P1 close it, P2/P3 leave it open for thread resolution to block.
+  p2_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P2\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  p3_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P3\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  p0_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P0\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  mixed_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P2\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"},{\"severity\":\"P1\",\"file\":\"c\",\"line\":2,\"title\":\"u\",\"body\":\"v\"}]}"}}]}'
+
+  for row in "P2 only|$p2_body|open" "P3 only|$p3_body|open" "P0|$p0_body|closed" "P1 and P2|$mixed_body|closed"; do
+    IFS='|' read -r label rbody expect <<<"$row"
+    if ( export OPENROUTER_API=k; run_fallback_case "$label" 200 "$rbody" "diff --git a b" ); then actual=open; else actual=closed; fi
+    [ "$actual" = "$expect" ] || fail "badge rule: '$label' left the gate $actual, expected $expect"
+    echo "  OK: $label leaves the gate $expect"
+  done
+
   if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
     fail "fallback reviewer passed the gate with no credential configured"
   fi

@@ -491,6 +491,7 @@ jobs:
             fi
 
             findings="$(printf '%s' "$body" | jq '.findings | length')"
+            blocking="$(printf '%s' "$body" | jq '[.findings[] | select(.severity == "P0" or .severity == "P1")] | length')"
             printf '%s' "$body" | jq -r '"Fallback reviewer summary: " + (.summary // "")'
 
             if [ "$findings" -eq 0 ]; then
@@ -500,9 +501,55 @@ jobs:
             fi
 
             printf '%s' "$body" | jq -r '.findings[] | "  [" + .severity + "] " + .file + ": " + .title'
+
+            # Findings become review threads. A thread cannot forge a pass --
+            # it can only add something GitHub then blocks merge on -- so the
+            # in-run verdict rule that governs the pass does not apply here.
+            post_fallback_findings "$head" "$body" || true
             post_fallback_note "$head" "findings" "$body" || true
-            echo "Fallback reviewer: ${findings} finding(s) for ${head}; gate stays closed." >&2
-            return 1
+
+            # The badge is the bar, enforced here rather than trusted to the
+            # agent: P0/P1 close the gate, P2/P3 leave it open and rely on
+            # GitHub's conversation resolution to force an answer before merge.
+            if [ "$blocking" -gt 0 ]; then
+              echo "Fallback reviewer: ${blocking} P0/P1 finding(s) for ${head}; gate stays closed." >&2
+              return 1
+            fi
+            echo "Fallback reviewer: ${findings} finding(s), none above P1, for ${head}; gate open, threads must be resolved before merge."
+            return 0
+          }
+
+          # One inline review thread per finding, so each can be answered and
+          # resolved. Idempotent per head: a marker carries the head and a
+          # digest of the finding, and a re-run skips what it already posted.
+          post_fallback_findings() {
+            local head="$1" body="$2" existing count i marker file line title text digest
+            [ "$event_mode" = pull_request ] || return 0
+
+            existing="$(rest_api "repos/$REPO/pulls/${number}/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null || printf '')"
+            count="$(printf '%s' "$body" | jq '.findings | length')"
+            i=0
+            while [ "$i" -lt "$count" ]; do
+              file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
+              line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
+              title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
+              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha256sum | cut -c1-16)"
+              marker="<!-- touchstone:fallback-finding head=${head} id=${digest} -->"
+
+              if ! printf '%s' "$existing" | grep -qF "$marker"; then
+                text="$(printf '%s' "$body" | jq -r --argjson i "$i" --arg m "$marker" '
+                  .findings[$i] |
+                  "**[" + .severity + "] " + .title + "**\n\n" + .body +
+                  "\n\n_Raised by the gate fallback reviewer; the primary reviewer was unavailable. " +
+                  "P2 and P3 do not close the gate — answer and route this thread, then resolve it._\n" + $m
+                ')"
+                rest_api "repos/$REPO/pulls/${number}/comments" \
+                  -f body="$text" -f commit_id="$head" -f path="$file" \
+                  -F line="$line" -f side=RIGHT >/dev/null 2>&1 \
+                  || echo "Fallback reviewer: could not post a thread for ${file}:${line}." >&2
+              fi
+              i=$((i + 1))
+            done
           }
 
           # Legibility only. The gate never reads this back as evidence.
