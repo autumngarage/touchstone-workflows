@@ -856,6 +856,51 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
 fi
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  echo "==> provider unavailability is an observed state, not an elapsed clock"
+  state_fixture="$(mktemp -d)"
+  awk '
+    /touchstone:provider-state:start/ { copying = 1; next }
+    /touchstone:provider-state:end/ { copying = 0 }
+    copying { sub(/^          /, ""); print }
+  ' "$review_gate" >"$state_fixture/state.sh"
+
+  check_provider_state() {
+    # $1 expected (yes|no), $2 evidence json, $3 case name
+    (
+      tmp="$state_fixture"; printf '%s' "$2" >"$tmp/evidence.json"
+      # shellcheck source=/dev/null
+      . "$state_fixture/state.sh"
+      if provider_unavailable; then actual=yes; else actual=no; fi
+      [ "$actual" = "$1" ] || exit 1
+    ) || fail "provider_unavailable misread '$3' (expected $1)"
+    echo "  OK: $3"
+  }
+
+  trusted='"trustedAuthors":["bot"]'
+  quota='You have reached your Codex usage limits for code reviews.'
+
+  check_provider_state yes \
+    "{$trusted,\"issueComments\":[{\"user\":{\"login\":\"bot\"},\"created_at\":\"2026-01-02\",\"body\":\"$quota\"}],\"reviews\":[]}" \
+    "a current notice from a trusted author is unavailability"
+
+  check_provider_state no \
+    "{$trusted,\"issueComments\":[{\"user\":{\"login\":\"stranger\"},\"created_at\":\"2026-01-02\",\"body\":\"$quota\"}],\"reviews\":[]}" \
+    "an untrusted author cannot declare the provider down"
+
+  check_provider_state no \
+    "{$trusted,\"issueComments\":[{\"user\":{\"login\":\"bot\"},\"created_at\":\"2026-01-01\",\"body\":\"$quota\"}],\"reviews\":[{\"user\":{\"login\":\"bot\"},\"submitted_at\":\"2026-01-02\",\"body\":\"Reviewed commit: abc\"}]}" \
+    "a later verdict supersedes an earlier notice"
+
+  check_provider_state yes \
+    "{$trusted,\"issueComments\":[{\"user\":{\"login\":\"bot\"},\"created_at\":\"2026-01-03\",\"body\":\"$quota\"}],\"reviews\":[{\"user\":{\"login\":\"bot\"},\"submitted_at\":\"2026-01-02\",\"body\":\"Reviewed commit: abc\"}]}" \
+    "a notice after the last verdict is current"
+
+  check_provider_state no \
+    "{$trusted,\"issueComments\":[],\"reviews\":[]}" \
+    "silence is not unavailability"
+
+  rm -r "$state_fixture"
+
   echo "==> the fallback reviewer fails closed"
   fallback_fixture="$(mktemp -d)"
   awk '

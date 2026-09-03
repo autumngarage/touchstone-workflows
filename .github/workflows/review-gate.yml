@@ -310,6 +310,35 @@ jobs:
           jq -f "$RUNNER_TEMP/evaluate-v3.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
           }
 
+          # touchstone:provider-state:start
+          # An observed state, not an elapsed clock. The reviewer tells us it
+          # cannot answer; waiting out the evidence window after that learns
+          # nothing. Derived from evidence the evaluation already collected, so
+          # it costs no REST request.
+          #
+          # The rule is recency, not mere presence: the provider is unavailable
+          # only when its MOST RECENT utterance is an unavailability notice. A
+          # stale notice from an earlier head cannot strand later evaluations,
+          # and a verdict posted after a notice supersedes it.
+          provider_unavailable() {
+            [ -s "$tmp/evidence.json" ] || return 1
+            jq -e '
+              (.trustedAuthors // []) as $trusted
+              | def trusted: select(((.user.login // "") as $l | $trusted | index($l)) != null);
+                def at: (.created_at // .submitted_at // .updated_at // "");
+                def unavailable:
+                  (.body // "")
+                  | test("reached your .* usage limits|usage limits for code reviews|Review limit reached|reached its usage spending cap"; "i");
+                [ (.issueComments // [])[], (.reviews // [])[] ]
+                | map(trusted)
+                | map(select(at != ""))
+                | sort_by(at)
+                | last
+                | if . == null then false else unavailable end
+            ' "$tmp/evidence.json" >/dev/null 2>&1
+          }
+          # touchstone:provider-state:end
+
           # touchstone:review-fallback:start
           # A verdict this run COMPUTES, never one it reads back. Nothing new
           # becomes a trusted comment author, so no forged comment can pass the
@@ -502,6 +531,16 @@ jobs:
                   return 0
                 fi
                 echo "ERROR: merge-group review evidence is incomplete and no fallback verdict was obtained." >&2
+                return 1
+              fi
+
+              if [ "$state" = waiting-review ] && provider_unavailable; then
+                echo "Trusted reviewer reported it cannot review this head; not waiting out the evidence window."
+                if fallback_review "${event_head:-}" "${event_base:-}"; then
+                  echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
+                  return 0
+                fi
+                echo "ERROR: trusted reviewer unavailable and no fallback verdict for ${event_head:-}." >&2
                 return 1
               fi
 
