@@ -482,6 +482,17 @@ jobs:
                 return 1
               fi
 
+              # A 200 can carry an error instead of a completion: the router
+              # returns rate limits and provider failures that way. Treated as
+              # an empty completion it looks like model variance, gets one
+              # pointless retry, and reports nothing anyone can act on.
+              api_error="$(jq -r '(.error.message // .error // empty) | tostring' "$work/response.json" 2>/dev/null || true)"
+              if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+                echo "Fallback reviewer: provider returned an error in a 200 response: ${api_error}" >&2
+                rm -f "$work/curl.conf"
+                return 1
+              fi
+
               body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
               [ -n "$body" ] && break
 

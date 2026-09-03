@@ -1041,6 +1041,14 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     echo "  OK: $label leaves the gate $expect"
   done
 
+  # A 200 carrying an error is a provider failure, not model variance: it must
+  # be refused and named, not retried as an empty completion.
+  err_body='{"error":{"message":"rate limit exceeded"}}'
+  if ( export OPENROUTER_API=k; run_fallback_case "error-in-200" 200 "$err_body" "diff --git a b" ); then
+    fail "a 200 carrying a provider error opened the gate"
+  fi
+  echo "  OK: a provider error inside a 200 is refused"
+
   if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
     fail "fallback reviewer passed the gate with no credential configured"
   fi
