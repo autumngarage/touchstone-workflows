@@ -67,6 +67,19 @@ jobs:
       REST_REQUEST_LIMIT: 12
       MAX_EVIDENCE_PAGES: 4
       REVIEW_POLL_SECONDS: 300
+      # Fallback reviewer. Absent credential = no fallback; the gate then
+      # behaves exactly as it did before this step existed.
+      OPENROUTER_API: ${{ secrets.OPENROUTER_API }}
+      FALLBACK_ENDPOINT: https://openrouter.ai/api/v1/chat/completions
+      FALLBACK_MODEL: openrouter/auto
+      FALLBACK_PLUGIN: auto-router
+      FALLBACK_COST_TIER: low
+      FALLBACK_MAX_INPUT_BYTES: 100000
+      FALLBACK_MAX_COMPLETION_TOKENS: 4096
+      FALLBACK_MAX_PROMPT_PRICE: 0.5
+      FALLBACK_MAX_COMPLETION_PRICE: 2
+      FALLBACK_CONNECT_TIMEOUT: 10
+      FALLBACK_REQUEST_TIMEOUT: 120
     steps:
       - name: Fetch pinned evaluator
         run: |
@@ -77,6 +90,15 @@ jobs:
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate-v3.jq" \
             -o "$RUNNER_TEMP/evaluate-v3.jq"
           echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate-v3.jq" | sha256sum --check --strict
+
+          # The fallback reviewer reuses the local tier's prompt rather than
+          # keeping a second copy that can drift from it.
+          prompt_revision="9818742198e3cb774a5d3ab5c738cc5985159e36"
+          prompt_sha256="bf7024bc8d3a92f2dc264c51c121ce410d32f4f4dbbac6ce731754a5adf8f57a"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${prompt_revision}/config/review-normal-prompt.md" \
+            -o "$RUNNER_TEMP/review-prompt.md"
+          echo "${prompt_sha256}  $RUNNER_TEMP/review-prompt.md" | sha256sum --check --strict
 
       - name: Evaluate review evidence for the pull request
         run: |
@@ -154,6 +176,7 @@ jobs:
           number="$(jq -r .number "$tmp/event-pr.json")"
           event_head="$(jq -r .headSha "$tmp/event-pr.json")"
           event_base_ref="$(jq -r .baseRef "$tmp/event-pr.json")"
+          event_base="$(jq -r .baseSha "$tmp/event-pr.json")"
 
           # touchstone:rest-budget:start
           # Every REST request crosses this hard budget boundary, including
@@ -287,6 +310,194 @@ jobs:
           jq -f "$RUNNER_TEMP/evaluate-v3.jq" "$tmp/evidence.json" >"$tmp/verdict.json"
           }
 
+          # touchstone:provider-state:start
+          # An observed state, not an elapsed clock. The reviewer tells us it
+          # cannot answer; waiting out the evidence window after that learns
+          # nothing. Derived from evidence the evaluation already collected, so
+          # it costs no REST request.
+          #
+          # The rule is recency, not mere presence: the provider is unavailable
+          # only when its MOST RECENT utterance is an unavailability notice. A
+          # stale notice from an earlier head cannot strand later evaluations,
+          # and a verdict posted after a notice supersedes it.
+          provider_unavailable() {
+            [ -s "$tmp/evidence.json" ] || return 1
+            jq -e '
+              (.trustedAuthors // []) as $trusted
+              | def trusted: select(((.user.login // "") as $l | $trusted | index($l)) != null);
+                def at: (.created_at // .submitted_at // .updated_at // "");
+                def unavailable:
+                  (.body // "")
+                  | test("reached your .* usage limits|usage limits for code reviews|Review limit reached|reached its usage spending cap"; "i");
+                [ (.issueComments // [])[], (.reviews // [])[] ]
+                | map(trusted)
+                | map(select(at != ""))
+                | sort_by(at)
+                | last
+                | if . == null then false else unavailable end
+            ' "$tmp/evidence.json" >/dev/null 2>&1
+          }
+          # touchstone:provider-state:end
+
+          # touchstone:review-fallback:start
+          # A verdict this run COMPUTES, never one it reads back. Nothing new
+          # becomes a trusted comment author, so no forged comment can pass the
+          # gate. Both pull_request and merge_group derive their own.
+          #
+          # Fail closed: this returns 0 only on an explicit empty finding set.
+          # A missing credential, oversized diff, transport error, malformed
+          # body, or any finding all return non-zero, leaving the gate exactly
+          # as it behaved before the fallback existed.
+          fallback_review() {
+            local head="$1" base="$2" work status http body findings
+
+            [ -n "${OPENROUTER_API:-}" ] || {
+              echo "Fallback reviewer: no credential configured; not attempting." >&2
+              return 1
+            }
+
+            work="$RUNNER_TEMP/fallback"
+            mkdir -p "$work"
+
+            # The fallback is one terminal phase per run, not a per-poll
+            # evaluation, so it opens its own request budget rather than
+            # spending what the final evaluation left. Its calls still go
+            # through rest_api and remain bounded by REST_REQUEST_LIMIT.
+            printf '0\n' >"$tmp/rest-request-count"
+
+            # Bind the review to exactly the range the gate is evaluating.
+            if ! rest_api "repos/$REPO/compare/${base}...${head}" \
+                 -H "Accept: application/vnd.github.v3.diff" >"$work/diff" 2>"$work/diff.err"; then
+              echo "Fallback reviewer: could not fetch the diff for ${base}...${head}." >&2
+              return 1
+            fi
+
+            if [ ! -s "$work/diff" ]; then
+              echo "Fallback reviewer: empty diff; refusing to certify nothing." >&2
+              return 1
+            fi
+            if [ "$(wc -c <"$work/diff")" -gt "$FALLBACK_MAX_INPUT_BYTES" ]; then
+              echo "Fallback reviewer: diff exceeds ${FALLBACK_MAX_INPUT_BYTES} bytes; not attempting." >&2
+              return 1
+            fi
+
+            jq -n \
+              --rawfile system "$RUNNER_TEMP/review-prompt.md" \
+              --rawfile diff "$work/diff" \
+              --arg model "$FALLBACK_MODEL" \
+              --arg plugin "$FALLBACK_PLUGIN" \
+              --arg costTier "$FALLBACK_COST_TIER" \
+              --arg head "$head" \
+              --argjson maxCompletionTokens "$FALLBACK_MAX_COMPLETION_TOKENS" \
+              --argjson maxPromptPrice "$FALLBACK_MAX_PROMPT_PRICE" \
+              --argjson maxCompletionPrice "$FALLBACK_MAX_COMPLETION_PRICE" \
+              '{
+                model: $model,
+                messages: [
+                  {role: "system", content: $system},
+                  {role: "user", content: ("Review the pushed head " + $head + ".\n\n" + $diff)}
+                ],
+                plugins: [{id: $plugin, cost_tier: $costTier}],
+                provider: {
+                  require_parameters: true,
+                  max_price: {prompt: $maxPromptPrice, completion: $maxCompletionPrice}
+                },
+                max_completion_tokens: $maxCompletionTokens,
+                response_format: {
+                  type: "json_schema",
+                  json_schema: {
+                    name: "touchstone_code_review",
+                    strict: true,
+                    schema: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["summary", "findings"],
+                      properties: {
+                        summary: {type: "string"},
+                        findings: {
+                          type: "array",
+                          maxItems: 100,
+                          items: {
+                            type: "object",
+                            additionalProperties: false,
+                            required: ["severity", "file", "line", "title", "body"],
+                            properties: {
+                              severity: {type: "string", enum: ["P0","P1","P2","P3"]},
+                              file: {type: "string"},
+                              line: {type: ["integer","null"], minimum: 1},
+                              title: {type: "string"},
+                              body: {type: "string"}
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }' >"$work/request.json"
+
+            # The credential goes in a private config file, never in argv,
+            # where the runner process list would expose it.
+            umask 077
+            printf 'header = "Authorization: Bearer %s"\n' "$OPENROUTER_API" >"$work/curl.conf"
+
+            # One request. A retry on a metered model doubles spend for the
+            # same outage, so transport failure is terminal here.
+            http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
+              --config "$work/curl.conf" \
+              --connect-timeout "$FALLBACK_CONNECT_TIMEOUT" \
+              --max-time "$FALLBACK_REQUEST_TIMEOUT" \
+              -H "Content-Type: application/json" \
+              -X POST --data @"$work/request.json" \
+              "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
+            rm -f "$work/curl.conf"
+
+            if [ "${status:-0}" -ne 0 ] || [ "$http" != "200" ]; then
+              echo "Fallback reviewer: request failed (http=${http:-none})." >&2
+              return 1
+            fi
+
+            body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
+            [ -n "$body" ] || { echo "Fallback reviewer: response carried no content." >&2; return 1; }
+
+            if ! printf '%s' "$body" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
+              echo "Fallback reviewer: malformed review body; not a verdict." >&2
+              return 1
+            fi
+
+            findings="$(printf '%s' "$body" | jq '.findings | length')"
+            printf '%s' "$body" | jq -r '"Fallback reviewer summary: " + (.summary // "")'
+
+            if [ "$findings" -eq 0 ]; then
+              post_fallback_note "$head" "clean" "$body" || true
+              echo "Fallback reviewer: clean verdict for ${head}."
+              return 0
+            fi
+
+            printf '%s' "$body" | jq -r '.findings[] | "  [" + .severity + "] " + .file + ": " + .title'
+            post_fallback_note "$head" "findings" "$body" || true
+            echo "Fallback reviewer: ${findings} finding(s) for ${head}; gate stays closed." >&2
+            return 1
+          }
+
+          # Legibility only. The gate never reads this back as evidence.
+          post_fallback_note() {
+            local head="$1" verdict="$2" body="$3" note
+            [ "$event_mode" = pull_request ] || return 0
+            note="$(printf '%s' "$body" | jq -r --arg head "$head" --arg verdict "$verdict" '
+              "### Fallback review — " + $verdict + "\n\n" +
+              "The primary reviewer produced no verdict for `" + $head + "`, so the pinned " +
+              "review-gate workflow reviewed this head itself.\n\n" +
+              (.summary // "") +
+              (if (.findings | length) > 0 then
+                 "\n\n" + ([.findings[] | "- **" + .severity + "** `" + .file + "` — " + .title + "\n  " + .body] | join("\n"))
+               else "" end) +
+              "\n\n_Computed in-run and not stored as evidence; every evaluation derives its own._"
+            ')"
+            rest_api "repos/$REPO/issues/${number}/comments" -f body="$note" >/dev/null 2>&1 || return 1
+          }
+          # touchstone:review-fallback:end
+
           # touchstone:review-wait:start
           review_gate_now() { date +%s; }
           review_gate_sleep() { sleep "$1"; }
@@ -314,7 +525,22 @@ jobs:
               esac
 
               if [ "$event_mode" != pull_request ]; then
-                echo "ERROR: merge-group review evidence is incomplete; queue evaluation never waits." >&2
+                echo "Merge-group review evidence is incomplete; queue evaluation never waits." >&2
+                if fallback_review "${event_head:-}" "${event_base:-}"; then
+                  echo "Merge group satisfied by the fallback reviewer for ${event_head:-}."
+                  return 0
+                fi
+                echo "ERROR: merge-group review evidence is incomplete and no fallback verdict was obtained." >&2
+                return 1
+              fi
+
+              if [ "$state" = waiting-review ] && provider_unavailable; then
+                echo "Trusted reviewer reported it cannot review this head; not waiting out the evidence window."
+                if fallback_review "${event_head:-}" "${event_base:-}"; then
+                  echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
+                  return 0
+                fi
+                echo "ERROR: trusted reviewer unavailable and no fallback verdict for ${event_head:-}." >&2
                 return 1
               fi
 
@@ -334,7 +560,12 @@ jobs:
               esac
               remaining=$((deadline - now))
               if [ "$remaining" -le 0 ]; then
-                echo "ERROR: review gate remained '$state' until its evidence deadline." >&2
+                echo "Review gate remained '$state' until its evidence deadline." >&2
+                if [ "$state" = waiting-review ] && fallback_review "${event_head:-}" "${event_base:-}"; then
+                  echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
+                  return 0
+                fi
+                echo "ERROR: no trusted verdict and no fallback verdict for ${event_head:-}." >&2
                 return 1
               fi
 
