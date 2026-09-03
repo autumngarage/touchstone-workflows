@@ -74,7 +74,7 @@ jobs:
       FALLBACK_MODEL: openrouter/auto
       FALLBACK_PLUGIN: auto-router
       FALLBACK_COST_TIER: low
-      FALLBACK_MAX_INPUT_BYTES: 100000
+      FALLBACK_MAX_INPUT_BYTES: 400000
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
       FALLBACK_MAX_PROMPT_PRICE: 0.5
       FALLBACK_MAX_COMPLETION_PRICE: 2
@@ -501,10 +501,10 @@ jobs:
             fi
 
             findings="$(printf '%s' "$body" | jq '.findings | length')"
+            blocking="$(printf '%s' "$body" | jq '[.findings[] | select(.severity == "P0" or .severity == "P1")] | length')"
             printf '%s' "$body" | jq -r '"Fallback reviewer summary: " + (.summary // "")'
 
             if [ "$findings" -eq 0 ]; then
-              post_fallback_note "$head" "clean" "$body" || true
               echo "Fallback reviewer: clean verdict for ${head}."
               return 0
             fi
@@ -516,99 +516,40 @@ jobs:
             # flow works unchanged. A thread cannot forge a pass -- it can only
             # add something GitHub blocks merge on -- so the in-run verdict
             # rule that governs the pass does not apply to findings.
-            post_fallback_findings "$head" "$body" || true
-            post_fallback_note "$head" "findings" "$body" || true
+            write_fallback_summary "$head" "$body" || true
 
-            # Any open finding closes the gate, whatever its severity: the
-            # severity bar decides how the DRIVER disposes of a finding, not
-            # whether review passed. Whether to fix or route stays the driver's
-            # call, exactly as with the primary reviewer.
-            #
-            # A finding whose thread is already resolved counts as answered and
-            # no longer blocks. The primary reviewer gets this for free by being
-            # non-deterministic -- a later review simply comes back clean. This
-            # one is deterministic and would re-report the same finding forever,
-            # so answered findings have to be excluded explicitly or routing
-            # could never converge.
-            open_findings="$(count_open_findings "$head" "$body")" || return 1
-            if [ "$open_findings" -gt 0 ]; then
-              echo "Fallback reviewer: ${open_findings} unanswered finding(s) for ${head}; gate stays closed." >&2
+            # The gate is read-only by design, so it cannot open review threads
+            # and there is no answer-and-resolve flow to lean on. The severity
+            # bar therefore has to be applied here: P0/P1 close the gate, and
+            # P2/P3 are reported without blocking.
+            if [ "$blocking" -gt 0 ]; then
+              echo "Fallback reviewer: ${blocking} P0/P1 finding(s) for ${head}; gate stays closed." >&2
               return 1
             fi
-            echo "Fallback reviewer: ${findings} finding(s) for ${head}, all answered and resolved; clean for this head."
+            echo "Fallback reviewer: ${findings} finding(s), none above P1, for ${head}; reported without blocking."
             return 0
           }
 
-          # How many findings are not yet answered? A resolved thread carrying
-          # the finding's marker is the answer; everything else is open.
-          count_open_findings() {
-            local head="$1" body="$2" resolved count i file line title digest open
-            # shellcheck disable=SC2016
-            resolved="$(gh api graphql -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -F owner="${REPO%/*}" -F repo="${REPO#*/}" -F number="$number" --jq '[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved)|.comments.nodes[0].body // ""]|join("\n")' 2>/dev/null || printf '')"
-
-            count="$(printf '%s' "$body" | jq '.findings | length')"
-            open=0
-            i=0
-            while [ "$i" -lt "$count" ]; do
-              file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
-              line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
-              title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
-              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
-              printf '%s' "$resolved" | grep -qF "id=${digest}" || open=$((open + 1))
-              i=$((i + 1))
-            done
-            printf '%s\n' "$open"
+          # Findings land in the run's job summary: visible on the pull
+          # request's checks tab, one place, and needing no write permission.
+          write_fallback_summary() {
+            local head="$1" body="$2"
+            [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+            {
+              printf '### Fallback review — %s\n\n' "$head"
+              printf '%s' "$body" | jq -r '"_" + (.summary // "") + "_\n"'
+              printf '%s' "$body" | jq -r '.findings[] |
+                "- **" + .severity + "** `" + .file + ":" + ((.line // 1) | tostring) + "` — " + .title + "\n  " + .body'
+              printf '\n_The primary reviewer was unavailable, so the pinned review-gate workflow reviewed this head. '
+              printf 'P0 and P1 close the gate; P2 and P3 are reported only._\n'
+            } >>"$GITHUB_STEP_SUMMARY"
           }
+
+          # How many findings are not yet answered? A resolved thread carrying
 
           # One inline review thread per finding, so each can be answered and
           # resolved. Idempotent per head: a marker carries the head and a
-          # digest of the finding, and a re-run skips what it already posted.
-          post_fallback_findings() {
-            local head="$1" body="$2" existing count i marker file line title text digest
-            [ "$event_mode" = pull_request ] || return 0
 
-            existing="$(rest_api "repos/$REPO/pulls/${number}/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null || printf '')"
-            count="$(printf '%s' "$body" | jq '.findings | length')"
-            i=0
-            while [ "$i" -lt "$count" ]; do
-              file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
-              line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
-              title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
-              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
-              marker="<!-- touchstone:fallback-finding head=${head} id=${digest} -->"
-
-              if ! printf '%s' "$existing" | grep -qF "$marker"; then
-                text="$(printf '%s' "$body" | jq -r --argjson i "$i" --arg m "$marker" '
-                  .findings[$i] |
-                  "**[" + .severity + "] " + .title + "**\n\n" + .body +
-                  "\n\n_Raised by the gate fallback reviewer; the primary reviewer was unavailable. " +
-                  "P2 and P3 do not close the gate — answer and route this thread, then resolve it._\n" + $m
-                ')"
-                rest_api "repos/$REPO/pulls/${number}/comments" \
-                  -f body="$text" -f commit_id="$head" -f path="$file" \
-                  -F line="$line" -f side=RIGHT >/dev/null 2>&1 \
-                  || echo "Fallback reviewer: could not post a thread for ${file}:${line}." >&2
-              fi
-              i=$((i + 1))
-            done
-          }
-
-          # Legibility only. The gate never reads this back as evidence.
-          post_fallback_note() {
-            local head="$1" verdict="$2" body="$3" note
-            [ "$event_mode" = pull_request ] || return 0
-            note="$(printf '%s' "$body" | jq -r --arg head "$head" --arg verdict "$verdict" '
-              "### Fallback review — " + $verdict + "\n\n" +
-              "The primary reviewer produced no verdict for `" + $head + "`, so the pinned " +
-              "review-gate workflow reviewed this head itself.\n\n" +
-              (.summary // "") +
-              (if (.findings | length) > 0 then
-                 "\n\n" + ([.findings[] | "- **" + .severity + "** `" + .file + "` — " + .title + "\n  " + .body] | join("\n"))
-               else "" end) +
-              "\n\n_Computed in-run and not stored as evidence; every evaluation derives its own._"
-            ')"
-            rest_api "repos/$REPO/issues/${number}/comments" -f body="$note" >/dev/null 2>&1 || return 1
-          }
           # touchstone:review-fallback:end
 
           # touchstone:review-wait:start

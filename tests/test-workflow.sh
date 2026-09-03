@@ -997,50 +997,19 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   ) || fail "an empty completion was not retried into a usable verdict"
   echo "  OK: an empty completion is retried once and can then succeed"
 
-  # Mirrors the primary reviewer: any unanswered finding closes the gate,
-  # whatever its severity. The severity bar decides how the driver disposes of
-  # a finding, not whether review passed.
+  # The gate is read-only and cannot open review threads, so the severity bar
+  # is applied here: P0/P1 close the gate, P2/P3 are reported without blocking.
   p2_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P2\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  p3_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P3\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
   p0_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P0\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  mixed_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P2\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"},{\"severity\":\"P1\",\"file\":\"c\",\"line\":2,\"title\":\"u\",\"body\":\"v\"}]}"}}]}'
 
-  for row in "an unanswered P2|$p2_body" "an unanswered P0|$p0_body"; do
-    IFS='|' read -r label rbody <<<"$row"
-    if ( export OPENROUTER_API=k; run_fallback_case "$label" 200 "$rbody" "diff --git a b" ); then
-      fail "$label left the gate open"
-    fi
-    echo "  OK: $label closes the gate"
+  for row in "P2 only|$p2_body|open" "P3 only|$p3_body|open" "P0|$p0_body|closed" "P1 with a P2|$mixed_body|closed"; do
+    IFS='|' read -r label rbody expect <<<"$row"
+    if ( export OPENROUTER_API=k; run_fallback_case "$label" 200 "$rbody" "diff --git a b" ); then actual=open; else actual=closed; fi
+    [ "$actual" = "$expect" ] || fail "severity bar: '$label' left the gate $actual, expected $expect"
+    echo "  OK: $label leaves the gate $expect"
   done
-
-  # A finding whose thread is resolved is answered, so it stops blocking --
-  # otherwise a deterministic reviewer could never converge after routing.
-  (
-    tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
-    printf '0\n' >"$tmp/rest-request-count"
-    RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
-    REST_REQUEST_LIMIT=12; OPENROUTER_API=k
-    FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
-    FALLBACK_COST_TIER=low; FALLBACK_MAX_INPUT_BYTES=100000
-    FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
-    FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
-    printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
-    rest_api() { case "$1" in *compare*) printf 'diff --git a b\n' ;; *comments*) return 0 ;; esac; }
-    curl() {
-      local out="" prev=""
-      for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
-      [ -n "$out" ] && printf '%s' "$p2_body_inner" >"$out"
-      printf '200'
-    }
-    # the resolved thread carries the digest of file|line|title
-    # NOT named "digest": count_open_findings declares a local of that name,
-    # which is still empty when it calls gh.
-    expected_digest="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
-    gh() { printf 'marker id=%s\n' "$expected_digest"; }
-    p2_body_inner='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P2\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
-    # shellcheck source=/dev/null
-    . "$fallback_fixture/fallback.sh"
-    fallback_review abc123 def456 >/dev/null 2>&1
-  ) || fail "a resolved finding still blocked the gate"
-  echo "  OK: a finding whose thread is resolved no longer blocks"
 
   if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
     fail "fallback reviewer passed the gate with no credential configured"
