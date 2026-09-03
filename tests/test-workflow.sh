@@ -856,6 +856,36 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
 fi
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  echo "==> a pull request with no driver still reaches the fallback"
+  authorless_fixture="$(mktemp -d)"
+  awk '
+    /touchstone:provider-state:start/ { copying = 1; next }
+    /touchstone:provider-state:end/ { copying = 0 }
+    copying { sub(/^          /, ""); print }
+  ' "$review_gate" >"$authorless_fixture/state.sh"
+
+  check_authorless() {
+    # $1 expected (yes|no), $2 pr.json contents, $3 label
+    (
+      tmp="$authorless_fixture"; printf '%s' "$2" >"$tmp/pr.json"
+      # shellcheck source=/dev/null
+      . "$authorless_fixture/state.sh"
+      if authorless_pull_request; then actual=yes; else actual=no; fi
+      [ "$actual" = "$1" ] || exit 1
+    ) || fail "authorless_pull_request misread '$3' (expected $1)"
+    echo "  OK: $3"
+  }
+
+  check_authorless yes '{"user":{"login":"dependabot[bot]","type":"Bot"}}' \
+    "a Bot-authored pull request has no driver to request review"
+  check_authorless yes '{"user":{"login":"renovate[bot]","type":"User"}}' \
+    "a [bot] login counts even when the type does not say Bot"
+  check_authorless no '{"user":{"login":"henrymodisett","type":"User"}}' \
+    "a person-authored pull request still owes a review request"
+  check_authorless no '{}' \
+    "missing author data is not treated as authorless"
+  rm -r "$authorless_fixture"
+
   echo "==> provider unavailability is an observed state, not an elapsed clock"
   state_fixture="$(mktemp -d)"
   awk '

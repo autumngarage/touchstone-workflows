@@ -311,6 +311,13 @@ jobs:
           }
 
           # touchstone:provider-state:start
+          # A pull request opened by an app has no driver to request review.
+          authorless_pull_request() {
+            [ -s "$tmp/pr.json" ] || return 1
+            jq -e '(.user.type // "") == "Bot" or ((.user.login // "") | endswith("[bot]"))' \
+              "$tmp/pr.json" >/dev/null 2>&1
+          }
+
           # An observed state, not an elapsed clock. The reviewer tells us it
           # cannot answer; waiting out the evidence window after that learns
           # nothing. Derived from evidence the evaluation already collected, so
@@ -625,7 +632,13 @@ jobs:
                 # posted for them, so they would otherwise sit here forever.
                 # Without that condition this would excuse a driver that simply
                 # never requested review.
-                if { [ "$state" = waiting-review ] || { [ "$state" = waiting-request ] && provider_unavailable; }; } \
+                # waiting-request means no review was ever requested. That is
+                # a driver failure and stays one -- unless there is no driver:
+                # a bot-authored pull request (Dependabot) has nobody to post
+                # the request, and nobody for the reviewer to answer, so the
+                # unavailability signal can never appear on it either.
+                if { [ "$state" = waiting-review ] \
+                     || { [ "$state" = waiting-request ] && { provider_unavailable || authorless_pull_request; }; }; } \
                    && fallback_review "${event_head:-}" "${event_base:-}"; then
                   echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
                   return 0
