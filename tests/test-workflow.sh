@@ -855,4 +855,76 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   rm -r "$fixture"
 fi
 
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  echo "==> the fallback reviewer fails closed"
+  fallback_fixture="$(mktemp -d)"
+  awk '
+    /touchstone:review-fallback:start/ { copying = 1; next }
+    /touchstone:review-fallback:end/ { copying = 0 }
+    copying { sub(/^          /, ""); print }
+  ' "$review_gate" >"$fallback_fixture/fallback.sh"
+
+  # Only an explicit empty finding set may return 0. Every other outcome must
+  # leave the gate exactly as it behaved before the fallback existed.
+  run_fallback_case() {
+    # $1 case name, $2 http code, $3 response body, $4 diff contents
+    (
+      tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+      printf '0\n' >"$tmp/rest-request-count"
+      RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+      REST_REQUEST_LIMIT=12
+        FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
+      FALLBACK_COST_TIER=low; FALLBACK_MAX_INPUT_BYTES=100000
+      FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+      FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+      printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+      printf '%s' "$4" >"$fallback_fixture/diff-src"
+      rest_api() {
+        case "$1" in
+          *compare*) cat "$fallback_fixture/diff-src" ;;
+          *comments*) return 0 ;;
+        esac
+      }
+      CASE_HTTP="$2"; CASE_BODY="$3"
+      curl() {
+        local out="" prev=""
+        for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+        [ -n "$out" ] && printf '%s' "$CASE_BODY" >"$out"
+        printf '%s' "$CASE_HTTP"
+      }
+      # shellcheck source=/dev/null
+      . "$fallback_fixture/fallback.sh"
+      fallback_review abc123 def456 >/dev/null 2>&1
+    )
+  }
+
+  clean_body='{"choices":[{"message":{"content":"{\"summary\":\"ok\",\"findings\":[]}"}}]}'
+  finding_body='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+
+  if ! ( export OPENROUTER_API=k; run_fallback_case clean 200 "$clean_body" "diff --git a b" ); then
+    fail "fallback reviewer rejected an explicit clean verdict"
+  fi
+  echo "  OK: an explicit empty finding set passes"
+
+  for case_name in \
+    "findings|200|$finding_body|diff --git a b" \
+    "malformed|200|{\"choices\":[{\"message\":{\"content\":\"not json\"}}]}|diff --git a b" \
+    "no-content|200|{\"choices\":[]}|diff --git a b" \
+    "http-500|500|{}|diff --git a b" \
+    "empty-diff|200|$clean_body|"
+  do
+    IFS='|' read -r name code body diff <<<"$case_name"
+    if ( export OPENROUTER_API=k; run_fallback_case "$name" "$code" "$body" "$diff" ); then
+      fail "fallback reviewer passed the gate on '$name'"
+    fi
+    echo "  OK: $name is refused"
+  done
+
+  if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
+    fail "fallback reviewer passed the gate with no credential configured"
+  fi
+  echo "  OK: a missing credential never passes"
+  rm -r "$fallback_fixture"
+fi
+
 echo "workflow contract passed"
