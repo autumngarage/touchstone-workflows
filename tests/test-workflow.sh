@@ -1041,6 +1041,38 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     echo "  OK: $label leaves the gate $expect"
   done
 
+  # A 404 is "no provider satisfied the constraints", so it retries once at the
+  # relaxed ceiling and can then succeed. A second 404 is refused.
+  (
+    tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+    printf '0\n' >"$tmp/rest-request-count"
+    RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+    REST_REQUEST_LIMIT=12; OPENROUTER_API=k
+    FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
+    FALLBACK_COST_TIER=low; FALLBACK_MAX_INPUT_BYTES=100000
+    FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+    FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+    FALLBACK_RELAXED_PROMPT_PRICE=2; FALLBACK_RELAXED_COMPLETION_PRICE=8
+    printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+    rest_api() { case "$1" in *compare*) printf 'diff --git a b\n' ;; *comments*) return 0 ;; esac; }
+    printf '0\n' >"$fallback_fixture/n404"
+    ok_body='{"choices":[{"message":{"content":"{\"summary\":\"ok\",\"findings\":[]}"}}]}'
+    curl() {
+      local out="" prev="" n
+      for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+      n=$(( $(cat "$fallback_fixture/n404") + 1 )); printf '%s\n' "$n" >"$fallback_fixture/n404"
+      if [ "$n" -eq 1 ]; then printf '404'; else
+        [ -n "$out" ] && printf '%s' "$ok_body" >"$out"; printf '200'
+      fi
+    }
+    # shellcheck source=/dev/null
+    . "$fallback_fixture/fallback.sh"
+    fallback_review abc123 def456 >/dev/null 2>&1 || exit 1
+    jq -e '.provider.max_price.prompt == 2 and .provider.max_price.completion == 8' \
+      "$fallback_fixture/fallback/request.json" >/dev/null || exit 1
+  ) || fail "a 404 was not retried at the relaxed ceiling"
+  echo "  OK: a 404 retries once at the relaxed ceiling and can then succeed"
+
   # A 200 carrying an error is a provider failure, not model variance: it must
   # be refused and named, not retried as an empty completion.
   err_body='{"error":{"message":"rate limit exceeded"}}'

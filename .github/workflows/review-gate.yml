@@ -78,6 +78,11 @@ jobs:
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
       FALLBACK_MAX_PROMPT_PRICE: 0.5
       FALLBACK_MAX_COMPLETION_PRICE: 2
+      # A 404 means no provider satisfied the constraints, which happens as
+      # provider pricing moves. One retry at a declared higher ceiling keeps
+      # delivery moving without making the ceiling permanently looser.
+      FALLBACK_RELAXED_PROMPT_PRICE: 2
+      FALLBACK_RELAXED_COMPLETION_PRICE: 8
       FALLBACK_CONNECT_TIMEOUT: 10
       FALLBACK_REQUEST_TIMEOUT: 120
     steps:
@@ -467,6 +472,7 @@ jobs:
             # Exactly one extra attempt, and only for that case.
             body=""
             attempt=1
+            relaxed=false
             while :; do
               status=0
               http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
@@ -478,11 +484,22 @@ jobs:
                 "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
 
               if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-                if [ "$http" = "404" ]; then
-                  # The router matched no model. With require_parameters true
-                  # and absolute price ceilings, the eligible set can empty as
-                  # provider pricing moves -- an outage looks nothing like this.
-                  echo "Fallback reviewer: the router matched no model (404). The price ceilings (prompt ${FALLBACK_MAX_PROMPT_PRICE}, completion ${FALLBACK_MAX_COMPLETION_PRICE} per million) with require_parameters may admit nothing right now." >&2
+                if [ "$http" = "404" ] && [ "$relaxed" = false ]; then
+                  # The router matched no provider satisfying every constraint.
+                  # OpenRouter documents this as a 404, and a cost tier is a
+                  # band rather than a ceiling, so max_price is what empties
+                  # the set as provider pricing moves. Retry once at a declared
+                  # higher ceiling instead of blocking delivery on a pricing
+                  # shift; the ceiling stays bounded and the cost is reported.
+                  echo "Fallback reviewer: no provider satisfied the price ceilings (404); retrying once at prompt ${FALLBACK_RELAXED_PROMPT_PRICE}, completion ${FALLBACK_RELAXED_COMPLETION_PRICE} per million." >&2
+                  relaxed=true
+                  jq --argjson p "$FALLBACK_RELAXED_PROMPT_PRICE" --argjson c "$FALLBACK_RELAXED_COMPLETION_PRICE" \
+                    '.provider.max_price = {prompt: $p, completion: $c}' \
+                    "$work/request.json" >"$work/request.relaxed.json" \
+                    && mv "$work/request.relaxed.json" "$work/request.json"
+                  continue
+                elif [ "$http" = "404" ]; then
+                  echo "Fallback reviewer: no provider satisfied the constraints even at the relaxed ceiling (404); require_parameters admits nothing right now." >&2
                 else
                   echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
                 fi
