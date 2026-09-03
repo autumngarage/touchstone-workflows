@@ -340,6 +340,16 @@ jobs:
           # touchstone:provider-state:end
 
           # touchstone:review-fallback:start
+          # Portable short digest: Linux runners have sha256sum, macOS has
+          # shasum. The tests run on either.
+          sha16() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum | cut -c1-16
+            else
+              shasum -a 256 | cut -c1-16
+            fi
+          }
+
           # A verdict this run COMPUTES, never one it reads back. Nothing new
           # becomes a trusted comment author, so no forged comment can pass the
           # gate. Both pull_request and merge_group derive their own.
@@ -491,7 +501,6 @@ jobs:
             fi
 
             findings="$(printf '%s' "$body" | jq '.findings | length')"
-            blocking="$(printf '%s' "$body" | jq '[.findings[] | select(.severity == "P0" or .severity == "P1")] | length')"
             printf '%s' "$body" | jq -r '"Fallback reviewer summary: " + (.summary // "")'
 
             if [ "$findings" -eq 0 ]; then
@@ -502,21 +511,53 @@ jobs:
 
             printf '%s' "$body" | jq -r '.findings[] | "  [" + .severity + "] " + .file + ": " + .title'
 
-            # Findings become review threads. A thread cannot forge a pass --
-            # it can only add something GitHub then blocks merge on -- so the
-            # in-run verdict rule that governs the pass does not apply here.
+            # Findings become review threads, the same object the primary
+            # reviewer produces, so the driver's existing answer-and-resolve
+            # flow works unchanged. A thread cannot forge a pass -- it can only
+            # add something GitHub blocks merge on -- so the in-run verdict
+            # rule that governs the pass does not apply to findings.
             post_fallback_findings "$head" "$body" || true
             post_fallback_note "$head" "findings" "$body" || true
 
-            # The badge is the bar, enforced here rather than trusted to the
-            # agent: P0/P1 close the gate, P2/P3 leave it open and rely on
-            # GitHub's conversation resolution to force an answer before merge.
-            if [ "$blocking" -gt 0 ]; then
-              echo "Fallback reviewer: ${blocking} P0/P1 finding(s) for ${head}; gate stays closed." >&2
+            # Any open finding closes the gate, whatever its severity: the
+            # severity bar decides how the DRIVER disposes of a finding, not
+            # whether review passed. Whether to fix or route stays the driver's
+            # call, exactly as with the primary reviewer.
+            #
+            # A finding whose thread is already resolved counts as answered and
+            # no longer blocks. The primary reviewer gets this for free by being
+            # non-deterministic -- a later review simply comes back clean. This
+            # one is deterministic and would re-report the same finding forever,
+            # so answered findings have to be excluded explicitly or routing
+            # could never converge.
+            open_findings="$(count_open_findings "$head" "$body")" || return 1
+            if [ "$open_findings" -gt 0 ]; then
+              echo "Fallback reviewer: ${open_findings} unanswered finding(s) for ${head}; gate stays closed." >&2
               return 1
             fi
-            echo "Fallback reviewer: ${findings} finding(s), none above P1, for ${head}; gate open, threads must be resolved before merge."
+            echo "Fallback reviewer: ${findings} finding(s) for ${head}, all answered and resolved; clean for this head."
             return 0
+          }
+
+          # How many findings are not yet answered? A resolved thread carrying
+          # the finding's marker is the answer; everything else is open.
+          count_open_findings() {
+            local head="$1" body="$2" resolved count i file line title digest open
+            # shellcheck disable=SC2016
+            resolved="$(gh api graphql -f query='query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved comments(first:1){nodes{body}}}}}}}' -F owner="${REPO%/*}" -F repo="${REPO#*/}" -F number="$number" --jq '[.data.repository.pullRequest.reviewThreads.nodes[]|select(.isResolved)|.comments.nodes[0].body // ""]|join("\n")' 2>/dev/null || printf '')"
+
+            count="$(printf '%s' "$body" | jq '.findings | length')"
+            open=0
+            i=0
+            while [ "$i" -lt "$count" ]; do
+              file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
+              line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
+              title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
+              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+              printf '%s' "$resolved" | grep -qF "id=${digest}" || open=$((open + 1))
+              i=$((i + 1))
+            done
+            printf '%s\n' "$open"
           }
 
           # One inline review thread per finding, so each can be answered and
@@ -533,7 +574,7 @@ jobs:
               file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
               line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
               title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
-              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha256sum | cut -c1-16)"
+              digest="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
               marker="<!-- touchstone:fallback-finding head=${head} id=${digest} -->"
 
               if ! printf '%s' "$existing" | grep -qF "$marker"; then
