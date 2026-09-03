@@ -420,6 +420,7 @@ jobs:
                   max_price: {prompt: $maxPromptPrice, completion: $maxCompletionPrice}
                 },
                 max_completion_tokens: $maxCompletionTokens,
+                usage: {include: true},
                 response_format: {
                   type: "json_schema",
                   json_schema: {
@@ -477,7 +478,14 @@ jobs:
                 "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
 
               if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-                echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                if [ "$http" = "404" ]; then
+                  # The router matched no model. With require_parameters true
+                  # and absolute price ceilings, the eligible set can empty as
+                  # provider pricing moves -- an outage looks nothing like this.
+                  echo "Fallback reviewer: the router matched no model (404). The price ceilings (prompt ${FALLBACK_MAX_PROMPT_PRICE}, completion ${FALLBACK_MAX_COMPLETION_PRICE} per million) with require_parameters may admit nothing right now." >&2
+                else
+                  echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                fi
                 rm -f "$work/curl.conf"
                 return 1
               fi
@@ -494,7 +502,17 @@ jobs:
               fi
 
               body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
-              [ -n "$body" ] && break
+              if [ -n "$body" ]; then
+                # Spend is invisible unless it is reported. This runs on every
+                # pull request and again per merge group while the primary
+                # reviewer is down, so the per-run cost is worth seeing.
+                jq -r '"Fallback reviewer cost: model=" + (.model // "?")
+                       + " prompt=" + ((.usage.prompt_tokens // 0) | tostring)
+                       + " completion=" + ((.usage.completion_tokens // 0) | tostring)
+                       + " usd=" + ((.usage.cost // 0) | tostring)' \
+                  "$work/response.json" 2>/dev/null || true
+                break
+              fi
 
               # Name what answered and why it stopped; an unexplained empty
               # completion is undiagnosable after the fact.
