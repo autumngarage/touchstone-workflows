@@ -509,7 +509,12 @@ jobs:
               return 0
             fi
 
-            printf '%s' "$body" | jq -r '.findings[] | "  [" + .severity + "] " + .file + ": " + .title'
+            # The job summary is reachable only in the UI, so the complete
+            # finding goes to the log, which the API serves. An agent that
+            # cannot read the detail cannot act on it.
+            printf '%s' "$body" | jq -r '.findings[] |
+              "  [" + .severity + "] " + .file + ":" + ((.line // 1) | tostring) + " — " + .title
+              + "\n      " + (.body | gsub("\n"; "\n      "))'
 
             # Findings become review threads, the same object the primary
             # reviewer produces, so the driver's existing answer-and-resolve
@@ -615,7 +620,13 @@ jobs:
               remaining=$((deadline - now))
               if [ "$remaining" -le 0 ]; then
                 echo "Review gate remained '$state' until its evidence deadline." >&2
-                if [ "$state" = waiting-review ] && fallback_review "${event_head:-}" "${event_base:-}"; then
+                # waiting-request too, but only when the reviewer has said it
+                # cannot answer. Dependabot pull requests never get a request
+                # posted for them, so they would otherwise sit here forever.
+                # Without that condition this would excuse a driver that simply
+                # never requested review.
+                if { [ "$state" = waiting-review ] || { [ "$state" = waiting-request ] && provider_unavailable; }; } \
+                   && fallback_review "${event_head:-}" "${event_base:-}"; then
                   echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
                   return 0
                 fi
