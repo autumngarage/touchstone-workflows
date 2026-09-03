@@ -78,6 +78,11 @@ jobs:
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
       FALLBACK_MAX_PROMPT_PRICE: 0.5
       FALLBACK_MAX_COMPLETION_PRICE: 2
+      # A 404 means no provider satisfied the constraints, which happens as
+      # provider pricing moves. One retry at a declared higher ceiling keeps
+      # delivery moving without making the ceiling permanently looser.
+      FALLBACK_RELAXED_PROMPT_PRICE: 2
+      FALLBACK_RELAXED_COMPLETION_PRICE: 8
       FALLBACK_CONNECT_TIMEOUT: 10
       FALLBACK_REQUEST_TIMEOUT: 120
     steps:
@@ -420,6 +425,7 @@ jobs:
                   max_price: {prompt: $maxPromptPrice, completion: $maxCompletionPrice}
                 },
                 max_completion_tokens: $maxCompletionTokens,
+                usage: {include: true},
                 response_format: {
                   type: "json_schema",
                   json_schema: {
@@ -466,6 +472,7 @@ jobs:
             # Exactly one extra attempt, and only for that case.
             body=""
             attempt=1
+            relaxed=false
             while :; do
               status=0
               http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
@@ -477,13 +484,52 @@ jobs:
                 "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
 
               if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-                echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                if [ "$http" = "404" ] && [ "$relaxed" = false ]; then
+                  # The router matched no provider satisfying every constraint.
+                  # OpenRouter documents this as a 404, and a cost tier is a
+                  # band rather than a ceiling, so max_price is what empties
+                  # the set as provider pricing moves. Retry once at a declared
+                  # higher ceiling instead of blocking delivery on a pricing
+                  # shift; the ceiling stays bounded and the cost is reported.
+                  echo "Fallback reviewer: no provider satisfied the price ceilings (404); retrying once at prompt ${FALLBACK_RELAXED_PROMPT_PRICE}, completion ${FALLBACK_RELAXED_COMPLETION_PRICE} per million." >&2
+                  relaxed=true
+                  jq --argjson p "$FALLBACK_RELAXED_PROMPT_PRICE" --argjson c "$FALLBACK_RELAXED_COMPLETION_PRICE" \
+                    '.provider.max_price = {prompt: $p, completion: $c}' \
+                    "$work/request.json" >"$work/request.relaxed.json" \
+                    && mv "$work/request.relaxed.json" "$work/request.json"
+                  continue
+                elif [ "$http" = "404" ]; then
+                  echo "Fallback reviewer: no provider satisfied the constraints even at the relaxed ceiling (404); require_parameters admits nothing right now." >&2
+                else
+                  echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                fi
+                rm -f "$work/curl.conf"
+                return 1
+              fi
+
+              # A 200 can carry an error instead of a completion: the router
+              # returns rate limits and provider failures that way. Treated as
+              # an empty completion it looks like model variance, gets one
+              # pointless retry, and reports nothing anyone can act on.
+              api_error="$(jq -r '(.error.message // .error // empty) | tostring' "$work/response.json" 2>/dev/null || true)"
+              if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+                echo "Fallback reviewer: provider returned an error in a 200 response: ${api_error}" >&2
                 rm -f "$work/curl.conf"
                 return 1
               fi
 
               body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
-              [ -n "$body" ] && break
+              if [ -n "$body" ]; then
+                # Spend is invisible unless it is reported. This runs on every
+                # pull request and again per merge group while the primary
+                # reviewer is down, so the per-run cost is worth seeing.
+                jq -r '"Fallback reviewer cost: model=" + (.model // "?")
+                       + " prompt=" + ((.usage.prompt_tokens // 0) | tostring)
+                       + " completion=" + ((.usage.completion_tokens // 0) | tostring)
+                       + " usd=" + ((.usage.cost // 0) | tostring)' \
+                  "$work/response.json" 2>/dev/null || true
+                break
+              fi
 
               # Name what answered and why it stopped; an unexplained empty
               # completion is undiagnosable after the fact.
