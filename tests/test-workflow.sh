@@ -1075,11 +1075,46 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
 
   # A 200 carrying an error is a provider failure, not model variance: it must
   # be refused and named, not retried as an empty completion.
-  err_body='{"error":{"message":"rate limit exceeded"}}'
+  err_body='{"error":{"message":"upstream provider returned an invalid response"}}'
   if ( export OPENROUTER_API=k; run_fallback_case "error-in-200" 200 "$err_body" "diff --git a b" ); then
     fail "a 200 carrying a provider error opened the gate"
   fi
   echo "  OK: a provider error inside a 200 is refused"
+
+  # A rate limit is waited out once, because the local tier and the gate draw
+  # on the same account and can collide seconds apart.
+  (
+    tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+    printf '0\n' >"$tmp/rest-request-count"
+    RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+    REST_REQUEST_LIMIT=12; OPENROUTER_API=k
+    FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
+    FALLBACK_COST_TIER=medium; FALLBACK_MAX_INPUT_BYTES=100000
+    FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+    FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+    FALLBACK_RELAXED_PROMPT_PRICE=2; FALLBACK_RELAXED_COMPLETION_PRICE=8
+    FALLBACK_RATE_LIMIT_BACKOFF=0
+    printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+    rest_api() { case "$1" in *compare*) printf 'diff --git a b\n' ;; *comments*) return 0 ;; esac; }
+    printf '0\n' >"$fallback_fixture/nrl"
+    ok_body='{"choices":[{"message":{"content":"{\"summary\":\"ok\",\"findings\":[]}"}}]}'
+    curl() {
+      local out="" prev="" n
+      for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+      n=$(( $(cat "$fallback_fixture/nrl") + 1 )); printf '%s\n' "$n" >"$fallback_fixture/nrl"
+      if [ "$n" -eq 1 ]; then
+        [ -n "$out" ] && printf '%s' '{"error":{"message":"Rate limit exceeded"}}' >"$out"
+      else
+        [ -n "$out" ] && printf '%s' "$ok_body" >"$out"
+      fi
+      printf '200'
+    }
+    # shellcheck source=/dev/null
+    . "$fallback_fixture/fallback.sh"
+    fallback_review abc123 def456 >/dev/null 2>&1 || exit 1
+    [ "$(cat "$fallback_fixture/nrl")" = "2" ] || exit 1
+  ) || fail "a rate limit was not waited out and retried once"
+  echo "  OK: a rate limit is waited out once and can then succeed"
 
   if ( unset OPENROUTER_API; run_fallback_case nocred 200 "$clean_body" "diff --git a b" ); then
     fail "fallback reviewer passed the gate with no credential configured"
