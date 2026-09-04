@@ -43,6 +43,12 @@ jobs:
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \
             -o "$RUNNER_TEMP/check-delivery-evidence.sh"
           echo "${evaluator_sha256}  $RUNNER_TEMP/check-delivery-evidence.sh" | sha256sum --check --strict
+          # The next step is a separate shell, so the revision has to cross the
+          # step boundary through the environment file rather than a shell
+          # variable. validate.yml already carries TOUCHSTONE_ENGINE_PATH this
+          # way; this is the same idiom.
+          printf 'TOUCHSTONE_EVIDENCE_CHECKER_REVISION=%s\n' \
+            "$touchstone_revision" >>"$GITHUB_ENV"
 
       - name: Verify recorded evidence
         run: |
@@ -59,5 +65,4 @@ jobs:
             *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
           esac
           gh api "repos/$REPO/pulls/$number" --jq '.body // ""' >"$RUNNER_TEMP/pr-body.md"
-          TOUCHSTONE_EVIDENCE_CHECKER_REVISION="$touchstone_revision" \
-            bash "$RUNNER_TEMP/check-delivery-evidence.sh" "$RUNNER_TEMP/pr-body.md"
+          bash "$RUNNER_TEMP/check-delivery-evidence.sh" "$RUNNER_TEMP/pr-body.md"
