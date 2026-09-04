@@ -1041,6 +1041,51 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     echo "  OK: $label leaves the gate $expect"
   done
 
+  # A reviewer can be wrong. A finding the pull request body refutes by id must
+  # stop blocking, and a P0 must be dismissible too -- severity does not decide
+  # whether a finding is CORRECT.
+  run_dismissal_case() {
+    # $1 pr body, $2 response body, $3 expected (open|closed)
+    (
+      tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+      printf '0\n' >"$tmp/rest-request-count"
+      printf '%s' "$1" | jq -Rs '{body:.}' >"$tmp/pr.json"
+      RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+      REST_REQUEST_LIMIT=12; OPENROUTER_API=k
+      FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODEL=m; FALLBACK_PLUGIN=p
+      FALLBACK_COST_TIER=low; FALLBACK_MAX_INPUT_BYTES=100000
+      FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+      FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+      FALLBACK_RELAXED_PROMPT_PRICE=2; FALLBACK_RELAXED_COMPLETION_PRICE=8
+      printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+      rest_api() { case "$1" in *compare*) printf 'diff --git a b\n' ;; *comments*) return 0 ;; esac; }
+      CASE_BODY="$2"
+      curl() { local out="" prev=""; for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
+        [ -n "$out" ] && printf '%s' "$CASE_BODY" >"$out"; printf '200'; }
+      # shellcheck source=/dev/null
+      . "$fallback_fixture/fallback.sh"
+      fallback_review abc123 def456 >/dev/null 2>&1
+    )
+  }
+
+  p1_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  p1_only='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+
+  if run_dismissal_case "no dismissals here" "$p1_only" ; then
+    fail "an undismissed P1 left the gate open"
+  fi
+  echo "  OK: an undismissed P1 closes the gate"
+
+  if ! run_dismissal_case "refuted: <!-- touchstone:review-dismiss id=$p1_id reason=the runner proves it -->" "$p1_only"; then
+    fail "a P1 dismissed by the pull request body still blocked"
+  fi
+  echo "  OK: a P1 the body refutes by id no longer blocks"
+
+  if run_dismissal_case "<!-- touchstone:review-dismiss id=0000000000000000 reason=wrong id -->" "$p1_only"; then
+    fail "a dismissal naming a different finding opened the gate"
+  fi
+  echo "  OK: a dismissal naming a different finding does not apply"
+
   # A 404 is "no provider satisfied the constraints", so it retries once at the
   # relaxed ceiling and can then succeed. A second 404 is refused.
   (
