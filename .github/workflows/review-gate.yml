@@ -415,19 +415,32 @@ jobs:
           recorded_verdict() {
             local head="$1" runs run_id jobs job_id attempt log encoded
             runs="$work/recorded-runs.json"
-            rest_api "repos/$REPO/actions/runs?head_sha=${head}&per_page=30" >"$runs" 2>/dev/null || return 1
-            jq -e 'type == "object" and (.workflow_runs | type == "array")' "$runs" >/dev/null 2>&1 || return 1
+            if ! rest_api "repos/$REPO/actions/runs?head_sha=${head}&per_page=30" >"$runs" 2>"$runs.err"; then
+              echo "Fallback reviewer: could not list runs for ${head}: $(head -c 200 "$runs.err")" >&2
+              return 1
+            fi
+            jq -e 'type == "object" and (.workflow_runs | type == "array")' "$runs" >/dev/null 2>&1 \
+              || { echo "Fallback reviewer: run list for ${head} is not in the expected shape." >&2; return 1; }
             # Newest first; at most a few runs, each one page of jobs.
             for run_id in $(jq -r --arg wf "${GITHUB_WORKFLOW:-}" '
                 [.workflow_runs[] | select($wf == "" or .name == $wf)] | sort_by(.run_number) | reverse | .[0:5][] | .id' "$runs"); do
               jobs="$work/recorded-jobs-$run_id.json"
-              rest_api "repos/$REPO/actions/runs/${run_id}/jobs?filter=all&per_page=100" >"$jobs" 2>/dev/null || continue
+              if ! rest_api "repos/$REPO/actions/runs/${run_id}/jobs?filter=all&per_page=100" >"$jobs" 2>"$jobs.err"; then
+                echo "Fallback reviewer: could not list jobs of run ${run_id}: $(head -c 200 "$jobs.err")" >&2
+                continue
+              fi
               for job_id in $(jq -r --arg run "${GITHUB_RUN_ID:-}" --arg att "${GITHUB_RUN_ATTEMPT:-}" '
                   [.jobs[] | select(.status == "completed")
                             | select(($run | tostring) != (.run_id | tostring) or ($att | tostring) != (.run_attempt | tostring))]
                   | sort_by(.run_attempt) | reverse | .[] | .id' "$jobs"); do
                 log="$work/recorded-log-$job_id.txt"
-                rest_api "repos/$REPO/actions/jobs/${job_id}/logs" >"$log" 2>/dev/null || continue
+                # The runner writes terminal escape sequences (group markers)
+                # into the log, and gh refuses to print such a response unless
+                # told to; the verdict line itself is plain base64.
+                if ! rest_api "repos/$REPO/actions/jobs/${job_id}/logs" --allow-escape-sequences >"$log" 2>"$log.err"; then
+                  echo "Fallback reviewer: could not read the log of job ${job_id}: $(head -c 200 "$log.err")" >&2
+                  continue
+                fi
                 encoded="$(grep -oE "Fallback reviewer verdict head=${head} v=1 json=[A-Za-z0-9+/=]+" "$log" | head -1 | sed 's/.*json=//')"
                 [ -n "$encoded" ] || continue
                 body="$(printf '%s' "$encoded" | base64 -d 2>/dev/null)" || continue
