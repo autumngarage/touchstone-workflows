@@ -1068,6 +1068,55 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     )
   }
 
+  # The verdict for a head is recorded in the log and reused by a later run
+  # for the same head: no second request, and the same finding ids, so a
+  # refutation recorded against the first run still applies.
+  run_reuse_case() {
+    # $1 pr body, $2 recorded verdict (message content JSON), $3 expected (open|closed)
+    (
+      tmp="$fallback_fixture/evidence"; mkdir -p "$tmp"
+      printf '0\n' >"$tmp/rest-request-count"
+      printf '%s' "$1" | jq -Rs '{body:.}' >"$tmp/pr.json"
+      RUNNER_TEMP="$fallback_fixture"; REPO="o/r"; number=1; event_mode=pull_request
+      REST_REQUEST_LIMIT=12; OPENROUTER_API=k
+      GITHUB_WORKFLOW=review-gate; GITHUB_RUN_ID=9; GITHUB_RUN_ATTEMPT=2
+      FALLBACK_ENDPOINT="https://example.invalid"; FALLBACK_MODELS="m1,m2"
+      FALLBACK_MAX_INPUT_BYTES=100000
+      FALLBACK_MAX_COMPLETION_TOKENS=16; FALLBACK_MAX_PROMPT_PRICE=1
+      FALLBACK_MAX_COMPLETION_PRICE=1; FALLBACK_CONNECT_TIMEOUT=1; FALLBACK_REQUEST_TIMEOUT=1
+      FALLBACK_RELAXED_PROMPT_PRICE=2; FALLBACK_RELAXED_COMPLETION_PRICE=8
+      printf 'prompt\n' >"$fallback_fixture/review-prompt.md"
+      recorded_b64="$(printf '%s' "$2" | jq -c . | base64 | tr -d '\n')"
+      rest_api() {
+        case "$1" in
+          *compare*) printf 'diff --git a b\n' ;;
+          *actions/runs\?head_sha=abc123*) printf '{"workflow_runs":[{"id":9,"name":"review-gate","run_number":4},{"id":8,"name":"validate","run_number":3}]}' ;;
+          *actions/runs/9/jobs*) printf '{"jobs":[{"id":91,"run_id":9,"run_attempt":1,"status":"completed"},{"id":92,"run_id":9,"run_attempt":2,"status":"in_progress"}]}' ;;
+          *actions/jobs/91/logs*) printf '2026-01-01T00:00:00Z Fallback reviewer verdict head=abc123 v=1 json=%s\n' "$recorded_b64" ;;
+          *comments*) return 0 ;;
+        esac
+      }
+      curl() { touch "$fallback_fixture/curl-called"; printf '000'; }
+      # shellcheck source=/dev/null
+      . "$fallback_fixture/fallback.sh"
+      fallback_review abc123 def456 >"$fallback_fixture/reuse.out" 2>&1
+    )
+  }
+  rm -f "$fallback_fixture/curl-called"
+  reuse_p1='{"summary":"x","findings":[{"severity":"P1","file":"a","line":1,"title":"t","body":"b"}]}'
+  if run_reuse_case "no dismissals" "$reuse_p1"; then
+    fail "a recorded P1 verdict left the gate open"
+  fi
+  [ ! -e "$fallback_fixture/curl-called" ] || fail "a recorded verdict was on file and the provider was asked again"
+  grep -q 'reusing the verdict recorded for abc123 in run 9 attempt 1' "$fallback_fixture/reuse.out" \
+    || fail "the reused verdict was not named in the log: $(cat "$fallback_fixture/reuse.out")"
+  echo "  OK: a recorded verdict is reused without a new request"
+  reuse_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  if ! run_reuse_case "<!-- touchstone:review-dismiss id=$reuse_id reason=refuted -->" "$reuse_p1"; then
+    fail "a dismissal recorded against the first run did not apply to the reused verdict"
+  fi
+  echo "  OK: a refutation of the recorded finding still applies on the re-run"
+
   p1_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
   p1_only='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
 

@@ -35,6 +35,9 @@ concurrency:
 permissions:
   contents: read
   pull-requests: read
+  # The fallback verdict for a head is recorded in this workflow's own log and
+  # read back on a later run for the same head.
+  actions: read
   issues: read
 
 defaults:
@@ -401,6 +404,49 @@ jobs:
               || true
           }
 
+          # A review happens once per head. The model is not deterministic, so
+          # asking it again on every gate run for the same head re-rolls the
+          # findings and their ids, and a refutation the driver recorded can
+          # never match -- the loop that held pull requests for eight rounds.
+          # The gate is read-only, so the verdict is recorded where it can
+          # write: its own log, which the API serves back. A later run for the
+          # same head reuses it, exactly as a primary review posted once would
+          # stand. Sets body and answered_by; returns 1 when nothing is on record.
+          recorded_verdict() {
+            local head="$1" runs run_id jobs job_id attempt log encoded
+            runs="$work/recorded-runs.json"
+            rest_api "repos/$REPO/actions/runs?head_sha=${head}&per_page=30" >"$runs" 2>/dev/null || return 1
+            jq -e 'type == "object" and (.workflow_runs | type == "array")' "$runs" >/dev/null 2>&1 || return 1
+            # Newest first; at most a few runs, each one page of jobs.
+            for run_id in $(jq -r --arg wf "${GITHUB_WORKFLOW:-}" '
+                [.workflow_runs[] | select($wf == "" or .name == $wf)] | sort_by(.run_number) | reverse | .[0:5][] | .id' "$runs"); do
+              jobs="$work/recorded-jobs-$run_id.json"
+              rest_api "repos/$REPO/actions/runs/${run_id}/jobs?filter=all&per_page=100" >"$jobs" 2>/dev/null || continue
+              for job_id in $(jq -r --arg run "${GITHUB_RUN_ID:-}" --arg att "${GITHUB_RUN_ATTEMPT:-}" '
+                  [.jobs[] | select(.status == "completed")
+                            | select(($run | tostring) != (.run_id | tostring) or ($att | tostring) != (.run_attempt | tostring))]
+                  | sort_by(.run_attempt) | reverse | .[] | .id' "$jobs"); do
+                log="$work/recorded-log-$job_id.txt"
+                rest_api "repos/$REPO/actions/jobs/${job_id}/logs" >"$log" 2>/dev/null || continue
+                encoded="$(grep -oE "Fallback reviewer verdict head=${head} v=1 json=[A-Za-z0-9+/=]+" "$log" | head -1 | sed 's/.*json=//')"
+                [ -n "$encoded" ] || continue
+                body="$(printf '%s' "$encoded" | base64 -d 2>/dev/null)" || continue
+                verdict_shaped "$body" || continue
+                attempt="$(jq -r --argjson j "$job_id" '.jobs[] | select(.id == $j) | .run_attempt' "$jobs")"
+                answered_by="run ${run_id} attempt ${attempt}"
+                echo "Fallback reviewer: reusing the verdict recorded for ${head} in ${answered_by}; no new request."
+                return 0
+              done
+            done
+            return 1
+          }
+
+          record_verdict() {
+            local head="$1" body="$2"
+            printf 'Fallback reviewer verdict head=%s v=1 json=%s\n' "$head" \
+              "$(printf '%s' "$body" | jq -c . | base64 | tr -d '\n')"
+          }
+
           # One bounded exchange with the provider: at most one retry for an
           # empty completion, one for a rate limit, one for a 404 at the relaxed
           # ceiling. Sets body and answered_by on success.
@@ -612,6 +658,9 @@ jobs:
                 }
               }' >"$work/request.json"
 
+            if recorded_verdict "$head"; then
+              :
+            else
             # The credential goes in a private config file, never in argv,
             # where the runner process list would expose it.
             umask 077
@@ -642,6 +691,8 @@ jobs:
               printf 'header = "Authorization: Bearer %s"\n' "$OPENROUTER_API" >"$work/curl.conf"
               fallback_request_loop || return 1
               verdict_shaped "$body" || { echo "Fallback reviewer: ${answered_by:-?} also answered with something that is not a verdict; gate stays closed." >&2; return 1; }
+            fi
+            record_verdict "$head" "$body"
             fi
 
             findings="$(printf '%s' "$body" | jq '.findings | length')"
