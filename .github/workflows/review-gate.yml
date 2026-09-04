@@ -352,6 +352,45 @@ jobs:
           # touchstone:provider-state:end
 
           # touchstone:review-fallback:start
+          # Each finding carries the id a driver would dismiss it by, so
+          # refuting one does not require guessing how it was addressed.
+          print_findings_with_ids() {
+            local body="$1" count i sev file line title fbody id
+            count="$(printf '%s' "$body" | jq '.findings | length')"
+            i=0
+            while [ "$i" -lt "$count" ]; do
+              sev="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].severity')"
+              file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
+              line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
+              title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
+              fbody="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].body')"
+              id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+              printf '  [%s] %s:%s — %s\n' "$sev" "$file" "$line" "$title"
+              printf '%s\n' "$fbody" | sed 's/^/      /'
+              printf '      dismiss with: <!-- touchstone:review-dismiss id=%s reason=... --> in the PR body\n' "$id"
+              i=$((i + 1))
+            done
+          }
+
+          # A reviewer can be wrong, and a wrong finding must not hold a correct
+          # change hostage. With the primary reviewer this is disposition 3:
+          # push back with evidence, resolve the thread, do not change the code.
+          # The fallback runs read-only and opens no thread, so that path has to
+          # live somewhere it can write: the pull request body, which only a
+          # collaborator can edit, and which delivery-evidence already reads.
+          #
+          # A dismissal unblocks, so it is the one input here that could be
+          # abused. It is bounded by requiring write access to the pull request,
+          # by naming the exact finding, by carrying a reason, and by being
+          # printed in the log every time it is honoured -- the record of a
+          # dismissed finding is as durable as the finding.
+          dismissed_finding_ids() {
+            [ -s "$tmp/pr.json" ] || return 0
+            jq -r '.body // ""' "$tmp/pr.json" 2>/dev/null \
+              | grep -oE '<!--[[:space:]]*touchstone:review-dismiss[[:space:]]+id=[0-9a-f]{16}[^>]*-->' \
+              || true
+          }
+
           # Portable short digest: Linux runners have sha256sum, macOS has
           # shasum. The tests run on either.
           sha16() {
@@ -565,9 +604,7 @@ jobs:
             # The job summary is reachable only in the UI, so the complete
             # finding goes to the log, which the API serves. An agent that
             # cannot read the detail cannot act on it.
-            printf '%s' "$body" | jq -r '.findings[] |
-              "  [" + .severity + "] " + .file + ":" + ((.line // 1) | tostring) + " — " + .title
-              + "\n      " + (.body | gsub("\n"; "\n      "))'
+            print_findings_with_ids "$body"
 
             # Findings become review threads, the same object the primary
             # reviewer produces, so the driver's existing answer-and-resolve
@@ -580,6 +617,29 @@ jobs:
             # and there is no answer-and-resolve flow to lean on. The severity
             # bar therefore has to be applied here: P0/P1 close the gate, and
             # P2/P3 are reported without blocking.
+            # Drop any finding the pull request body explicitly refutes.
+            dismissals="$(dismissed_finding_ids)"
+            if [ -n "$dismissals" ]; then
+              blocking=0
+              count="$(printf '%s' "$body" | jq '.findings | length')"
+              i=0
+              while [ "$i" -lt "$count" ]; do
+                sev="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].severity')"
+                file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
+                line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
+                title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
+                id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+                if printf '%s' "$dismissals" | grep -qF "id=$id"; then
+                  printf 'Fallback reviewer: finding %s (%s %s:%s) dismissed by the pull request body: %s\n' \
+                    "$id" "$sev" "$file" "$line" \
+                    "$(printf '%s' "$dismissals" | grep -F "id=$id" | head -1)"
+                elif [ "$sev" = P0 ] || [ "$sev" = P1 ]; then
+                  blocking=$((blocking + 1))
+                fi
+                i=$((i + 1))
+              done
+            fi
+
             if [ "$blocking" -gt 0 ]; then
               echo "Fallback reviewer: ${blocking} P0/P1 finding(s) for ${head}; gate stays closed." >&2
               return 1
