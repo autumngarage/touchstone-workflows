@@ -1099,7 +1099,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       curl() { touch "$fallback_fixture/curl-called"; printf '000'; }
       # shellcheck source=/dev/null
       . "$fallback_fixture/fallback.sh"
-      fallback_review abc123 def456 >"$fallback_fixture/reuse.out" 2>&1
+      fallback_review "${REUSE_EVAL_HEAD:-abc123}" def456 "${REUSE_REVIEWED_HEAD:-}" >"$fallback_fixture/reuse.out" 2>&1
     )
   }
   rm -f "$fallback_fixture/curl-called"
@@ -1116,6 +1116,16 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fail "a dismissal recorded against the first run did not apply to the reused verdict"
   fi
   echo "  OK: a refutation of the recorded finding still applies on the re-run"
+  # The merge group evaluates the prospective merge sha; the review that
+  # admitted the pull request is the one recorded for its head, and it stands.
+  rm -f "$fallback_fixture/curl-called"
+  if ! REUSE_EVAL_HEAD=mg9999 REUSE_REVIEWED_HEAD=abc123 run_reuse_case "<!-- touchstone:review-dismiss id=$reuse_id reason=refuted -->" "$reuse_p1"; then
+    fail "the merge group did not reuse the verdict recorded for the pull request head"
+  fi
+  [ ! -e "$fallback_fixture/curl-called" ] || fail "the merge group re-reviewed the group head although the pull request head had a recorded verdict"
+  grep -q 'reusing the verdict recorded for abc123' "$fallback_fixture/reuse.out" \
+    || fail "the merge group did not name the pull request head's verdict: $(cat "$fallback_fixture/reuse.out")"
+  echo "  OK: the merge group reuses the verdict recorded for the pull request head"
 
   p1_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
   p1_only='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
