@@ -73,7 +73,14 @@ jobs:
       FALLBACK_ENDPOINT: https://openrouter.ai/api/v1/chat/completions
       FALLBACK_MODEL: openrouter/auto
       FALLBACK_PLUGIN: auto-router
-      FALLBACK_COST_TIER: low
+      # The gate decides whether work merges, so a wrong finding costs a
+      # review round -- CI minutes, an agent's time, and a person's attention
+      # -- to save a fraction of a cent. hesperus#189 took eight rounds with
+      # five real findings and four false ones, and the false rate rose as the
+      # cheap tier did the gating. A measured review is 4,677 prompt tokens at
+      # $0.0032 on this tier; a tier up is still cents, and one avoided false
+      # P1 pays for hundreds of reviews.
+      FALLBACK_COST_TIER: medium
       FALLBACK_MAX_INPUT_BYTES: 400000
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
       FALLBACK_MAX_PROMPT_PRICE: 0.5
@@ -83,6 +90,7 @@ jobs:
       # delivery moving without making the ceiling permanently looser.
       FALLBACK_RELAXED_PROMPT_PRICE: 2
       FALLBACK_RELAXED_COMPLETION_PRICE: 8
+      FALLBACK_RATE_LIMIT_BACKOFF: 45
       FALLBACK_CONNECT_TIMEOUT: 10
       FALLBACK_REQUEST_TIMEOUT: 120
     steps:
@@ -512,6 +520,7 @@ jobs:
             body=""
             attempt=1
             relaxed=false
+            rate_limited=false
             while :; do
               status=0
               http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
@@ -552,6 +561,19 @@ jobs:
               # pointless retry, and reports nothing anyone can act on.
               api_error="$(jq -r '(.error.message // .error // empty) | tostring' "$work/response.json" 2>/dev/null || true)"
               if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+                # A rate limit is the one provider error worth waiting out. The
+                # local review tier and this gate draw on the same account, so
+                # an agent producing local evidence can exhaust the limit the
+                # gate needs seconds later -- the advisory tier starving the
+                # deciding one. Backing off once costs a minute; failing sends
+                # a correct change back round the loop.
+                if printf '%s' "$api_error" | grep -qiE 'rate.?limit|too many requests|429' \
+                  && [ "$rate_limited" = false ]; then
+                  rate_limited=true
+                  echo "Fallback reviewer: provider rate limit (${api_error}); waiting ${FALLBACK_RATE_LIMIT_BACKOFF}s and trying once more." >&2
+                  sleep "$FALLBACK_RATE_LIMIT_BACKOFF"
+                  continue
+                fi
                 echo "Fallback reviewer: provider returned an error in a 200 response: ${api_error}" >&2
                 rm -f "$work/curl.conf"
                 return 1
