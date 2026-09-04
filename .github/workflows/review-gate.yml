@@ -71,15 +71,18 @@ jobs:
       # behaves exactly as it did before this step existed.
       OPENROUTER_API: ${{ secrets.OPENROUTER_API }}
       FALLBACK_ENDPOINT: https://openrouter.ai/api/v1/chat/completions
-      # A priority list across vendors, not one auto-routed model. openrouter/auto
-      # picks the top-ranked eligible model every time, which with strict JSON
-      # output meant one model on every run -- and one upstream pool to be
-      # throttled by. OpenRouter falls through this list on any error: rate
-      # limit, downtime, context length. The list is the cost control; every
-      # entry supports strict structured output and sits under the ceiling.
-      # OpenRouter allows at most three. Three vendors, so one upstream
-      # throttle cannot empty the list.
-      FALLBACK_MODELS: openai/gpt-5.6-luna,anthropic/claude-haiku-4.5,deepseek/deepseek-v3.2
+      # A priority list across vendors, at most three (the API's limit).
+      # OpenRouter falls through it on any provider error; this gate also
+      # falls through when a model answers with something that is not a
+      # verdict. Every entry was verified to return a strict-schema verdict on
+      # a real 9,500-token diff. Anthropic is absent on purpose: claude-haiku
+      # answers large diffs with prose and ignores response_format.
+      #
+      # The request must use max_tokens, not max_completion_tokens: the
+      # latter is an OpenAI-only name, and with require_parameters every
+      # provider that does not advertise it was excluded -- which is why the
+      # router only ever reached one model.
+      FALLBACK_MODELS: openai/gpt-5.6-luna,x-ai/grok-4.3,deepseek/deepseek-v3.2
       FALLBACK_MAX_INPUT_BYTES: 400000
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
       FALLBACK_MAX_PROMPT_PRICE: 2
@@ -398,6 +401,113 @@ jobs:
               || true
           }
 
+          # One bounded exchange with the provider: at most one retry for an
+          # empty completion, one for a rate limit, one for a 404 at the relaxed
+          # ceiling. Sets body and answered_by on success.
+          fallback_request_loop() {
+            local status http
+              body=""
+              attempt=1
+              relaxed=false
+              rate_limited=false
+              while :; do
+                status=0
+                http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
+                  --config "$work/curl.conf" \
+                  --connect-timeout "$FALLBACK_CONNECT_TIMEOUT" \
+                  --max-time "$FALLBACK_REQUEST_TIMEOUT" \
+                  -H "Content-Type: application/json" \
+                  -X POST --data @"$work/request.json" \
+                  "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
+
+                if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
+                  if [ "$http" = "404" ] && [ "$relaxed" = false ]; then
+                    # The router matched no provider satisfying every constraint.
+                    # OpenRouter documents this as a 404, and a cost tier is a
+                    # band rather than a ceiling, so max_price is what empties
+                    # the set as provider pricing moves. Retry once at a declared
+                    # higher ceiling instead of blocking delivery on a pricing
+                    # shift; the ceiling stays bounded and the cost is reported.
+                    echo "Fallback reviewer: no provider satisfied the price ceilings (404); retrying once at prompt ${FALLBACK_RELAXED_PROMPT_PRICE}, completion ${FALLBACK_RELAXED_COMPLETION_PRICE} per million." >&2
+                    relaxed=true
+                    jq --argjson p "$FALLBACK_RELAXED_PROMPT_PRICE" --argjson c "$FALLBACK_RELAXED_COMPLETION_PRICE" \
+                      '.provider.max_price = {prompt: $p, completion: $c}' \
+                      "$work/request.json" >"$work/request.relaxed.json" \
+                      && mv "$work/request.relaxed.json" "$work/request.json"
+                    continue
+                  elif [ "$http" = "404" ]; then
+                    echo "Fallback reviewer: no provider satisfied the constraints even at the relaxed ceiling (404); require_parameters admits nothing right now." >&2
+                  else
+                    echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
+                  fi
+                  rm -f "$work/curl.conf"
+                  return 1
+                fi
+
+                # A 200 can carry an error instead of a completion: the router
+                # returns rate limits and provider failures that way. Treated as
+                # an empty completion it looks like model variance, gets one
+                # pointless retry, and reports nothing anyone can act on.
+                api_error="$(jq -r '(.error.message // .error // empty) | tostring' "$work/response.json" 2>/dev/null || true)"
+                if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
+                  # A rate limit is the one provider error worth waiting out. The
+                  # local review tier and this gate draw on the same account, so
+                  # an agent producing local evidence can exhaust the limit the
+                  # gate needs seconds later -- the advisory tier starving the
+                  # deciding one. Backing off once costs a minute; failing sends
+                  # a correct change back round the loop.
+                  if printf '%s' "$api_error" | grep -qiE 'rate.?limit|too many requests|429' \
+                    && [ "$rate_limited" = false ]; then
+                    rate_limited=true
+                    echo "Fallback reviewer: provider rate limit (${api_error}); waiting ${FALLBACK_RATE_LIMIT_BACKOFF}s and trying once more." >&2
+                    sleep "$FALLBACK_RATE_LIMIT_BACKOFF"
+                    continue
+                  fi
+                  echo "Fallback reviewer: provider returned an error in a 200 response: ${api_error}" >&2
+                  rm -f "$work/curl.conf"
+                  return 1
+                fi
+
+                body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
+                if [ -n "$body" ]; then
+                  # Spend is invisible unless it is reported. This runs on every
+                  # pull request and again per merge group while the primary
+                  # reviewer is down, so the per-run cost is worth seeing.
+                  jq -r '"Fallback reviewer cost: model=" + (.model // "?")
+                         + " prompt=" + ((.usage.prompt_tokens // 0) | tostring)
+                         + " completion=" + ((.usage.completion_tokens // 0) | tostring)
+                         + " usd=" + ((.usage.cost // 0) | tostring)' \
+                    "$work/response.json" 2>/dev/null || true
+                  break
+                fi
+
+                # Name what answered and why it stopped; an unexplained empty
+                # completion is undiagnosable after the fact.
+                jq -r '"  model=" + (.model // "?") + " finish=" + (.choices[0].finish_reason // "?")
+                       + " native=" + (.choices[0].native_finish_reason // "?")
+                       + " error=" + ((.error // {}) | tostring | .[0:200])' \
+                  "$work/response.json" 2>/dev/null >&2 || true
+
+                if [ "$attempt" -ge 2 ]; then
+                  echo "Fallback reviewer: response carried no content after $attempt attempts." >&2
+                  rm -f "$work/curl.conf"
+                  return 1
+                fi
+                echo "Fallback reviewer: empty completion; one further attempt." >&2
+                attempt=$((attempt + 1))
+              done
+              rm -f "$work/curl.conf"
+            answered_by="$(jq -r '.model // ""' "$work/response.json" 2>/dev/null || true)"
+            return 0
+          }
+
+          # A verdict is one JSON object with a findings array. Code fences
+          # around it are tolerated; prose is not a verdict however good.
+          verdict_shaped() {
+            printf '%s' "$1" | sed -e 's/^```json//' -e 's/^```//' -e 's/```$//' \
+              | jq -e 'type == "object" and has("findings") and (.findings | type == "array")' >/dev/null 2>&1
+          }
+
           # Portable short digest: Linux runners have sha256sum, macOS has
           # shasum. The tests run on either.
           sha16() {
@@ -467,7 +577,7 @@ jobs:
                   require_parameters: true,
                   max_price: {prompt: $maxPromptPrice, completion: $maxCompletionPrice}
                 },
-                max_completion_tokens: $maxCompletionTokens,
+                max_tokens: $maxCompletionTokens,
                 usage: {include: true},
                 response_format: {
                   type: "json_schema",
@@ -513,101 +623,25 @@ jobs:
             # the spend is already sunk. openrouter/auto selects per request,
             # so a second attempt usually lands on a model that answers.
             # Exactly one extra attempt, and only for that case.
-            body=""
-            attempt=1
-            relaxed=false
-            rate_limited=false
-            while :; do
-              status=0
-              http="$(curl -sS -o "$work/response.json" -w '%{http_code}' \
-                --config "$work/curl.conf" \
-                --connect-timeout "$FALLBACK_CONNECT_TIMEOUT" \
-                --max-time "$FALLBACK_REQUEST_TIMEOUT" \
-                -H "Content-Type: application/json" \
-                -X POST --data @"$work/request.json" \
-                "$FALLBACK_ENDPOINT" 2>"$work/curl.err")" || status=$?
+            fallback_request_loop || return 1
 
-              if [ "$status" -ne 0 ] || [ "$http" != "200" ]; then
-                if [ "$http" = "404" ] && [ "$relaxed" = false ]; then
-                  # The router matched no provider satisfying every constraint.
-                  # OpenRouter documents this as a 404, and a cost tier is a
-                  # band rather than a ceiling, so max_price is what empties
-                  # the set as provider pricing moves. Retry once at a declared
-                  # higher ceiling instead of blocking delivery on a pricing
-                  # shift; the ceiling stays bounded and the cost is reported.
-                  echo "Fallback reviewer: no provider satisfied the price ceilings (404); retrying once at prompt ${FALLBACK_RELAXED_PROMPT_PRICE}, completion ${FALLBACK_RELAXED_COMPLETION_PRICE} per million." >&2
-                  relaxed=true
-                  jq --argjson p "$FALLBACK_RELAXED_PROMPT_PRICE" --argjson c "$FALLBACK_RELAXED_COMPLETION_PRICE" \
-                    '.provider.max_price = {prompt: $p, completion: $c}' \
-                    "$work/request.json" >"$work/request.relaxed.json" \
-                    && mv "$work/request.relaxed.json" "$work/request.json"
-                  continue
-                elif [ "$http" = "404" ]; then
-                  echo "Fallback reviewer: no provider satisfied the constraints even at the relaxed ceiling (404); require_parameters admits nothing right now." >&2
-                else
-                  echo "Fallback reviewer: request failed (http=${http:-none}, curl=${status})." >&2
-                fi
-                rm -f "$work/curl.conf"
+            if ! verdict_shaped "$body"; then
+              echo "Fallback reviewer: ${answered_by:-?} answered with something that is not a verdict. First 300 bytes:" >&2
+              printf '%s' "$body" | head -c 300 >&2; echo >&2
+              # OpenRouter falls through its list on provider errors, not on a
+              # model that ignored response_format. Drop that model and ask the
+              # rest of the list once.
+              remaining="$(printf '%s' "$FALLBACK_MODELS" | tr ',' '\n' | grep -vxF "${answered_by:-}" | paste -sd, -)"
+              if [ -z "$remaining" ] || [ "$remaining" = "$FALLBACK_MODELS" ]; then
                 return 1
               fi
-
-              # A 200 can carry an error instead of a completion: the router
-              # returns rate limits and provider failures that way. Treated as
-              # an empty completion it looks like model variance, gets one
-              # pointless retry, and reports nothing anyone can act on.
-              api_error="$(jq -r '(.error.message // .error // empty) | tostring' "$work/response.json" 2>/dev/null || true)"
-              if [ -n "$api_error" ] && [ "$api_error" != "null" ]; then
-                # A rate limit is the one provider error worth waiting out. The
-                # local review tier and this gate draw on the same account, so
-                # an agent producing local evidence can exhaust the limit the
-                # gate needs seconds later -- the advisory tier starving the
-                # deciding one. Backing off once costs a minute; failing sends
-                # a correct change back round the loop.
-                if printf '%s' "$api_error" | grep -qiE 'rate.?limit|too many requests|429' \
-                  && [ "$rate_limited" = false ]; then
-                  rate_limited=true
-                  echo "Fallback reviewer: provider rate limit (${api_error}); waiting ${FALLBACK_RATE_LIMIT_BACKOFF}s and trying once more." >&2
-                  sleep "$FALLBACK_RATE_LIMIT_BACKOFF"
-                  continue
-                fi
-                echo "Fallback reviewer: provider returned an error in a 200 response: ${api_error}" >&2
-                rm -f "$work/curl.conf"
-                return 1
-              fi
-
-              body="$(jq -r '.choices[0].message.content // empty' "$work/response.json" 2>/dev/null || true)"
-              if [ -n "$body" ]; then
-                # Spend is invisible unless it is reported. This runs on every
-                # pull request and again per merge group while the primary
-                # reviewer is down, so the per-run cost is worth seeing.
-                jq -r '"Fallback reviewer cost: model=" + (.model // "?")
-                       + " prompt=" + ((.usage.prompt_tokens // 0) | tostring)
-                       + " completion=" + ((.usage.completion_tokens // 0) | tostring)
-                       + " usd=" + ((.usage.cost // 0) | tostring)' \
-                  "$work/response.json" 2>/dev/null || true
-                break
-              fi
-
-              # Name what answered and why it stopped; an unexplained empty
-              # completion is undiagnosable after the fact.
-              jq -r '"  model=" + (.model // "?") + " finish=" + (.choices[0].finish_reason // "?")
-                     + " native=" + (.choices[0].native_finish_reason // "?")
-                     + " error=" + ((.error // {}) | tostring | .[0:200])' \
-                "$work/response.json" 2>/dev/null >&2 || true
-
-              if [ "$attempt" -ge 2 ]; then
-                echo "Fallback reviewer: response carried no content after $attempt attempts." >&2
-                rm -f "$work/curl.conf"
-                return 1
-              fi
-              echo "Fallback reviewer: empty completion; one further attempt." >&2
-              attempt=$((attempt + 1))
-            done
-            rm -f "$work/curl.conf"
-
-            if ! printf '%s' "$body" | jq -e 'has("findings") and (.findings | type == "array")' >/dev/null 2>&1; then
-              echo "Fallback reviewer: malformed review body; not a verdict." >&2
-              return 1
+              echo "Fallback reviewer: asking the remaining models once: ${remaining}" >&2
+              jq --arg m "$remaining" '.models = ($m | split(","))' "$work/request.json" >"$work/request.next.json" \
+                && mv "$work/request.next.json" "$work/request.json"
+              umask 077
+              printf 'header = "Authorization: Bearer %s"\n' "$OPENROUTER_API" >"$work/curl.conf"
+              fallback_request_loop || return 1
+              verdict_shaped "$body" || { echo "Fallback reviewer: ${answered_by:-?} also answered with something that is not a verdict; gate stays closed." >&2; return 1; }
             fi
 
             findings="$(printf '%s' "$body" | jq '.findings | length')"
