@@ -71,25 +71,24 @@ jobs:
       # behaves exactly as it did before this step existed.
       OPENROUTER_API: ${{ secrets.OPENROUTER_API }}
       FALLBACK_ENDPOINT: https://openrouter.ai/api/v1/chat/completions
-      FALLBACK_MODEL: openrouter/auto
-      FALLBACK_PLUGIN: auto-router
-      # The gate decides whether work merges, so a wrong finding costs a
-      # review round -- CI minutes, an agent's time, and a person's attention
-      # -- to save a fraction of a cent. hesperus#189 took eight rounds with
-      # five real findings and four false ones, and the false rate rose as the
-      # cheap tier did the gating. A measured review is 4,677 prompt tokens at
-      # $0.0032 on this tier; a tier up is still cents, and one avoided false
-      # P1 pays for hundreds of reviews.
-      FALLBACK_COST_TIER: medium
+      # A priority list across vendors, not one auto-routed model. openrouter/auto
+      # picks the top-ranked eligible model every time, which with strict JSON
+      # output meant one model on every run -- and one upstream pool to be
+      # throttled by. OpenRouter falls through this list on any error: rate
+      # limit, downtime, context length. The list is the cost control; every
+      # entry supports strict structured output and sits under the ceiling.
+      # OpenRouter allows at most three. Three vendors, so one upstream
+      # throttle cannot empty the list.
+      FALLBACK_MODELS: openai/gpt-5.6-luna,anthropic/claude-haiku-4.5,deepseek/deepseek-v3.2
       FALLBACK_MAX_INPUT_BYTES: 400000
       FALLBACK_MAX_COMPLETION_TOKENS: 4096
-      FALLBACK_MAX_PROMPT_PRICE: 0.5
-      FALLBACK_MAX_COMPLETION_PRICE: 2
+      FALLBACK_MAX_PROMPT_PRICE: 2
+      FALLBACK_MAX_COMPLETION_PRICE: 8
       # A 404 means no provider satisfied the constraints, which happens as
       # provider pricing moves. One retry at a declared higher ceiling keeps
       # delivery moving without making the ceiling permanently looser.
-      FALLBACK_RELAXED_PROMPT_PRICE: 2
-      FALLBACK_RELAXED_COMPLETION_PRICE: 8
+      FALLBACK_RELAXED_PROMPT_PRICE: 5
+      FALLBACK_RELAXED_COMPLETION_PRICE: 25
       FALLBACK_RATE_LIMIT_BACKOFF: 45
       FALLBACK_CONNECT_TIMEOUT: 10
       FALLBACK_REQUEST_TIMEOUT: 120
@@ -453,20 +452,17 @@ jobs:
             jq -n \
               --rawfile system "$RUNNER_TEMP/review-prompt.md" \
               --rawfile diff "$work/diff" \
-              --arg model "$FALLBACK_MODEL" \
-              --arg plugin "$FALLBACK_PLUGIN" \
-              --arg costTier "$FALLBACK_COST_TIER" \
+              --arg models "$FALLBACK_MODELS" \
               --arg head "$head" \
               --argjson maxCompletionTokens "$FALLBACK_MAX_COMPLETION_TOKENS" \
               --argjson maxPromptPrice "$FALLBACK_MAX_PROMPT_PRICE" \
               --argjson maxCompletionPrice "$FALLBACK_MAX_COMPLETION_PRICE" \
               '{
-                model: $model,
+                models: ($models | split(",") | map(select(length > 0))),
                 messages: [
                   {role: "system", content: $system},
                   {role: "user", content: ("Review the pushed head " + $head + ".\n\n" + $diff)}
                 ],
-                plugins: [{id: $plugin, cost_tier: $costTier}],
                 provider: {
                   require_parameters: true,
                   max_price: {prompt: $maxPromptPrice, completion: $maxCompletionPrice}
