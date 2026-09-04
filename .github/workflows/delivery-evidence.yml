@@ -37,8 +37,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="567704521132c92029c0e64f41c35e270d6e79a4"
-          evaluator_sha256="34d4095e94504e5ccbb86e278d79ae349dc8d4316192031e648ec82084ef1c5f"
+          touchstone_revision="519d10b86a5f0a05dbd06d8e0bd2863a5baac6f8"
+          evaluator_sha256="95b44d609b340b9e753b2a36d214ca19427daf070f191addec0b45927c3d2315"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \
             -o "$RUNNER_TEMP/check-delivery-evidence.sh"
@@ -59,4 +59,5 @@ jobs:
             *) echo "ERROR: unsupported event ${GITHUB_EVENT_NAME}" >&2; exit 1 ;;
           esac
           gh api "repos/$REPO/pulls/$number" --jq '.body // ""' >"$RUNNER_TEMP/pr-body.md"
-          bash "$RUNNER_TEMP/check-delivery-evidence.sh" "$RUNNER_TEMP/pr-body.md"
+          TOUCHSTONE_EVIDENCE_CHECKER_REVISION="$touchstone_revision" \
+            bash "$RUNNER_TEMP/check-delivery-evidence.sh" "$RUNNER_TEMP/pr-body.md"
