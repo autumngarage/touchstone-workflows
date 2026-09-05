@@ -1227,4 +1227,13 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   rm -r "$fallback_fixture"
 fi
 
+# Cross-step shell scope. Everything above asserts on the text of the workflows;
+# this asserts the one property that text cannot show, and that a broken pin
+# proved matters more than any pattern (46efeaa, AUT-1263). Skipped inside the
+# recursive fixture runs, whose roots carry workflows but no tests directory.
+if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-run-block-scope.sh" \
+    || fail "cross-step shell scope check failed"
+fi
+
 echo "workflow contract passed"
