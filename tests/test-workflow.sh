@@ -1111,7 +1111,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   grep -q 'reusing the verdict recorded for abc123 in run 9 attempt 1' "$fallback_fixture/reuse.out" \
     || fail "the reused verdict was not named in the log: $(cat "$fallback_fixture/reuse.out")"
   echo "  OK: a recorded verdict is reused without a new request"
-  reuse_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  reuse_id="$(printf '%s|%s' a t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
   if ! run_reuse_case "<!-- touchstone:review-dismiss id=$reuse_id reason=refuted -->" "$reuse_p1"; then
     fail "a dismissal recorded against the first run did not apply to the reused verdict"
   fi
@@ -1127,7 +1127,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     || fail "the merge group did not name the pull request head's verdict: $(cat "$fallback_fixture/reuse.out")"
   echo "  OK: the merge group reuses the verdict recorded for the pull request head"
 
-  p1_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  p1_id="$(printf '%s|%s' a t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
   p1_only='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":1,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
 
   if run_dismissal_case "no dismissals here" "$p1_only" ; then
@@ -1139,6 +1139,24 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fail "a P1 dismissed by the pull request body still blocked"
   fi
   echo "  OK: a P1 the body refutes by id no longer blocks"
+
+  # A rebase shifts the line. The claim is identical, so the dismissal must
+  # still hold -- the scheme this replaced re-blocked a finding already
+  # refuted and charged the fix-round budget for it (AUT-1284).
+  p1_moved='{"choices":[{"message":{"content":"{\"summary\":\"x\",\"findings\":[{\"severity\":\"P1\",\"file\":\"a\",\"line\":184,\"title\":\"t\",\"body\":\"b\"}]}"}}]}'
+  if ! run_dismissal_case "refuted: <!-- touchstone:review-dismiss id=$p1_id reason=the runner proves it -->" "$p1_moved"; then
+    fail "a dismissal stopped applying after the finding moved to another line"
+  fi
+  echo "  OK: a dismissal survives the line moving"
+
+  # A dismissal written under the old line-bearing scheme still matches while
+  # the line is unchanged, so the upgrade does not invalidate refutations
+  # already recorded in open pull request bodies.
+  legacy_p1_id="$(printf '%s|%s|%s' a 1 t | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  if ! run_dismissal_case "refuted: <!-- touchstone:review-dismiss id=$legacy_p1_id reason=recorded before the change -->" "$p1_only"; then
+    fail "a dismissal recorded under the legacy id scheme stopped being honoured"
+  fi
+  echo "  OK: a legacy dismissal is still honoured during the transition"
 
   if run_dismissal_case "<!-- touchstone:review-dismiss id=0000000000000000 reason=wrong id -->" "$p1_only"; then
     fail "a dismissal naming a different finding opened the gate"
