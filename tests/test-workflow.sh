@@ -287,11 +287,22 @@ echo "  OK: triggers and effective permissions are structurally bound"
 
 echo "==> review polling preserves repository API headroom at concurrent scale"
 production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+production_fast_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_FAST_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+production_request_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_REQUEST_WAIT_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 production_request_limit="$(sed -n 's/^[[:space:]]*REST_REQUEST_LIMIT: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+[ -n "$production_fast_poll_seconds" ] && [ -n "$production_request_wait_seconds" ] \
+  || fail "review-gate must declare REVIEW_FAST_POLL_SECONDS and REVIEW_REQUEST_WAIT_SECONDS"
+[ "$production_fast_poll_seconds" -lt "$production_request_wait_seconds" ] \
+  || fail "REVIEW_FAST_POLL_SECONDS ($production_fast_poll_seconds) must be shorter than the request window ($production_request_wait_seconds) or the window is one sleep (AUT-1291)"
 standard_hourly_budget=1000
 reserved_budget=$((standard_hourly_budget / 5))
 concurrent_waiting_prs=3
-projected_requests=$((concurrent_waiting_prs * (3600 / production_poll_seconds) * production_request_limit))
+# Each waiting PR pays a bounded fast burst inside its request window -- the
+# immediate first evaluation plus one per fast interval -- then the slow
+# steady poll for the rest of the hour.
+fast_evaluations=$((production_request_wait_seconds / production_fast_poll_seconds + 1))
+steady_evaluations=$(((3600 - production_request_wait_seconds) / production_poll_seconds))
+projected_requests=$((concurrent_waiting_prs * (fast_evaluations + steady_evaluations) * production_request_limit))
 [ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
   || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
 direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'gh api "\$@"' | grep -v 'gh api graphql' || true)"
@@ -430,6 +441,8 @@ run_wait_case() {
   REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
   REVIEW_POLL_SECONDS="${8:-60}"
   EVALUATION_SECONDS="${9:-0}"
+  REVIEW_FAST_POLL_SECONDS="${10:-30}"
+  expected_max_elapsed="${11:-}"
 
   evaluate_once() {
     index="$WAIT_CALLS"
@@ -449,17 +462,32 @@ run_wait_case() {
   fi
   [ "$WAIT_CALLS" -eq "$expected_calls" ] \
     || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
+  [ -z "$expected_max_elapsed" ] || [ "$MOCK_NOW" -le "$expected_max_elapsed" ] \
+    || fail "$label: expected the wait to end within ${expected_max_elapsed}s, it took ${MOCK_NOW}s"
   echo "  OK: $label"
 }
 
+# The request window (120s here) is polled at the fast interval (30s): five
+# evaluations to a request deadline, not three at the old 60s poll.
 run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
 run_wait_case "terminal-failure" "failure" pull_request failure 1
 run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
-run_wait_case "request-deadline" "waiting-request" pull_request failure 3
-run_wait_case "review-deadline" "waiting-review" pull_request failure 3
+run_wait_case "request-deadline" "waiting-request" pull_request failure 5
+run_wait_case "review-deadline" "waiting-review" pull_request failure 5
 run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180
 run_wait_case "request-starts-full-review-window" "waiting-request,waiting-review,waiting-review,success" pull_request success 4 60 180 60
 run_wait_case "unknown-state" "unknown" pull_request failure 1
+# AUT-1291: with the production 300s poll, one sleep used to cover the whole
+# 120s request window, so a request posted seconds after the run began was
+# not seen for ~120s, and neither was the reviewer's capacity notice behind
+# it. Inside the window the gate now re-evaluates every 30s: a request seen
+# on the second evaluation and a verdict on the third end the wait in 60s,
+# not 420s.
+run_wait_case "request-window-polls-fast" "waiting-request,waiting-request,waiting-request,success" pull_request success 4 120 3600 300 0 30 90
+run_wait_case "capacity-notice-seen-inside-the-window" "waiting-request,waiting-review,success" pull_request success 3 120 3600 300 0 30 60
+# Past the window the slow poll returns: a review that takes long is waited
+# for at 300s, so the fast burst stays bounded to the window.
+run_wait_case "slow-poll-resumes-after-the-window" "waiting-request,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,success" pull_request success 8 120 3600 300 0 30 1320
 rm -rf "$wait_fixture"
 
 echo "==> review-gate binds evidence to event PR coordinates"
