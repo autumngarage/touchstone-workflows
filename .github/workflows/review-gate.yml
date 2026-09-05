@@ -377,7 +377,16 @@ jobs:
               line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
               title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
               fbody="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].body')"
-              id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+              # Keyed on the claim, not its coordinates. A line number in the
+              # id meant any rebase or merge that shifted the line invalidated
+              # a dismissal already justified in the body, and the identical
+              # claim returned as a new blocking finding -- spending the fix
+              # round budget on work already answered (AUT-1284). Two findings
+              # sharing a title in one file therefore share an id, and one
+              # dismissal clears both: a deliberate trade, because an id that
+              # does not survive a rebase is worth less than one that is
+              # occasionally too broad.
+              id="$(printf '%s|%s' "$file" "$title" | sha16)"
               printf '  [%s] %s:%s — %s\n' "$sev" "$file" "$line" "$title"
               printf '%s\n' "$fbody" | sed 's/^/      /'
               printf '      dismiss with: <!-- touchstone:review-dismiss id=%s reason=... --> in the PR body\n' "$id"
@@ -752,11 +761,23 @@ jobs:
                 file="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].file')"
                 line="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].line // 1')"
                 title="$(printf '%s' "$body" | jq -r --argjson i "$i" '.findings[$i].title')"
-                id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+                id="$(printf '%s|%s' "$file" "$title" | sha16)"
+                # A dismissal written before the id stopped carrying the line
+                # still names the old digest. Accept it so the upgrade does not
+                # invalidate refutations already sitting in open pull request
+                # bodies -- re-blocking exactly what this change exists to stop.
+                # Only the durable id is emitted, so the legacy form ages out.
+                legacy_id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
+                matched_id=""
                 if printf '%s' "$dismissals" | grep -qF "id=$id"; then
+                  matched_id="$id"
+                elif printf '%s' "$dismissals" | grep -qF "id=$legacy_id"; then
+                  matched_id="$legacy_id"
+                fi
+                if [ -n "$matched_id" ]; then
                   printf 'Fallback reviewer: finding %s (%s %s:%s) dismissed by the pull request body: %s\n' \
-                    "$id" "$sev" "$file" "$line" \
-                    "$(printf '%s' "$dismissals" | grep -F "id=$id" | head -1)"
+                    "$matched_id" "$sev" "$file" "$line" \
+                    "$(printf '%s' "$dismissals" | grep -F "id=$matched_id" | head -1)"
                 elif [ "$sev" = P0 ] || [ "$sev" = P1 ]; then
                   blocking=$((blocking + 1))
                 fi
