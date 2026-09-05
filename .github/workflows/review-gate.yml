@@ -70,6 +70,17 @@ jobs:
       REST_REQUEST_LIMIT: 12
       MAX_EVIDENCE_PAGES: 4
       REVIEW_POLL_SECONDS: 300
+      # The first REVIEW_REQUEST_WAIT_SECONDS of a run are polled at this
+      # faster interval. Everything the gate can learn quickly arrives then:
+      # the driver's request comment lands seconds after the push that
+      # started the run, and a reviewer at capacity answers it within
+      # seconds more. Polled at REVIEW_POLL_SECONDS, one sleep covered the
+      # whole request window, so a head pushed while the reviewer was at
+      # capacity idled ~120s before the fallback ran -- on every push of
+      # every PR (AUT-1291). The burst is bounded: at most
+      # REVIEW_REQUEST_WAIT_SECONDS / REVIEW_FAST_POLL_SECONDS evaluations
+      # per run, which tests/test-workflow.sh counts against the API budget.
+      REVIEW_FAST_POLL_SECONDS: 30
       # Fallback reviewer. Absent credential = no fallback; the gate then
       # behaves exactly as it did before this step existed.
       OPENROUTER_API: ${{ secrets.OPENROUTER_API }}
@@ -898,7 +909,14 @@ jobs:
                 return 1
               fi
 
-              sleep_seconds="$REVIEW_POLL_SECONDS"
+              # Inside the request window the wait is for evidence that
+              # arrives in seconds (the request, a capacity notice), so poll
+              # fast; past it the wait is for a review, so poll slowly.
+              if [ "$now" -lt "$request_deadline" ]; then
+                sleep_seconds="$REVIEW_FAST_POLL_SECONDS"
+              else
+                sleep_seconds="$REVIEW_POLL_SECONDS"
+              fi
               [ "$sleep_seconds" -le "$remaining" ] || sleep_seconds="$remaining"
               echo "Review gate is '$state'; re-evaluating in ${sleep_seconds}s (${remaining}s remain)."
               review_gate_sleep "$sleep_seconds"
