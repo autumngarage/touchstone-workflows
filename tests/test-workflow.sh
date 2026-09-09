@@ -166,13 +166,13 @@ assert_active_line "$review_gate" \
   'echo "${evaluator_sha256}  $RUNNER_TEMP/evaluate-v3.jq" | sha256sum --check --strict' \
   "review evaluator checksum"
 assert_active_line "$review_gate" \
-  'timeout-minutes: 65' \
+  'timeout-minutes: 20' \
   "review wait job timeout"
 assert_active_line "$review_gate" \
   'REVIEW_REQUEST_WAIT_SECONDS: 120' \
   "review request wait bound"
 assert_active_line "$review_gate" \
-  'REVIEW_EVIDENCE_WAIT_SECONDS: 3600' \
+  'REVIEW_EVIDENCE_WAIT_SECONDS: 600' \
   "review evidence wait bound"
 assert_active_line "$review_gate" \
   'REST_REQUEST_LIMIT: 12' \
@@ -290,8 +290,22 @@ production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0
 production_fast_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_FAST_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 production_request_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_REQUEST_WAIT_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 production_request_limit="$(sed -n 's/^[[:space:]]*REST_REQUEST_LIMIT: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+production_evidence_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_EVIDENCE_WAIT_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 [ -n "$production_fast_poll_seconds" ] && [ -n "$production_request_wait_seconds" ] \
-  || fail "review-gate must declare REVIEW_FAST_POLL_SECONDS and REVIEW_REQUEST_WAIT_SECONDS"
+  && [ -n "$production_evidence_wait_seconds" ] \
+  || fail "review-gate must declare REVIEW_FAST_POLL_SECONDS, REVIEW_REQUEST_WAIT_SECONDS and REVIEW_EVIDENCE_WAIT_SECONDS"
+[ "$production_request_wait_seconds" -lt "$production_evidence_wait_seconds" ] \
+  || fail "REVIEW_REQUEST_WAIT_SECONDS ($production_request_wait_seconds) must fit inside the evidence window ($production_evidence_wait_seconds)"
+# AUT-1417 derived this deadline from measurement: every observed review
+# landed within five minutes of a request the reviewer acted on, so the
+# deadline governs how long to sit on a request that may never be answered,
+# not how long a review takes. It sat at 3600 for no measured reason and
+# cost an hour per head. Widen it only against a fresh measurement, and
+# change these bounds in the same commit.
+[ "$production_evidence_wait_seconds" -ge 240 ] \
+  || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) is inside the band where the reviewer still answers; it would cut off reviews that were going to arrive"
+[ "$production_evidence_wait_seconds" -le 1200 ] \
+  || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) waits past the measured band, buying latency the measurement says does not exist (AUT-1417)"
 [ "$production_fast_poll_seconds" -lt "$production_request_wait_seconds" ] \
   || fail "REVIEW_FAST_POLL_SECONDS ($production_fast_poll_seconds) must be shorter than the request window ($production_request_wait_seconds) or the window is one sleep (AUT-1291)"
 standard_hourly_budget=1000
@@ -301,7 +315,10 @@ concurrent_waiting_prs=3
 # immediate first evaluation plus one per fast interval -- then the slow
 # steady poll for the rest of the hour.
 fast_evaluations=$((production_request_wait_seconds / production_fast_poll_seconds + 1))
-steady_evaluations=$(((3600 - production_request_wait_seconds) / production_poll_seconds))
+# The waiting run's own duration, not a round hour: a literal here kept
+# testing an hour after the deadline was derived down to its measured band
+# (AUT-1417), which would have let any poll interval pass unexamined.
+steady_evaluations=$(((production_evidence_wait_seconds - production_request_wait_seconds) / production_poll_seconds))
 projected_requests=$((concurrent_waiting_prs * (fast_evaluations + steady_evaluations) * production_request_limit))
 [ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
   || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
@@ -488,6 +505,12 @@ run_wait_case "capacity-notice-seen-inside-the-window" "waiting-request,waiting-
 # Past the window the slow poll returns: a review that takes long is waited
 # for at 300s, so the fast burst stays bounded to the window.
 run_wait_case "slow-poll-resumes-after-the-window" "waiting-request,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,success" pull_request success 8 120 3600 300 0 30 1320
+# AUT-1417: a reviewer that never answers this head must be given up on at
+# the derived deadline, not an hour later. Run at the production constants
+# so the bound this asserts is the one that ships: the gate reaches its
+# deadline -- and the fallback reviewer behind it -- in 600s. On the former
+# 3600s deadline this case takes six times as long and fails here.
+run_wait_case "silent-reviewer-hits-the-derived-deadline" "waiting-review" pull_request failure 7 120 600 300 0 30 600
 rm -rf "$wait_fixture"
 
 echo "==> review-gate binds evidence to event PR coordinates"

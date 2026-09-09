@@ -51,13 +51,38 @@ jobs:
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: review-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
       REVIEW_REQUEST_WAIT_SECONDS: 120
-      REVIEW_EVIDENCE_WAIT_SECONDS: 3600
+      # Derived from the reviewer's measured answer latency, not a round hour.
+      # Measured 2026-09-08 over hesperus #270-#300: every head's review
+      # requests paired with the result comment naming that head (n=15).
+      #
+      # Time from the head's FIRST request to its result:
+      #   3, 3, 3, 3, 3, 4, 4, 4, 4 | 16, 55, 59, 99, 133, 144   (minutes)
+      #
+      # Time from the LAST request before that result:
+      #   2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 5, 5           (minutes)
+      #
+      # The reviewer is never slow. Every one of the fifteen answered within
+      # five minutes of a request it acted on, and every case in the slow
+      # column had two or three requests: the first was dropped, and the
+      # elapsed hour was time spent waiting for something to ask again. So
+      # this deadline governs how long to sit on a request that may never be
+      # answered -- not how long a review takes.
+      #
+      # 600s is 2x the slowest observed answer. Past it the fallback reviewer
+      # returns a full verdict in ~15s for ~$0.003 -- a real verdict, not a
+      # waiver, and one that has caught a P1 the primary never reported.
+      # Waiting longer cannot help: a request this reviewer received has
+      # already been answered by 5 minutes, and one it dropped is not
+      # answered by waiting (AUT-1417). Recovering a dropped request is a
+      # separate question and belongs to the driver, not here (AUT-1482).
+      # Move this only against a fresh measurement.
+      REVIEW_EVIDENCE_WAIT_SECONDS: 600
       # Scale boundary: 3 concurrent PRs * 12 polls/hour * the enforced
       # 12 REST requests/evaluation = 432 of the token's 1,000 requests/hour.
       #
