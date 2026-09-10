@@ -30,7 +30,10 @@ jobs:
     # keeps changes to the adapter reviewable without adding work to consumers.
     if: github.repository == 'autumngarage/touchstone-workflows'
     name: source contract
-    runs-on: ubuntu-latest
+    # LINUX_RUNNER unset: GitHub-hosted Linux, exactly as before. Set: a
+    # self-hosted runner with that label, and self-hosted is always required,
+    # so the setting can never name a hosted image (AUT-1595).
+    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Checkout workflow source
@@ -56,8 +59,10 @@ jobs:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
     if: github.repository != 'autumngarage/touchstone-workflows'
+    # The name is the check context consumers already see, kept literal and
+    # unchanged; the runner comes from the setting below (AUT-1595).
     name: validate (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - name: Checkout target repository

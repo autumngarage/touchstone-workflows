@@ -28,6 +28,27 @@ assert_active_line() {
 }
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
+
+# AUT-1595: every job takes its runner from the LINUX_RUNNER setting. Unset,
+# it is GitHub-hosted Linux exactly as before; set, self-hosted is always
+# required, so the setting can never name a hosted image. Touchstone's shared
+# hosted-runner check (AUT-1592) accepts this shape.
+# shellcheck disable=SC2016
+runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
+assert_runner_selector() {
+  file="$1"
+  jobs="$2"
+  actual="$(sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$file" | grep -Fxc -- "$runner_selector" || true)"
+  [ "$actual" -eq "$jobs" ] || fail "$file: expected $jobs job(s) on the LINUX_RUNNER selector, found $actual"
+  # Self-test fixtures append jobs of their own; only production is exhaustive.
+  if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+    actual="$(grep -Ec '^[[:space:]]*runs-on:' "$file" || true)"
+    [ "$actual" -eq "$jobs" ] || fail "$file: a job takes its runner from somewhere other than the LINUX_RUNNER selector"
+  fi
+}
+assert_runner_selector "$workflow" 2
+assert_runner_selector "$review_gate" 1
+assert_runner_selector "$delivery_evidence" 1
 assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
 assert_count 1 'touchstone_sha256="[0-9a-f]{64}"'

@@ -48,3 +48,37 @@ and guards those version-3 behavior invariants.
 Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
 workflow to an immutable commit from this repository.
+
+## Runner
+
+Every job takes its runner from one selector:
+
+```yaml
+runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
+```
+
+With the `LINUX_RUNNER` variable unset, every job runs on GitHub-hosted
+`ubuntu-latest`, exactly as before. Setting it moves every consumer's required
+checks to the self-hosted runner with that label. The `self-hosted` label is
+always required as well, so the variable can never name a hosted image
+(AUT-1595). The check name `validate (ubuntu-latest)` stays literal: it is the
+status context consumers already see, not a statement about the runner.
+
+To move the checks to a self-hosted runner (Phase 2), register the runner in a
+group restricted to the private consumers, then:
+
+```bash
+gh variable set LINUX_RUNNER --org autumngarage --visibility private --body '<runner label>'
+```
+
+`--visibility private` is load-bearing. The public repositories accept pull
+requests from forks, and `validate` executes the candidate's code, so a public
+repository must never resolve the variable or reach a persistent runner. Undo
+the move with `gh variable delete LINUX_RUNNER --org autumngarage`.
+
+A required workflow runs in the consumer repository's context and reads the
+variables visible to that repository; a repository variable overrides the
+organization's. Confirm on the first run after setting it: the job's "Set up
+job" step names the runner that took it. If the organization variable does not
+resolve there, set it per repository instead:
+`gh variable set LINUX_RUNNER -R autumngarage/<repository> --body '<runner label>'`.
