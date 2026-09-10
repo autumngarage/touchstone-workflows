@@ -35,7 +35,10 @@ jobs:
     # validate.yml. Keeping one publisher avoids ambiguous duplicate contexts.
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: delivery-evidence
-    runs-on: ubuntu-latest
+    # LINUX_RUNNER unset: GitHub-hosted Linux, exactly as before. Set: a
+    # self-hosted runner with that label, and self-hosted is always required,
+    # so the setting can never name a hosted image (AUT-1595).
+    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}

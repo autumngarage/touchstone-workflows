@@ -38,6 +38,8 @@ jobs:
     # keeps changes to the adapter reviewable without adding work to consumers.
     if: github.repository == 'autumngarage/touchstone-workflows'
     name: source contract
+    # Runs this repository's candidate tests, so it never takes the
+    # LINUX_RUNNER setting; see "Runner" in README.md.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -65,6 +67,10 @@ jobs:
     # that boundary for this file's ordinary pull_request/push triggers.
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: validate (ubuntu-latest)
+    # Executes the candidate's own declared commands, so it stays on a fresh
+    # GitHub-hosted runner and never takes the LINUX_RUNNER setting: on a
+    # persistent runner a pull request could plant state for every later job
+    # on that host. See "Runner" in README.md.
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
