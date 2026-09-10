@@ -22,28 +22,31 @@ workflow's Touchstone repository, path, revision, checksum, and supported
 project schemas; the source-contract job executes schema-1 and schema-2
 fixtures with those exact bytes before an engine-pin change can land. Its
 `gateBehaviorContractVersion` declares the behavior
-contract implemented by the pinned workflows. Version 3 means that
+contract implemented by the pinned workflows. Version 4 means that
 validation, review evidence, and delivery evidence are checksum-pinned,
 read-only required workflows with aligned refresh triggers that run for pull
 requests and merge groups; the review gate derives one trusted reviewer
 verdict for the exact current PR head — only an unedited, explicit clean
 result succeeds — and never adjudicates historical findings: threads belong
 to GitHub conversation resolution and the merged result to the merge queue
-(AUT-1132). A merge-group run binds the queue commit and base to the PR
-number in its ref and evaluates once, without waiting. Pull-request review
-gates poll only evaluator-declared waiting states until their bounded
-deadline. Evidence collection is O(pages of current surfaces): every REST
-path crosses an enforced 12-request evaluation limit with a four-page bound
-per surface, independent of how much review history the pull request
-carries. The five-minute cadence budgets for three concurrent waiting pull
-requests at that limit (432 requests/hour), leaving more than half of the
-standard repository token's hourly API budget for unrelated work. Evidence
-that exceeds a bound fails closed. Terminal failures and merge-group runs
-remain immediate.
+(AUT-1132). Every review-gate run evaluates once and never waits (AUT-793):
+the driver waits for the reviewer on its own machine, then re-runs the gate.
+A waiting pull-request run asks the fallback reviewer only when the reviewer
+has said it cannot answer (a usage or quota notice, or an explicit error
+reply to the head's latest request), when a bot opened the pull request, or
+when the head's latest review request is older than
+`REVIEW_EVIDENCE_WAIT_SECONDS`. The fallback never overrides a completed
+findings verdict (AUT-1581). Otherwise the run fails at once, naming its
+state and the request's age. A merge-group run binds the queue commit and
+base to the PR number in its ref and evaluates once. Evidence collection is
+O(pages of current surfaces): every REST path crosses an enforced 12-request
+evaluation limit with a four-page bound per surface, independent of how much
+review history the pull request carries. Evidence that exceeds a bound fails
+closed.
 `tests/test-workflow.sh` refuses missing, extra, nested, or duplicate
 workflow declarations, verifies that only the declared publisher owns the
 status, refuses engine-pin drift between the manifest and consumer workflow,
-and guards those version-3 behavior invariants.
+and guards those version-4 behavior invariants.
 
 Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
