@@ -189,6 +189,21 @@ assert_active_line "$review_gate" \
 assert_active_line "$review_gate" \
   'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
   "pull-request review run replacement"
+# AUT-1591: a newer push supersedes the older head's validation and evidence
+# runs too, and a merge-queue run is never cancelled. Each workflow keeps its
+# own group so one cannot cancel another's run.
+assert_active_line "$workflow" \
+  'group: validate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
+  "validation run concurrency identity"
+assert_active_line "$workflow" \
+  'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
+  "pull-request validation run replacement"
+assert_active_line "$delivery_evidence" \
+  'group: delivery-evidence-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
+  "delivery-evidence run concurrency identity"
+assert_active_line "$delivery_evidence" \
+  'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
+  "pull-request delivery-evidence run replacement"
 assert_active_line "$review_gate" \
   'wait_for_review_gate' \
   "production waiting-state loop"
