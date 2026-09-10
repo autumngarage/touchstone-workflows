@@ -51,21 +51,30 @@ workflow to an immutable commit from this repository.
 
 ## Runner
 
-Every job takes its runner from one selector:
+`review-gate` and `delivery-evidence` take their runner from one selector:
 
 ```yaml
 runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
 ```
 
-With the `LINUX_RUNNER` variable unset, every job runs on GitHub-hosted
-`ubuntu-latest`, exactly as before. Setting it moves every consumer's required
-checks to the self-hosted runner with that label. The `self-hosted` label is
-always required as well, so the variable can never name a hosted image
-(AUT-1595). The check name `validate (ubuntu-latest)` stays literal: it is the
-status context consumers already see, not a statement about the runner.
+With the `LINUX_RUNNER` variable unset, both run on GitHub-hosted
+`ubuntu-latest`, exactly as before. Setting it moves them, in every consumer,
+to the self-hosted runner with that label. The `self-hosted` label is always
+required as well, so the variable can never name a hosted image (AUT-1595).
+Both jobs execute only code pinned here and data read from the API, never the
+pull request's code.
 
-To move the checks to a self-hosted runner (Phase 2), register the runner in a
-group restricted to the private consumers, then:
+`validate` does not take the setting, and neither does the `source contract`
+job. Both execute the candidate's code (`validate` runs the target's declared
+commands), so each runs on a fresh GitHub-hosted runner every time. On a
+persistent self-hosted runner, a pull request could modify the host and reach
+every later job there, including `review-gate`, which receives the fallback
+reviewer's credential (touchstone-workflows#48). The workflow cannot prove
+that a runner is ephemeral, so moving `validate` off hosted runners needs an
+ephemeral one-job runner and its own reviewed change.
+
+To move the two gates to a self-hosted runner (Phase 2), register the runner in
+a group restricted to the private consumers, then:
 
 ```bash
 gh variable set LINUX_RUNNER --org autumngarage --visibility private --body '<runner label>'
