@@ -461,16 +461,30 @@ run_wait_case() {
   REVIEW_FAST_POLL_SECONDS="${10:-30}"
   expected_max_elapsed="${11:-}"
 
+  # A sequence item is `state`, or `state|verdict` where the evaluator's
+  # verdict matters (the fallback rule).
   evaluate_once() {
     index="$WAIT_CALLS"
     if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
-    state="${WAIT_STATES[$index]}"
+    IFS='|' read -r mock_state mock_verdict <<<"${WAIT_STATES[$index]}"
     WAIT_CALLS=$((WAIT_CALLS + 1))
-    jq -n --arg state "$state" '{state: $state, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
+    jq -n --arg state "$mock_state" --arg verdict "${mock_verdict:-}" \
+      '{state: $state, verdict: $verdict, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
     MOCK_NOW=$((MOCK_NOW + EVALUATION_SECONDS))
   }
   review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
   review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
+  # The fallback answers clean only when a case says so, so a case that
+  # expects failure proves the gate refused to ask, not that it asked and lost.
+  FALLBACK_CALLS=0
+  # Called by the sourced production functions.
+  # shellcheck disable=SC2329
+  fallback_review() {
+    FALLBACK_CALLS=$((FALLBACK_CALLS + 1))
+    [ "${MOCK_FALLBACK_VERDICT:-none}" = clean ]
+  }
+  # shellcheck disable=SC2329
+  provider_unavailable() { [ "${MOCK_PROVIDER_UNAVAILABLE:-false}" = true ]; }
 
   if [ "$expected_result" = success ]; then
     wait_for_review_gate >"$tmp/output" 2>&1 || fail "$label: expected success"
@@ -481,6 +495,8 @@ run_wait_case() {
     || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
   [ -z "$expected_max_elapsed" ] || [ "$MOCK_NOW" -le "$expected_max_elapsed" ] \
     || fail "$label: expected the wait to end within ${expected_max_elapsed}s, it took ${MOCK_NOW}s"
+  [ -z "${EXPECT_FALLBACK_CALLS:-}" ] || [ "$FALLBACK_CALLS" -eq "$EXPECT_FALLBACK_CALLS" ] \
+    || fail "$label: expected $EXPECT_FALLBACK_CALLS fallback review(s), got $FALLBACK_CALLS"
   echo "  OK: $label"
 }
 
@@ -511,6 +527,32 @@ run_wait_case "slow-poll-resumes-after-the-window" "waiting-request,waiting-revi
 # deadline -- and the fallback reviewer behind it -- in 600s. On the former
 # 3600s deadline this case takes six times as long and fails here.
 run_wait_case "silent-reviewer-hits-the-derived-deadline" "waiting-review" pull_request failure 7 120 600 300 0 30 600
+
+# AUT-1581, vesper#1251: the fallback stands in for a review that did not
+# happen, never for one that did. Every case below lets the fallback answer
+# clean, so a failure proves the gate refused to ask it.
+#
+# The pull-request run of #1251, at production constants: the primary's
+# findings stand for the whole window while it reviews the attest request,
+# and the run used to hand the head to the fallback at the deadline.
+EXPECT_FALLBACK_CALLS=0 MOCK_FALLBACK_VERDICT=clean run_wait_case "pull-request-run-never-overrides-findings" \
+  "waiting-review|findings" pull_request failure 7 120 600 300 0 30 600
+# The merge-group run of #1251 read the findings and reused a fallback verdict
+# over them.
+EXPECT_FALLBACK_CALLS=0 MOCK_FALLBACK_VERDICT=clean run_wait_case "merge-group-never-overrides-findings" \
+  "waiting-review|findings" merge_group failure 1
+# A primary that has said it cannot answer hands over, findings or not: its
+# next verdict is not coming.
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean MOCK_PROVIDER_UNAVAILABLE=true run_wait_case "unavailable-reviewer-after-findings-hands-over" \
+  "waiting-review|findings" pull_request success 1
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean MOCK_PROVIDER_UNAVAILABLE=true run_wait_case "merge-group-unavailable-reviewer-after-findings" \
+  "waiting-review|findings" merge_group success 1
+# A head the primary never reviewed is what the fallback is for.
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean run_wait_case "unreviewed-head-reaches-the-fallback" \
+  "waiting-review" pull_request success 5
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean run_wait_case "merge-group-unreviewed-head-reaches-the-fallback" \
+  "waiting-review" merge_group success 1
+unset -f fallback_review provider_unavailable
 rm -rf "$wait_fixture"
 
 echo "==> review-gate binds evidence to event PR coordinates"
