@@ -855,6 +855,24 @@ jobs:
           review_gate_now() { date +%s; }
           review_gate_sleep() { sleep "$1"; }
 
+          # The fallback reviewer stands in for a review that did not happen,
+          # never for one that did. A findings verdict for this head is a
+          # completed review: only the primary's next verdict supersedes it,
+          # unless the primary has since said it cannot answer. vesper#1251
+          # merged the other way (AUT-1581). At its deadline the pull-request
+          # run let the fallback answer while the primary was still reviewing
+          # the attest request, and the merge-group run reused that verdict
+          # over the findings it had just read. The primary's P1s landed seven
+          # seconds later. Prints why, and succeeds, when the fallback may not
+          # answer.
+          fallback_withheld() {
+            [ "$(jq -r '.verdict // ""' "$tmp/verdict.json")" = findings ] || return 1
+            if provider_unavailable; then
+              return 1
+            fi
+            echo "the latest trusted verdict for this head reports findings, and the reviewer has not said it cannot answer; the fallback never overrides a completed review -- answer the findings and request the reviewer's next verdict"
+          }
+
           wait_for_review_gate() {
             now="$(review_gate_now)"
             request_deadline=$((now + REVIEW_REQUEST_WAIT_SECONDS))
@@ -879,6 +897,10 @@ jobs:
 
               if [ "$event_mode" != pull_request ]; then
                 echo "Merge-group review evidence is incomplete; queue evaluation never waits." >&2
+                if withheld="$(fallback_withheld)"; then
+                  echo "ERROR: the fallback reviewer may not stand in for ${event_head:-}: $withheld." >&2
+                  return 1
+                fi
                 if fallback_review "${event_head:-}" "${event_base:-}" "$(jq -r '.head.sha // ""' "$tmp/pr.json" 2>/dev/null)"; then
                   echo "Merge group satisfied by the fallback reviewer for ${event_head:-}."
                   return 0
@@ -914,6 +936,10 @@ jobs:
               remaining=$((deadline - now))
               if [ "$remaining" -le 0 ]; then
                 echo "Review gate remained '$state' until its evidence deadline." >&2
+                if withheld="$(fallback_withheld)"; then
+                  echo "ERROR: the fallback reviewer may not stand in for ${event_head:-}: $withheld." >&2
+                  return 1
+                fi
                 # waiting-request too, but only when the reviewer has said it
                 # cannot answer. Dependabot pull requests never get a request
                 # posted for them, so they would otherwise sit here forever.
