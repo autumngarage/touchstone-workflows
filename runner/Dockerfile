@@ -2,8 +2,9 @@
 # GitHub's ubuntu-latest for the required workflows and for the private
 # consumers' own Linux jobs, so it carries what those jobs use. The base image
 # brings the runner, git, jq, curl, tar, and python3. This adds gh, which the
-# gate workflows call; Swift's system dependencies and libsqlite3-dev; and a
-# Swift toolchain, which hesperus's validate builds with. Rebuild it with
+# gate workflows call; ruby, whose YAML parser validate's hosted-runner check
+# uses (ubuntu-latest ships it); Swift's system dependencies and
+# libsqlite3-dev; and a Swift toolchain, which hesperus's validate builds with. Rebuild it with
 # `bash runner/linux-runner.sh build`.
 #
 # Pinned: the base by digest, gh by its release checksum. swiftly verifies the
@@ -27,7 +28,7 @@ RUN set -eux; \
   apt-get install -y --no-install-recommends /tmp/gh.deb \
     binutils gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
     libncurses-dev libpython3-dev libsqlite3-0 libsqlite3-dev libstdc++-13-dev \
-    libxml2-dev libz3-dev pkg-config tzdata xz-utils zlib1g-dev; \
+    libxml2-dev libz3-dev pkg-config ruby tzdata xz-utils zlib1g-dev; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
 USER runner

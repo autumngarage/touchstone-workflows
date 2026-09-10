@@ -49,6 +49,17 @@ Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
 workflow to an immutable commit from this repository.
 
+## Hosted-runner check
+
+`validate` refuses a consumer pull request whose workflows name a
+GitHub-hosted macOS or Windows image, or take a runner from a setting without
+also requiring the `self-hosted` label (AUT-1592). A macOS minute consumes
+about ten included Actions minutes, and a Windows minute about two. The program
+is embedded in the `Refuse GitHub-hosted macOS and Windows runners` step and
+pinned with the workflow. `tests/test-hosted-runners.sh` extracts it and runs
+it against fixtures. It needs Ruby, which `ubuntu-latest` ships and
+`runner/Dockerfile` installs.
+
 ## Runner
 
 Every consumer job (`validate`, `review-gate`, `delivery-evidence`) takes its

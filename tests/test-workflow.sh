@@ -1393,6 +1393,14 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
   # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
     || fail "runner supervisor check failed"
+  # AUT-1592: validate runs the hosted-runner check exactly once, and its
+  # embedded program passes its fixtures.
+  # shellcheck disable=SC2016
+  assert_active_line "$workflow" \
+    'ruby -rpsych - "$GITHUB_WORKSPACE" <<'\''RUBY'\''' \
+    "hosted-runner check"
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-hosted-runners.sh" \
+    || fail "hosted-runner check failed"
 fi
 
 echo "workflow contract passed"
