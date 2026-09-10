@@ -75,7 +75,10 @@ label. For each job it asks GitHub for a just-in-time configuration, which
 registers a runner for exactly one job, and starts a fresh container that
 holds that configuration and nothing else: no volume, no Docker socket, no
 host network, no credential (`tests/test-runner.sh` pins this). Never register
-a long-lived runner with the label or into its group.
+a long-lived runner with the label or into its group. Before every
+registration the supervisor also checks the group itself: it must be visible
+only to selected repositories, closed to public ones, and hold only private
+repositories, or nothing is registered.
 
 The variable's repositories and the runner group's repositories must be the
 same set. A repository that resolves the variable but is outside the group

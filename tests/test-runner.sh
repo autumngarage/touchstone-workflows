@@ -21,10 +21,20 @@ cat >"$bin/gh" <<'EOF'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >>"$FAKE_CALLS"
 case "$*" in
+  *runner-groups/*/repositories*)
+    [ -f "$FAKE_STATE/empty-group" ] && exit 0
+    echo "autumngarage/vesper true"
+    [ -f "$FAKE_STATE/public-repo" ] && echo "autumngarage/touchstone false"
+    exit 0
+    ;;
   *actions/runner-groups*)
     [ -f "$FAKE_STATE/no-group" ] && exit 0
-    echo 7
-    [ -f "$FAKE_STATE/two-groups" ] && echo 9
+    visibility=selected
+    [ -f "$FAKE_STATE/broad-group" ] && visibility=all
+    public=false
+    [ -f "$FAKE_STATE/public-allowed" ] && public=true
+    echo "{\"id\":7,\"visibility\":\"$visibility\",\"allows_public_repositories\":$public}"
+    [ -f "$FAKE_STATE/two-groups" ] && echo '{"id":9,"visibility":"selected","allows_public_repositories":false}'
     exit 0
     ;;
   *generate-jitconfig*)
@@ -127,6 +137,14 @@ lacks '^docker run ' "missing group"
 FLAGS=two-groups runner run
 refused 'found 2' "two same-named groups"
 ok "a missing or ambiguous runner group registers nothing"
+# The group is the host's trust boundary: a public repository takes fork pull
+# requests, so a group that could ever admit one must register nothing.
+for flag in broad-group public-allowed public-repo empty-group; do
+  FLAGS=$flag runner run
+  [ "$rc" -ne 0 ] || fail "$flag: a runner group that could admit untrusted code was accepted"
+  lacks 'generate-jitconfig' "$flag"
+done
+ok "a group with broad visibility, public access, a public repository, or no repositories registers nothing"
 FLAGS=no-image runner run
 refused 'runner/linux-runner.sh build' "a missing image"
 lacks 'generate-jitconfig' "missing image"

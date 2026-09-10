@@ -71,17 +71,28 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH; $2"
 }
 
-# The one runner group this fleet registers into. Exactly one must exist:
-# registering into the wrong group would offer these runners to repositories
-# the group was meant to exclude.
+# The one runner group this fleet registers into, checked as the host's trust
+# boundary: exactly one group of that name, visible only to repositories named
+# one by one, closed to public repositories, and holding only private ones. A
+# public repository takes fork pull requests; if the group ever admitted one,
+# a stranger's code could run here. Prints the group's id, or dies.
 group_id() {
-  local ids count
-  ids="$(gh api --paginate "orgs/$ORG/actions/runner-groups" \
-    --jq ".runner_groups[] | select(.name == \"$GROUP\") | .id")" \
+  local groups count gid repos public
+  groups="$(gh api --paginate "orgs/$ORG/actions/runner-groups" \
+    --jq ".runner_groups[] | select(.name == \"$GROUP\") | {id, visibility, allows_public_repositories} | tojson")" \
     || die "could not list $ORG's runner groups; check 'gh auth status' for admin:org"
-  count="$(printf '%s\n' "$ids" | grep -c '[0-9]' || true)"
+  count="$(printf '%s\n' "$groups" | grep -c '"id"' || true)"
   [ "$count" -eq 1 ] || die "expected one runner group named '$GROUP' in $ORG, found $count; create it as README.md \"Runner\" describes"
-  printf '%s\n' "$ids"
+  printf '%s' "$groups" | jq -e '.visibility == "selected" and .allows_public_repositories == false' >/dev/null \
+    || die "runner group '$GROUP' must be visible only to selected repositories and closed to public ones: $groups"
+  gid="$(printf '%s' "$groups" | jq -r '.id')"
+  repos="$(gh api --paginate "orgs/$ORG/actions/runner-groups/$gid/repositories" \
+    --jq '.repositories[] | "\(.full_name) \(.private)"')" \
+    || die "could not list the repositories of runner group '$GROUP'"
+  [ -n "$repos" ] || die "runner group '$GROUP' has no repositories; no job could reach these runners"
+  public="$(printf '%s\n' "$repos" | awk '$2 != "true" { print $1 }')"
+  [ -z "$public" ] || die "runner group '$GROUP' admits a repository that is not private: $public"
+  printf '%s\n' "$gid"
 }
 
 # Best effort: GitHub removes a single-use runner after its job, so a 404 here
@@ -94,11 +105,19 @@ forget_runner() {
 }
 
 run_slot() {
-  local slot="$1" gid="$2" backoff="$BACKOFF_START" jobs=0
-  local name response jit id started rc
+  local slot="$1" backoff="$BACKOFF_START" jobs=0
+  local gid name response jit id started rc
   while :; do
     if [ -n "$MAX_JOBS" ] && [ "$jobs" -ge "$MAX_JOBS" ]; then
       return 0
+    fi
+    # Before every registration, not once at start: the group is the
+    # boundary, and it can be edited while the supervisor runs.
+    if ! gid="$(group_id)"; then
+      log "slot $slot: runner group '$GROUP' failed its check; registering nothing, retrying in ${backoff}s"
+      sleep "$backoff"
+      backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
+      continue
     fi
     name="$prefix-$slot-$(date +%s)"
     # A just-in-time registration gets only the labels it is given, not the
@@ -170,7 +189,7 @@ cmd_run() {
   log "supervising $SLOTS slot(s) for label $LABEL in $ORG runner group $GROUP ($gid)"
   slot=1
   while [ "$slot" -le "$SLOTS" ]; do
-    run_slot "$slot" "$gid" &
+    run_slot "$slot" &
     slot=$((slot + 1))
   done
   wait
