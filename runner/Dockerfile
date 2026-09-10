@@ -54,7 +54,10 @@ RUN set -eux; \
   npm --version
 
 USER runner
-ARG SWIFT_VERSION=6.2
+# The version GitHub's ubuntu-24.04 image ships (image 20260831: 6.3.3). A
+# lower one fails hesperus's build: 6.2.4 cannot type-check
+# GateIsolation.swift:193 in reasonable time, and 6.3.3 compiles it.
+ARG SWIFT_VERSION=6.3.3
 # swiftly's env.sh is bash; the default RUN shell is dash.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN set -eux; \
