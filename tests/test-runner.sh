@@ -85,6 +85,10 @@ runner run
 [ "$rc" -eq 0 ] || fail "a clean one-job run exited $rc: $(cat "$tmp/out")"
 has 'generate-jitconfig' "registration"
 has 'runner_group_id=7' "registration binds the runner group"
+# The workflows select ["self-hosted", LINUX_RUNNER]. A just-in-time runner
+# carries only the labels it is registered with, so it must be given both, or
+# every job waits forever for a runner that never matches.
+has 'labels[]=self-hosted' "registration carries the self-hosted label every selector requires"
 has 'labels[]=linux-ephemeral' "registration carries the label LINUX_RUNNER names"
 run_line="$(grep '^docker run ' "$tmp/calls")"
 for arg in '--rm' '--init' '--memory 6g' '--cpus 4' '--pull never' './run.sh --jitconfig SINGLE-USE-CONFIG'; do

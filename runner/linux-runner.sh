@@ -96,8 +96,11 @@ run_slot() {
       return 0
     fi
     name="$prefix-$slot-$(date +%s)"
+    # A just-in-time registration gets only the labels it is given, not the
+    # defaults config.sh adds, and every workflow selector requires both.
     if ! response="$(gh api -X POST "orgs/$ORG/actions/runners/generate-jitconfig" \
-      -f name="$name" -F runner_group_id="$gid" -f "labels[]=$LABEL" -f work_folder=_work 2>&1)"; then
+      -f name="$name" -F runner_group_id="$gid" -f "labels[]=self-hosted" -f "labels[]=$LABEL" \
+      -f work_folder=_work 2>&1)"; then
       log "slot $slot: could not register a runner ($response); retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
