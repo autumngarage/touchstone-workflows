@@ -1,13 +1,19 @@
 # The image every linux-ephemeral job runs in (AUT-1596). It stands in for
 # GitHub's ubuntu-latest for the required workflows and for the private
 # consumers' own Linux jobs, so it carries what those jobs use. The base image
-# brings the runner, git, jq, curl, tar, and python3. This adds gh, which the
-# gate workflows call; Swift's system dependencies and libsqlite3-dev; and a
-# Swift toolchain, which hesperus's validate builds with. Rebuild it with
-# `bash runner/linux-runner.sh build`.
+# brings the runner, git, jq, curl, tar, and python3. This adds what GitHub's
+# image ships and these jobs use:
+#   - gh, which the gate workflows call;
+#   - gawk: the base's awk is mawk, which panics on regex intervals such as
+#     ` {0,3}` in delivery-evidence's checker;
+#   - pipx, which runs pinned Python tools (vesper's Semgrep);
+#   - Node 22 LTS with npm (vesper's site validation);
+#   - Swift's system dependencies, libsqlite3-dev, and a Swift toolchain,
+#     which hesperus's validate builds with.
+# Rebuild it with `bash runner/linux-runner.sh build`.
 #
-# Pinned: the base by digest, gh by its release checksum. swiftly verifies the
-# toolchain's signature against swift.org's keys.
+# Pinned: the base by digest, gh and Node by their release checksums. swiftly
+# verifies the toolchain's signature against swift.org's keys.
 FROM ghcr.io/actions/actions-runner:2.337.0@sha256:e5496277be5d09bc968b3d64911b74e219ac4a3f2edce956a3ecf9271bea1ef4
 
 USER root
@@ -25,13 +31,33 @@ RUN set -eux; \
   echo "${sum}  /tmp/gh.deb" | sha256sum --check --strict; \
   apt-get update; \
   apt-get install -y --no-install-recommends /tmp/gh.deb \
-    binutils gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
+    binutils gawk gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
     libncurses-dev libpython3-dev libsqlite3-0 libsqlite3-dev libstdc++-13-dev \
-    libxml2-dev libz3-dev pkg-config tzdata xz-utils zlib1g-dev; \
+    libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zlib1g-dev; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
+ARG NODE_VERSION=22.23.2
+ARG NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
+ARG NODE_SHA256_X64=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307
+RUN set -eux; \
+  arch="$(dpkg --print-architecture)"; \
+  case "$arch" in \
+    amd64) node_arch=x64; sum="$NODE_SHA256_X64" ;; \
+    arm64) node_arch=arm64; sum="$NODE_SHA256_ARM64" ;; \
+    *) echo "unsupported architecture $arch" >&2; exit 1 ;; \
+  esac; \
+  curl -fsSL -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${node_arch}.tar.xz"; \
+  echo "${sum}  /tmp/node.tar.xz" | sha256sum --check --strict; \
+  tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \
+  rm -f /tmp/node.tar.xz; \
+  node --version; \
+  npm --version
+
 USER runner
-ARG SWIFT_VERSION=6.2
+# The version GitHub's ubuntu-24.04 image ships (image 20260831: 6.3.3). A
+# lower one fails hesperus's build: 6.2.4 cannot type-check
+# GateIsolation.swift:193 in reasonable time, and 6.3.3 compiles it.
+ARG SWIFT_VERSION=6.3.3
 # swiftly's env.sh is bash; the default RUN shell is dash.
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN set -eux; \
