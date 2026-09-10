@@ -17,6 +17,14 @@ on:
   merge_group:
     types: [checks_requested]
 
+# One validation per pull request at a time. A newer push supersedes the older
+# head's run, which would otherwise finish and bill for a verdict nobody reads
+# (AUT-1591). A merge-queue run is never cancelled: the queue owns that
+# verdict, and each queue entry has its own ref, so no two share a group.
+concurrency:
+  group: validate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
