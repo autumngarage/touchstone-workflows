@@ -1,7 +1,7 @@
 name: review-gate
 
 # Central required review gate for Touchstone consumers, gate behavior
-# contract version 3. GitHub runs this pinned source against the target pull
+# contract version 4. GitHub runs this pinned source against the target pull
 # request and against the merge queue's commit, outside the PR's control. It
 # reads the current review surface with the read-only token, runs the pure
 # evaluator fetched from Touchstone at a pinned revision, and passes or
@@ -16,9 +16,14 @@ name: review-gate
 # never O(review history) (AUT-1132; the 20-request capacity failure this
 # replaces was AUT-1106).
 #
-# Pull-request runs keep an explicit waiting state alive while trusted review
-# evidence can still arrive. Terminal evidence failures stop immediately. The
-# merge queue never waits: it re-evaluates the PR's current-head verdict once.
+# Every run evaluates once and never waits (contract 4, AUT-793). On a pull
+# request the driver waits on its own machine for the reviewer to answer,
+# then re-runs this gate. A waiting state asks the fallback reviewer only
+# when waiting longer cannot help -- the reviewer said it cannot answer, a bot
+# opened the pull request, or the head's latest review request is older than
+# REVIEW_EVIDENCE_WAIT_SECONDS -- and otherwise fails at once, naming its
+# state and the request's age. The merge queue re-evaluates the PR's
+# current-head verdict once, exactly as under contract 3.
 #
 # DEPENDENCY CONTRACT: the runner image, the target repository, github.com.
 
@@ -59,7 +64,6 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       TRUSTED_REVIEWERS: chatgpt-codex-connector,chatgpt-codex-connector[bot]
-      REVIEW_REQUEST_WAIT_SECONDS: 120
       # Derived from the reviewer's measured answer latency, not a round hour.
       # Measured 2026-09-08 over hesperus #270-#300: every head's review
       # requests paired with the result comment naming that head (n=15).
@@ -85,30 +89,22 @@ jobs:
       # answered by waiting (AUT-1417). Recovering a dropped request is a
       # separate question and belongs to the driver, not here (AUT-1482).
       # Move this only against a fresh measurement.
-      REVIEW_EVIDENCE_WAIT_SECONDS: 600
-      # Scale boundary: 3 concurrent PRs * 12 polls/hour * the enforced
-      # 12 REST requests/evaluation = 432 of the token's 1,000 requests/hour.
       #
+      # The age is the head's latest review request's (the pinned
+      # evaluator's requestedAt), never how long a run has existed: no run
+      # waits. The driver's CLI reads this line from the pinned file to know
+      # when to re-run the gate, and fails closed without it, so it keeps
+      # exactly this shape: `REVIEW_EVIDENCE_WAIT_SECONDS: <integer>`.
+      REVIEW_EVIDENCE_WAIT_SECONDS: 600
       # The ceiling is per EVALUATION and is O(pages), independent of how
       # much review history the pull request carries: 2 fixed reads, up to
       # MAX_EVIDENCE_PAGES each of timeline and issue-comment pages, and one
       # resolution per trusted head-prefix result candidate (normally one).
       # A page bound, unlike the historical per-record work it replaces,
-      # cannot be exhausted by accumulating review rounds (AUT-1106).
+      # cannot be exhausted by accumulating review rounds (AUT-1106). A run
+      # makes one evaluation, and the fallback opens one budget of its own.
       REST_REQUEST_LIMIT: 12
       MAX_EVIDENCE_PAGES: 4
-      REVIEW_POLL_SECONDS: 300
-      # The first REVIEW_REQUEST_WAIT_SECONDS of a run are polled at this
-      # faster interval. Everything the gate can learn quickly arrives then:
-      # the driver's request comment lands seconds after the push that
-      # started the run, and a reviewer at capacity answers it within
-      # seconds more. Polled at REVIEW_POLL_SECONDS, one sleep covered the
-      # whole request window, so a head pushed while the reviewer was at
-      # capacity idled ~120s before the fallback ran -- on every push of
-      # every PR (AUT-1291). The burst is bounded: at most
-      # REVIEW_REQUEST_WAIT_SECONDS / REVIEW_FAST_POLL_SECONDS evaluations
-      # per run, which tests/test-workflow.sh counts against the API budget.
-      REVIEW_FAST_POLL_SECONDS: 30
       # Fallback reviewer. Absent credential = no fallback; the gate then
       # behaves exactly as it did before this step existed.
       OPENROUTER_API: ${{ secrets.OPENROUTER_API }}
@@ -141,8 +137,8 @@ jobs:
       - name: Fetch pinned evaluator
         run: |
           set -euo pipefail
-          touchstone_revision="aadd2b3d6b83971ca4802b3eee2effac97bd7ce6"
-          evaluator_sha256="3b509ed496fd6de055da62a595f21936cc8846be84b8741dee321e09641d64dc"
+          touchstone_revision="0a8c8868549977aa973c1679f97ed8f9d4e8de6f"
+          evaluator_sha256="dbf70d281b45a9376bb73a615c1e708f0a453e0e6add6ac1cd4b768b5222e94d"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/.github/review-gate/evaluate-v3.jq" \
             -o "$RUNNER_TEMP/evaluate-v3.jq"
@@ -346,6 +342,11 @@ jobs:
           jq '[.data.repository.pullRequest.reviews.nodes[] | {id: .databaseId, body, state, submitted_at: .submittedAt, updated_at: .updatedAt, commit_id: .commit.oid, user: {login: .author.login}}]' \
             "$tmp/reviews-response.json" >"$tmp/reviews.json"
 
+          # The evidence document is the pinned evaluator's input contract,
+          # still version 3: behavior contract 4 changes what this workflow
+          # does with the verdict, not the evidence the evaluator reads, and
+          # the evaluator refuses any other version. Its requestedAt output
+          # is additive.
           jq -n \
             --slurpfile pr "$tmp/pr.json" \
             --slurpfile issueComments "$tmp/issues-resolved.json" \
@@ -381,24 +382,40 @@ jobs:
           # it costs no REST request.
           #
           # The rule is recency, not mere presence: the provider is unavailable
-          # only when its MOST RECENT utterance is an unavailability notice. A
+          # only when its MOST RECENT utterance says it cannot answer. A
           # stale notice from an earlier head cannot strand later evaluations,
           # and a verdict posted after a notice supersedes it.
+          #
+          # Two utterances say it. A usage or quota notice is account state, so
+          # it counts whenever it is the latest. An explicit error reply
+          # ("Something went wrong. Try again later ...", touchstone#1190, where
+          # the reviewer claimed the head it had been asked about did not
+          # exist) answers one request, so it counts only when it follows the
+          # latest request naming this head -- the evaluator's requestedAt. An
+          # error that precedes that request answered an earlier one, and the
+          # head's own request is still open.
           provider_unavailable() {
+            local requested_at=""
             [ -s "$tmp/evidence.json" ] || return 1
-            jq -e '
+            if [ -s "$tmp/verdict.json" ]; then
+              requested_at="$(jq -r '.requestedAt // ""' "$tmp/verdict.json")" || return 1
+            fi
+            jq -e --arg requestedAt "$requested_at" '
               (.trustedAuthors // []) as $trusted
               | def trusted: select(((.user.login // "") as $l | $trusted | index($l)) != null);
                 def at: (.created_at // .submitted_at // .updated_at // "");
-                def unavailable:
+                def quota_notice:
                   (.body // "")
                   | test("reached your .* usage limits|usage limits for code reviews|Review limit reached|reached its usage spending cap"; "i");
+                def error_reply:
+                  (.body // "") | test("^[[:space:]]*Codex Review:[[:space:]]*Something went wrong"; "i");
                 [ (.issueComments // [])[], (.reviews // [])[] ]
                 | map(trusted)
                 | map(select(at != ""))
                 | sort_by(at)
                 | last
-                | if . == null then false else unavailable end
+                | if . == null then false
+                  else quota_notice or (error_reply and $requestedAt != "" and at > $requestedAt) end
             ' "$tmp/evidence.json" >/dev/null 2>&1
           }
           # touchstone:provider-state:end
@@ -650,9 +667,9 @@ jobs:
             work="$RUNNER_TEMP/fallback"
             mkdir -p "$work"
 
-            # The fallback is one terminal phase per run, not a per-poll
+            # The fallback is one terminal phase per run, after the run's one
             # evaluation, so it opens its own request budget rather than
-            # spending what the final evaluation left. Its calls still go
+            # spending what that evaluation left. Its calls still go
             # through rest_api and remain bounded by REST_REQUEST_LIMIT.
             printf '0\n' >"$tmp/rest-request-count"
 
@@ -856,7 +873,6 @@ jobs:
 
           # touchstone:review-wait:start
           review_gate_now() { date +%s; }
-          review_gate_sleep() { sleep "$1"; }
 
           # The fallback reviewer stands in for a review that did not happen,
           # never for one that did. A findings verdict for this head is a
@@ -876,106 +892,90 @@ jobs:
             echo "the latest trusted verdict for this head reports findings, and the reviewer has not said it cannot answer; the fallback never overrides a completed review -- answer the findings and request the reviewer's next verdict"
           }
 
-          wait_for_review_gate() {
-            now="$(review_gate_now)"
-            request_deadline=$((now + REVIEW_REQUEST_WAIT_SECONDS))
-            review_deadline=0
-            previous_state=""
+          # How long, in whole seconds, the latest review request naming this
+          # head has gone unanswered: the pinned evaluator's requestedAt,
+          # clocked from the request's latest edit. Empty when no request names
+          # the head. A bare `@codex review` never starts this clock, so it can
+          # never age a freshly pushed head into the fallback (touchstone#1192,
+          # touchstone#1197).
+          request_age_seconds() {
+            jq -r --argjson now "$(review_gate_now)" '
+              if (.requestedAt | type) == "string"
+              then ([$now - (.requestedAt | fromdateiso8601), 0] | max | floor)
+              else "" end' "$tmp/verdict.json"
+          }
 
-            while :; do
-              evaluate_once
-              state="$(jq -er '.state | select(type == "string" and length > 0)' "$tmp/verdict.json")"
+          # Gate behavior contract 4 (AUT-793): every run evaluates once and
+          # never waits. On a pull request the driver waits on its own machine
+          # for the reviewer to answer, then re-runs this gate; a runner
+          # sleeping through the evidence window learned nothing a re-run
+          # cannot. A waiting state asks the fallback only when waiting longer
+          # cannot help: the reviewer said it cannot answer, no driver exists to
+          # request a review, or the head's latest request is older than the
+          # evidence deadline. Anything else fails at once, naming the state
+          # and the request's age, so the driver knows when a re-run can pass.
+          # The merge queue re-evaluates the pull request's current-head
+          # verdict once, exactly as before.
+          decide_review_gate() {
+            evaluate_once
+            state="$(jq -er '.state | select(type == "string" and length > 0)' "$tmp/verdict.json")"
+            jq -r '.summary' "$tmp/verdict.json"
 
-              if [ "$state" != "$previous_state" ]; then
-                jq -r '.summary' "$tmp/verdict.json"
-                previous_state="$state"
-              fi
+            case "$state" in
+              success) return 0 ;;
+              failure) return 1 ;;
+              waiting-request | waiting-review) ;;
+              *) echo "ERROR: evaluator returned unsupported state '$state'." >&2; return 1 ;;
+            esac
 
-              case "$state" in
-                success) return 0 ;;
-                failure) return 1 ;;
-                waiting-request | waiting-review) ;;
-                *) echo "ERROR: evaluator returned unsupported state '$state'." >&2; return 1 ;;
-              esac
-
-              if [ "$event_mode" != pull_request ]; then
-                echo "Merge-group review evidence is incomplete; queue evaluation never waits." >&2
-                if withheld="$(fallback_withheld)"; then
-                  echo "ERROR: the fallback reviewer may not stand in for ${event_head:-}: $withheld." >&2
-                  return 1
-                fi
-                if fallback_review "${event_head:-}" "${event_base:-}" "$(jq -r '.head.sha // ""' "$tmp/pr.json" 2>/dev/null)"; then
-                  echo "Merge group satisfied by the fallback reviewer for ${event_head:-}."
-                  return 0
-                fi
-                echo "ERROR: merge-group review evidence is incomplete and no fallback verdict was obtained." >&2
+            if [ "$event_mode" != pull_request ]; then
+              echo "Merge-group review evidence is incomplete; queue evaluation never waits." >&2
+              if withheld="$(fallback_withheld)"; then
+                echo "ERROR: the fallback reviewer may not stand in for ${event_head:-}: $withheld." >&2
                 return 1
               fi
-
-              if [ "$state" = waiting-review ] && provider_unavailable; then
-                echo "Trusted reviewer reported it cannot review this head; not waiting out the evidence window."
-                if fallback_review "${event_head:-}" "${event_base:-}"; then
-                  echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
-                  return 0
-                fi
-                echo "ERROR: trusted reviewer unavailable and no fallback verdict for ${event_head:-}." >&2
-                return 1
+              if fallback_review "${event_head:-}" "${event_base:-}" "$(jq -r '.head.sha // ""' "$tmp/pr.json" 2>/dev/null)"; then
+                echo "Merge group satisfied by the fallback reviewer for ${event_head:-}."
+                return 0
               fi
+              echo "ERROR: merge-group review evidence is incomplete and no fallback verdict was obtained." >&2
+              return 1
+            fi
 
-              now="$(review_gate_now)"
-              case "$state" in
-                waiting-request)
-                  deadline="$request_deadline"
-                  ;;
-                waiting-review)
-                  # A request grants the complete review window from the
-                  # moment the gate first observes it.
-                  if [ "$review_deadline" -eq 0 ]; then
-                    review_deadline=$((now + REVIEW_EVIDENCE_WAIT_SECONDS))
-                  fi
-                  deadline="$review_deadline"
-                  ;;
-              esac
-              remaining=$((deadline - now))
-              if [ "$remaining" -le 0 ]; then
-                echo "Review gate remained '$state' until its evidence deadline." >&2
-                if withheld="$(fallback_withheld)"; then
-                  echo "ERROR: the fallback reviewer may not stand in for ${event_head:-}: $withheld." >&2
-                  return 1
-                fi
-                # waiting-request too, but only when the reviewer has said it
-                # cannot answer. Dependabot pull requests never get a request
-                # posted for them, so they would otherwise sit here forever.
-                # Without that condition this would excuse a driver that simply
-                # never requested review.
-                # waiting-request means no review was ever requested. That is
-                # a driver failure and stays one -- unless there is no driver:
-                # a bot-authored pull request (Dependabot) has nobody to post
-                # the request, and nobody for the reviewer to answer, so the
-                # unavailability signal can never appear on it either.
-                if { [ "$state" = waiting-review ] \
-                     || { [ "$state" = waiting-request ] && { provider_unavailable || authorless_pull_request; }; }; } \
-                   && fallback_review "${event_head:-}" "${event_base:-}"; then
-                  echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
-                  return 0
-                fi
-                echo "ERROR: no trusted verdict and no fallback verdict for ${event_head:-}." >&2
-                return 1
-              fi
+            age="$(request_age_seconds)"
+            if [ -z "$age" ]; then
+              waited="no review request names ${event_head:-} in a Touchstone marker, so its ${REVIEW_EVIDENCE_WAIT_SECONDS}s evidence window has not started; touchstone pr open posts one"
+            elif [ "$age" -lt "$REVIEW_EVIDENCE_WAIT_SECONDS" ]; then
+              waited="the latest request for ${event_head:-} is ${age}s old; the fallback may answer once it is ${REVIEW_EVIDENCE_WAIT_SECONDS}s old, in $((REVIEW_EVIDENCE_WAIT_SECONDS - age))s"
+            else
+              waited="the latest request for ${event_head:-} is ${age}s old, past the ${REVIEW_EVIDENCE_WAIT_SECONDS}s evidence deadline"
+            fi
 
-              # Inside the request window the wait is for evidence that
-              # arrives in seconds (the request, a capacity notice), so poll
-              # fast; past it the wait is for a review, so poll slowly.
-              if [ "$now" -lt "$request_deadline" ]; then
-                sleep_seconds="$REVIEW_FAST_POLL_SECONDS"
-              else
-                sleep_seconds="$REVIEW_POLL_SECONDS"
-              fi
-              [ "$sleep_seconds" -le "$remaining" ] || sleep_seconds="$remaining"
-              echo "Review gate is '$state'; re-evaluating in ${sleep_seconds}s (${remaining}s remain)."
-              review_gate_sleep "$sleep_seconds"
-            done
+            trigger=""
+            if provider_unavailable; then
+              trigger="the trusted reviewer said it cannot review this head"
+            elif authorless_pull_request; then
+              trigger="a bot opened this pull request, so no driver requests its review"
+            elif [ -n "$age" ] && [ "$age" -ge "$REVIEW_EVIDENCE_WAIT_SECONDS" ]; then
+              trigger="the latest request for this head went unanswered past the ${REVIEW_EVIDENCE_WAIT_SECONDS}s evidence deadline"
+            fi
+
+            if [ -z "$trigger" ]; then
+              echo "ERROR: review gate is '$state' for ${event_head:-}: $waited. This run evaluated once and does not wait; re-run it when the reviewer answers or the request reaches the deadline." >&2
+              return 1
+            fi
+            if withheld="$(fallback_withheld)"; then
+              echo "ERROR: review gate is '$state' for ${event_head:-} ($waited), and the fallback reviewer may not stand in: $withheld." >&2
+              return 1
+            fi
+            echo "Review gate is '$state' for ${event_head:-}: $trigger; asking the fallback reviewer."
+            if fallback_review "${event_head:-}" "${event_base:-}"; then
+              echo "Gate satisfied by the fallback reviewer for ${event_head:-}."
+              return 0
+            fi
+            echo "ERROR: $trigger, and no fallback verdict was obtained for ${event_head:-}." >&2
+            return 1
           }
           # touchstone:review-wait:end
 
-          wait_for_review_gate
+          decide_review_gate

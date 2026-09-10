@@ -197,22 +197,16 @@ assert_active_line "$review_gate" \
   "review evaluator checksum"
 assert_active_line "$review_gate" \
   'timeout-minutes: 20' \
-  "review wait job timeout"
-assert_active_line "$review_gate" \
-  'REVIEW_REQUEST_WAIT_SECONDS: 120' \
-  "review request wait bound"
+  "review job timeout"
 assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 600' \
-  "review evidence wait bound"
+  "review evidence deadline"
 assert_active_line "$review_gate" \
   'REST_REQUEST_LIMIT: 12' \
   "review REST request bound"
 assert_active_line "$review_gate" \
   'MAX_EVIDENCE_PAGES: 4' \
   "review evidence page bound"
-assert_active_line "$review_gate" \
-  'REVIEW_POLL_SECONDS: 300' \
-  "review poll interval"
 assert_active_line "$review_gate" \
   'group: review-gate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
   "review run concurrency identity"
@@ -235,14 +229,17 @@ assert_active_line "$delivery_evidence" \
   'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
   "pull-request delivery-evidence run replacement"
 assert_active_line "$review_gate" \
-  'wait_for_review_gate' \
-  "production waiting-state loop"
+  'decide_review_gate' \
+  "production one-shot evaluation"
 # Behavior v3 evaluates only current GitHub surfaces: the evidence document,
 # the bounded resolver, and the pinned evaluator must each be one active
-# command, and no prior-snapshot machinery may reappear.
+# command, and no prior-snapshot machinery may reappear. Under behavior
+# contract 4 the evidence document stays the pinned evaluator's version-3
+# input: the evaluator refuses any other version, and contract 4 changes only
+# what the workflow does with the verdict.
 assert_active_line "$review_gate" \
   'gateBehaviorContractVersion: 3, complete: true,' \
-  "gate behavior contract version in evidence"
+  "evaluator evidence contract version"
 assert_active_line "$review_gate" \
   'resolve_head_prefix_candidates "$head" "$tmp/issues.json" "$tmp/issues-resolved.json"' \
   "bounded head-prefix resolution"
@@ -330,17 +327,24 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
 done
 echo "  OK: triggers and effective permissions are structurally bound"
 
-echo "==> review polling preserves repository API headroom at concurrent scale"
-production_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
-production_fast_poll_seconds="$(sed -n 's/^[[:space:]]*REVIEW_FAST_POLL_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
-production_request_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_REQUEST_WAIT_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
+echo "==> review evidence stays inside its enforced budget, and no run polls"
 production_request_limit="$(sed -n 's/^[[:space:]]*REST_REQUEST_LIMIT: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
 production_evidence_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_EVIDENCE_WAIT_SECONDS: \([0-9][0-9]*\)$/\1/p' "$review_gate")"
-[ -n "$production_fast_poll_seconds" ] && [ -n "$production_request_wait_seconds" ] \
-  && [ -n "$production_evidence_wait_seconds" ] \
-  || fail "review-gate must declare REVIEW_FAST_POLL_SECONDS, REVIEW_REQUEST_WAIT_SECONDS and REVIEW_EVIDENCE_WAIT_SECONDS"
-[ "$production_request_wait_seconds" -lt "$production_evidence_wait_seconds" ] \
-  || fail "REVIEW_REQUEST_WAIT_SECONDS ($production_request_wait_seconds) must fit inside the evidence window ($production_evidence_wait_seconds)"
+[ -n "$production_request_limit" ] && [ -n "$production_evidence_wait_seconds" ] \
+  || fail "review-gate must declare REST_REQUEST_LIMIT and REVIEW_EVIDENCE_WAIT_SECONDS"
+# The driver's CLI (touchstone#1195) reads the deadline from the pinned file
+# with exactly this pattern, and fails closed without a match; a second match
+# would let a comment or a stray line move the deadline it wakes the gate at.
+cli_deadline_matches="$(sed -n -E 's/^[[:space:]]*REVIEW_EVIDENCE_WAIT_SECONDS:[[:space:]]*"?([0-9]+)"?[[:space:]]*(#.*)?$/\1/p' "$review_gate")"
+[ "$cli_deadline_matches" = "$production_evidence_wait_seconds" ] \
+  || fail "the driver's CLI must read exactly one REVIEW_EVIDENCE_WAIT_SECONDS from $review_gate, got: $cli_deadline_matches"
+# Gate behavior contract 4 (AUT-793): no run polls, so the knobs only a
+# polling run read must not come back.
+for polling_knob in REVIEW_POLL_SECONDS REVIEW_FAST_POLL_SECONDS REVIEW_REQUEST_WAIT_SECONDS review_gate_sleep; do
+  if grep -q "$polling_knob" "$review_gate"; then
+    fail "$review_gate: $polling_knob reappeared; a contract-4 run evaluates once and never polls"
+  fi
+done
 # AUT-1417 derived this deadline from measurement: every observed review
 # landed within five minutes of a request the reviewer acted on, so the
 # deadline governs how long to sit on a request that may never be answered,
@@ -351,22 +355,6 @@ production_evidence_wait_seconds="$(sed -n 's/^[[:space:]]*REVIEW_EVIDENCE_WAIT_
   || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) is inside the band where the reviewer still answers; it would cut off reviews that were going to arrive"
 [ "$production_evidence_wait_seconds" -le 1200 ] \
   || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) waits past the measured band, buying latency the measurement says does not exist (AUT-1417)"
-[ "$production_fast_poll_seconds" -lt "$production_request_wait_seconds" ] \
-  || fail "REVIEW_FAST_POLL_SECONDS ($production_fast_poll_seconds) must be shorter than the request window ($production_request_wait_seconds) or the window is one sleep (AUT-1291)"
-standard_hourly_budget=1000
-reserved_budget=$((standard_hourly_budget / 5))
-concurrent_waiting_prs=3
-# Each waiting PR pays a bounded fast burst inside its request window -- the
-# immediate first evaluation plus one per fast interval -- then the slow
-# steady poll for the rest of the hour.
-fast_evaluations=$((production_request_wait_seconds / production_fast_poll_seconds + 1))
-# The waiting run's own duration, not a round hour: a literal here kept
-# testing an hour after the deadline was derived down to its measured band
-# (AUT-1417), which would have let any poll interval pass unexamined.
-steady_evaluations=$(((production_evidence_wait_seconds - production_request_wait_seconds) / production_poll_seconds))
-projected_requests=$((concurrent_waiting_prs * (fast_evaluations + steady_evaluations) * production_request_limit))
-[ $((projected_requests + reserved_budget)) -le "$standard_hourly_budget" ] \
-  || fail "review polling consumes $projected_requests requests/hour and leaves less than $reserved_budget requests of headroom"
 direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'gh api "\$@"' | grep -v 'gh api graphql' || true)"
 [ -z "$direct_rest_calls" ] \
   || fail "review evidence bypasses the enforced REST request boundary: $direct_rest_calls"
@@ -404,7 +392,7 @@ grep -Fq "supported bound of 2 evidence pages" "$budget_fixture/pages.err" \
   || fail "page-bound failure lost its diagnostic: $(cat "$budget_fixture/pages.err")"
 unset -f gh
 rm -rf "$budget_fixture"
-echo "  OK: enforced $production_request_limit-request evaluations consume at most $projected_requests requests/hour and leave $((standard_hourly_budget - projected_requests)) for unrelated work"
+echo "  OK: every REST path crosses the enforced $production_request_limit-request evaluation budget, and no polling knob remains"
 
 echo "==> review-gate resolves only trusted head-prefix result candidates"
 resolve_fixture="$(mktemp -d)"
@@ -474,131 +462,148 @@ rm -rf "$resolve_fixture"
 trap - EXIT HUP INT TERM
 echo "  OK: dedupe, stale prefixes, untrusted authors, and unresolvable candidates are explicit"
 
-echo "==> review-gate waits only for pull-request evidence states"
-wait_fixture="$(mktemp -d)"
-trap 'rm -rf "$wait_fixture"' EXIT HUP INT TERM
+echo "==> review-gate evaluates once and never waits (gate behavior contract 4)"
+gate_fixture="$(mktemp -d)"
+trap 'rm -rf "$gate_fixture"' EXIT HUP INT TERM
 awk '
   /touchstone:review-wait:start/ { copying = 1; next }
   /touchstone:review-wait:end/ { copying = 0 }
   copying { sub(/^          /, ""); print }
-' "$review_gate" >"$wait_fixture/wait.sh"
+' "$review_gate" >"$gate_fixture/gate.sh"
 # shellcheck source=/dev/null
-source "$wait_fixture/wait.sh"
+source "$gate_fixture/gate.sh"
+# The deadline that ships, so the boundary cases below test the real bound.
+REVIEW_EVIDENCE_WAIT_SECONDS="$production_evidence_wait_seconds"
+gate_epoch=1788000000
 
-run_wait_case() {
-  label="$1"
-  sequence="$2"
-  event="$3"
-  expected_result="$4"
-  expected_calls="$5"
-  request_wait="${6:-120}"
-  evidence_wait="${7:-120}"
-  tmp="$wait_fixture/$label"
+# $1 label, $2 event, $3 evaluator state, $4 evaluator verdict, $5 age in
+# seconds of the head's latest request (`none`: requestedAt is null), $6
+# expected result. MOCK_* shape the collaborators; EXPECT_FALLBACK_CALLS
+# (default 0) and EXPECT_OUTPUT ('|'-separated fragments) are asserted.
+# The fallback answers clean unless a case says otherwise, so a failure proves
+# the gate refused to ask it, not that it asked and lost.
+run_gate_case() {
+  gate_label="$1"
+  event_mode="$2"
+  gate_state="$3"
+  gate_verdict="$4"
+  gate_age="$5"
+  gate_expected="$6"
+  tmp="$gate_fixture/$gate_label"
   mkdir -p "$tmp"
-  IFS=, read -r -a WAIT_STATES <<<"$sequence"
-  WAIT_CALLS=0
-  MOCK_NOW=0
-  event_mode="$event"
-  REVIEW_REQUEST_WAIT_SECONDS="$request_wait"
-  REVIEW_EVIDENCE_WAIT_SECONDS="$evidence_wait"
-  REVIEW_POLL_SECONDS="${8:-60}"
-  EVALUATION_SECONDS="${9:-0}"
-  REVIEW_FAST_POLL_SECONDS="${10:-30}"
-  expected_max_elapsed="${11:-}"
-
-  # A sequence item is `state`, or `state|verdict` where the evaluator's
-  # verdict matters (the fallback rule).
-  evaluate_once() {
-    index="$WAIT_CALLS"
-    if [ "$index" -ge "${#WAIT_STATES[@]}" ]; then index=$((${#WAIT_STATES[@]} - 1)); fi
-    IFS='|' read -r mock_state mock_verdict <<<"${WAIT_STATES[$index]}"
-    WAIT_CALLS=$((WAIT_CALLS + 1))
-    jq -n --arg state "$mock_state" --arg verdict "${mock_verdict:-}" \
-      '{state: $state, verdict: $verdict, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
-    MOCK_NOW=$((MOCK_NOW + EVALUATION_SECONDS))
-  }
-  review_gate_now() { printf '%s\n' "$MOCK_NOW"; }
-  review_gate_sleep() { MOCK_NOW=$((MOCK_NOW + $1)); }
-  # The fallback answers clean only when a case says so, so a case that
-  # expects failure proves the gate refused to ask, not that it asked and lost.
-  FALLBACK_CALLS=0
+  gate_evaluations=0
+  gate_sleeps=0
+  gate_fallbacks=0
+  gate_now="$gate_epoch"
+  if [ "$gate_age" = none ]; then
+    gate_requested_at=null
+  else
+    gate_requested_at="$(jq -n --argjson t $((gate_epoch - gate_age)) '$t | todate')"
+  fi
   # Called by the sourced production functions.
   # shellcheck disable=SC2329
+  evaluate_once() {
+    gate_evaluations=$((gate_evaluations + 1))
+    jq -n --arg state "$gate_state" --arg verdict "$gate_verdict" --argjson requestedAt "$gate_requested_at" \
+      '{state: $state, verdict: $verdict, requestedAt: $requestedAt, summary: ("summary: " + $state)}' >"$tmp/verdict.json"
+  }
+  # shellcheck disable=SC2329
+  review_gate_now() { printf '%s\n' "$gate_now"; }
+  # Any wait is a regression here. Count it and let the clock move, so a
+  # polling loop still ends and is reported rather than hanging the suite.
+  # shellcheck disable=SC2329
+  sleep() {
+    gate_sleeps=$((gate_sleeps + 1))
+    gate_now=$((gate_now + $1))
+  }
+  # shellcheck disable=SC2329
   fallback_review() {
-    FALLBACK_CALLS=$((FALLBACK_CALLS + 1))
-    [ "${MOCK_FALLBACK_VERDICT:-none}" = clean ]
+    gate_fallbacks=$((gate_fallbacks + 1))
+    [ "${MOCK_FALLBACK_VERDICT:-clean}" = clean ]
   }
   # shellcheck disable=SC2329
   provider_unavailable() { [ "${MOCK_PROVIDER_UNAVAILABLE:-false}" = true ]; }
+  # shellcheck disable=SC2329
+  authorless_pull_request() { [ "${MOCK_AUTHORLESS:-false}" = true ]; }
 
-  if [ "$expected_result" = success ]; then
-    wait_for_review_gate >"$tmp/output" 2>&1 || fail "$label: expected success"
-  elif wait_for_review_gate >"$tmp/output" 2>&1; then
-    fail "$label: expected failure"
+  if decide_review_gate >"$tmp/output" 2>&1; then gate_actual=success; else gate_actual=failure; fi
+  [ "$gate_actual" = "$gate_expected" ] \
+    || fail "$gate_label: expected $gate_expected, got $gate_actual: $(cat "$tmp/output")"
+  [ "$gate_evaluations" -eq 1 ] \
+    || fail "$gate_label: expected exactly one evaluation, got $gate_evaluations"
+  [ "$gate_sleeps" -eq 0 ] \
+    || fail "$gate_label: the run slept $gate_sleeps time(s); a contract-4 run never waits"
+  [ "$gate_fallbacks" -eq "${EXPECT_FALLBACK_CALLS:-0}" ] \
+    || fail "$gate_label: expected ${EXPECT_FALLBACK_CALLS:-0} fallback review(s), got $gate_fallbacks"
+  if [ -n "${EXPECT_OUTPUT:-}" ]; then
+    IFS='|' read -r -a gate_fragments <<<"$EXPECT_OUTPUT"
+    for gate_fragment in "${gate_fragments[@]}"; do
+      grep -Fq -- "$gate_fragment" "$tmp/output" \
+        || fail "$gate_label: output does not say '$gate_fragment': $(cat "$tmp/output")"
+    done
   fi
-  [ "$WAIT_CALLS" -eq "$expected_calls" ] \
-    || fail "$label: expected $expected_calls evaluation(s), got $WAIT_CALLS"
-  [ -z "$expected_max_elapsed" ] || [ "$MOCK_NOW" -le "$expected_max_elapsed" ] \
-    || fail "$label: expected the wait to end within ${expected_max_elapsed}s, it took ${MOCK_NOW}s"
-  [ -z "${EXPECT_FALLBACK_CALLS:-}" ] || [ "$FALLBACK_CALLS" -eq "$EXPECT_FALLBACK_CALLS" ] \
-    || fail "$label: expected $EXPECT_FALLBACK_CALLS fallback review(s), got $FALLBACK_CALLS"
-  echo "  OK: $label"
+  echo "  OK: $gate_label"
 }
 
-# The request window (120s here) is polled at the fast interval (30s): five
-# evaluations to a request deadline, not three at the old 60s poll.
-run_wait_case "request-review-success" "waiting-request,waiting-review,success" pull_request success 3
-run_wait_case "terminal-failure" "failure" pull_request failure 1
-run_wait_case "merge-group-never-waits" "waiting-review" merge_group failure 1
-run_wait_case "request-deadline" "waiting-request" pull_request failure 5
-run_wait_case "review-deadline" "waiting-review" pull_request failure 5
-run_wait_case "request-deadline-caps-long-poll" "waiting-request,success" pull_request success 2 120 120 180
-run_wait_case "request-starts-full-review-window" "waiting-request,waiting-review,waiting-review,success" pull_request success 4 60 180 60
-run_wait_case "unknown-state" "unknown" pull_request failure 1
-# AUT-1291: with the production 300s poll, one sleep used to cover the whole
-# 120s request window, so a request posted seconds after the run began was
-# not seen for ~120s, and neither was the reviewer's capacity notice behind
-# it. Inside the window the gate now re-evaluates every 30s: a request seen
-# on the second evaluation and a verdict on the third end the wait in 60s,
-# not 420s.
-run_wait_case "request-window-polls-fast" "waiting-request,waiting-request,waiting-request,success" pull_request success 4 120 3600 300 0 30 90
-run_wait_case "capacity-notice-seen-inside-the-window" "waiting-request,waiting-review,success" pull_request success 3 120 3600 300 0 30 60
-# Past the window the slow poll returns: a review that takes long is waited
-# for at 300s, so the fast burst stays bounded to the window.
-run_wait_case "slow-poll-resumes-after-the-window" "waiting-request,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,waiting-review,success" pull_request success 8 120 3600 300 0 30 1320
-# AUT-1417: a reviewer that never answers this head must be given up on at
-# the derived deadline, not an hour later. Run at the production constants
-# so the bound this asserts is the one that ships: the gate reaches its
-# deadline -- and the fallback reviewer behind it -- in 600s. On the former
-# 3600s deadline this case takes six times as long and fails here.
-run_wait_case "silent-reviewer-hits-the-derived-deadline" "waiting-review" pull_request failure 7 120 600 300 0 30 600
+# Terminal and clean verdicts end the run as before.
+run_gate_case "a-clean-verdict-passes" pull_request success clean none success
+run_gate_case "an-invalid-verdict-fails" pull_request failure invalid none failure
+run_gate_case "an-unknown-state-fails" pull_request unknown waiting none failure
 
-# AUT-1581, vesper#1251: the fallback stands in for a review that did not
-# happen, never for one that did. Every case below lets the fallback answer
-# clean, so a failure proves the gate refused to ask it.
-#
-# The pull-request run of #1251, at production constants: the primary's
-# findings stand for the whole window while it reviews the attest request,
-# and the run used to hand the head to the fallback at the deadline.
-EXPECT_FALLBACK_CALLS=0 MOCK_FALLBACK_VERDICT=clean run_wait_case "pull-request-run-never-overrides-findings" \
-  "waiting-review|findings" pull_request failure 7 120 600 300 0 30 600
-# The merge-group run of #1251 read the findings and reused a fallback verdict
-# over them.
-EXPECT_FALLBACK_CALLS=0 MOCK_FALLBACK_VERDICT=clean run_wait_case "merge-group-never-overrides-findings" \
-  "waiting-review|findings" merge_group failure 1
-# A primary that has said it cannot answer hands over, findings or not: its
-# next verdict is not coming.
-EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean MOCK_PROVIDER_UNAVAILABLE=true run_wait_case "unavailable-reviewer-after-findings-hands-over" \
-  "waiting-review|findings" pull_request success 1
-EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean MOCK_PROVIDER_UNAVAILABLE=true run_wait_case "merge-group-unavailable-reviewer-after-findings" \
-  "waiting-review|findings" merge_group success 1
-# A head the primary never reviewed is what the fallback is for.
-EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean run_wait_case "unreviewed-head-reaches-the-fallback" \
-  "waiting-review" pull_request success 5
-EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=clean run_wait_case "merge-group-unreviewed-head-reaches-the-fallback" \
-  "waiting-review" merge_group success 1
-unset -f fallback_review provider_unavailable
-rm -rf "$wait_fixture"
+# One evaluation, no wait: a request younger than the deadline fails at once,
+# and says which state it is in and when a re-run can reach the fallback.
+EXPECT_OUTPUT="'waiting-review'|is 120s old|in 480s" run_gate_case \
+  "a-fresh-request-fails-at-once-naming-state-and-age" pull_request waiting-review waiting 120 failure
+EXPECT_OUTPUT="'waiting-review'|is 599s old" run_gate_case \
+  "a-request-just-under-the-deadline-does-not-reach-the-fallback" pull_request waiting-review waiting 599 failure
+
+# Past the deadline the request is not coming back, and the fallback answers.
+EXPECT_FALLBACK_CALLS=1 EXPECT_OUTPUT="went unanswered past the 600s evidence deadline|satisfied by the fallback" run_gate_case \
+  "a-request-at-the-deadline-reaches-the-fallback" pull_request waiting-review waiting 600 success
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=none run_gate_case \
+  "an-aged-request-without-a-fallback-verdict-stays-closed" pull_request waiting-review waiting 900 failure
+
+# No request names this head: nothing starts the clock, however long the run
+# waits. A bare `@codex review` is a wait hint only (state waiting-review,
+# requestedAt null), and never ages into the fallback either.
+EXPECT_OUTPUT="'waiting-request'|no review request names" run_gate_case \
+  "no-request-for-the-head-fails-at-once-and-says-so" pull_request waiting-request waiting none failure
+EXPECT_OUTPUT="'waiting-review'|no review request names" run_gate_case \
+  "a-bare-request-never-ages-into-the-fallback" pull_request waiting-review waiting none failure
+
+# A reviewer that said it cannot answer hands over at once, findings or not.
+EXPECT_FALLBACK_CALLS=1 MOCK_PROVIDER_UNAVAILABLE=true run_gate_case \
+  "an-unavailable-reviewer-hands-over-at-once" pull_request waiting-review waiting 5 success
+EXPECT_FALLBACK_CALLS=1 MOCK_PROVIDER_UNAVAILABLE=true run_gate_case \
+  "an-unavailable-reviewer-hands-over-before-any-request" pull_request waiting-request waiting none success
+EXPECT_FALLBACK_CALLS=1 MOCK_PROVIDER_UNAVAILABLE=true run_gate_case \
+  "an-unavailable-reviewer-after-findings-hands-over" pull_request waiting-review findings 5 success
+
+# A bot-authored pull request has no driver to request review.
+EXPECT_FALLBACK_CALLS=1 MOCK_AUTHORLESS=true run_gate_case \
+  "a-bot-pull-request-reaches-the-fallback" pull_request waiting-request waiting none success
+
+# AUT-1581, vesper#1251: the fallback never overrides a completed findings
+# verdict, whatever made the fallback eligible.
+EXPECT_OUTPUT="never overrides a completed review|is 900s old" run_gate_case \
+  "an-aged-request-never-overrides-findings" pull_request waiting-review findings 900 failure
+MOCK_AUTHORLESS=true run_gate_case \
+  "a-bot-pull-request-never-overrides-findings" pull_request waiting-review findings none failure
+
+# The merge queue is unchanged: it evaluates once, never reads the request
+# clock, and hands an unreviewed head to the fallback.
+EXPECT_FALLBACK_CALLS=1 MOCK_FALLBACK_VERDICT=none run_gate_case \
+  "merge-group-without-a-fallback-verdict-fails" merge_group waiting-review waiting none failure
+EXPECT_FALLBACK_CALLS=1 run_gate_case \
+  "merge-group-unreviewed-head-reaches-the-fallback" merge_group waiting-review waiting none success
+EXPECT_FALLBACK_CALLS=1 run_gate_case \
+  "merge-group-does-not-read-the-request-clock" merge_group waiting-review waiting 5 success
+run_gate_case "merge-group-never-overrides-findings" merge_group waiting-review findings 900 failure
+EXPECT_FALLBACK_CALLS=1 MOCK_PROVIDER_UNAVAILABLE=true run_gate_case \
+  "merge-group-unavailable-reviewer-after-findings" merge_group waiting-review findings none success
+unset -f evaluate_once review_gate_now sleep fallback_review provider_unavailable authorless_pull_request
+rm -rf "$gate_fixture"
+trap - EXIT HUP INT TERM
 
 echo "==> review-gate binds evidence to event PR coordinates"
 coordinate_fixture="$(mktemp -d)"
@@ -684,7 +689,7 @@ command -v ruby >/dev/null 2>&1 || fail "ruby is required to parse workflow YAML
 jq -e '
   . as $contract
   | .contractVersion == 1
-  and .gateBehaviorContractVersion == 3
+  and .gateBehaviorContractVersion == 4
   and (.requiredStatusCheck
     | type == "string"
     and test("^[A-Za-z0-9][A-Za-z0-9 ._()/-]*\\z"))
@@ -873,7 +878,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for invalid_behavior_version in null '"3"' 2; do
+  for invalid_behavior_version in null '"4"' 3; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -1033,9 +1038,12 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   ' "$review_gate" >"$state_fixture/state.sh"
 
   check_provider_state() {
-    # $1 expected (yes|no), $2 evidence json, $3 case name
+    # $1 expected (yes|no), $2 evidence json, $3 case name, $4 the evaluator's
+    # verdict json (optional; absent means no verdict.json)
     (
       tmp="$state_fixture"; printf '%s' "$2" >"$tmp/evidence.json"
+      rm -f "$tmp/verdict.json"
+      [ -z "${4:-}" ] || printf '%s' "$4" >"$tmp/verdict.json"
       # shellcheck source=/dev/null
       . "$state_fixture/state.sh"
       if provider_unavailable; then actual=yes; else actual=no; fi
@@ -1066,6 +1074,48 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   check_provider_state no \
     "{$trusted,\"issueComments\":[],\"reviews\":[]}" \
     "silence is not unavailability"
+
+  # touchstone#1190, verbatim: Codex answered the head's attest request with an
+  # explicit error, naming as missing a commit that existed. That is the
+  # reviewer saying it cannot answer. The driver's CLI wakes the gate on any
+  # reply, so the gate must read it as unavailability too, or the pull request
+  # waits on an answer that is not coming.
+  trusted_1190='"trustedAuthors":["chatgpt-codex-connector","chatgpt-codex-connector[bot]"]'
+  attest_1190='"@codex review\n\n<!-- touchstone:attest-request head=37792790545bc688a0abc9aa106cc827ada38eec -->\n<!-- touchstone:attest-round head=37792790545bc688a0abc9aa106cc827ada38eec answered=3981670767,3981670780,3981670784,3981784623,3981784633,3981784640 -->"'
+  error_1190='"Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n\n```\nProvided git ref 37792790545bc688a0abc9aa106cc827ada38eec does not exist\n```\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>"'
+  evidence_1190="{$trusted_1190,\"issueComments\":[{\"id\":5622926664,\"user\":{\"login\":\"henrymodisett\"},\"created_at\":\"2026-09-10T17:42:12Z\",\"body\":$attest_1190},{\"id\":5622938910,\"user\":{\"login\":\"chatgpt-codex-connector[bot]\"},\"created_at\":\"2026-09-10T17:43:11Z\",\"body\":$error_1190}],\"reviews\":[]}"
+
+  check_provider_state yes "$evidence_1190" \
+    "an explicit error reply to the head's latest request is unavailability (#1190)" \
+    '{"requestedAt":"2026-09-10T17:42:12Z"}'
+
+  check_provider_state no "$evidence_1190" \
+    "an error reply before the head's latest request answered an earlier one" \
+    '{"requestedAt":"2026-09-10T17:50:00Z"}'
+
+  check_provider_state no "$evidence_1190" \
+    "an error reply is not bound to a head no request names" \
+    '{"requestedAt":null}'
+
+  check_provider_state no "$evidence_1190" \
+    "an error reply with no evaluator verdict is not bound to the head"
+
+  check_provider_state no \
+    "{$trusted_1190,\"issueComments\":[{\"user\":{\"login\":\"stranger\"},\"created_at\":\"2026-09-10T17:43:11Z\",\"body\":$error_1190}],\"reviews\":[]}" \
+    "an untrusted author cannot declare the provider down with an error" \
+    '{"requestedAt":"2026-09-10T17:42:12Z"}'
+
+  check_provider_state no \
+    "{$trusted_1190,\"issueComments\":[{\"user\":{\"login\":\"chatgpt-codex-connector[bot]\"},\"created_at\":\"2026-09-10T17:43:11Z\",\"body\":$error_1190},{\"user\":{\"login\":\"chatgpt-codex-connector[bot]\"},\"created_at\":\"2026-09-10T18:53:58Z\",\"body\":\"Codex Review: Didn't find any major issues.\"}],\"reviews\":[]}" \
+    "a verdict after the error reply supersedes it" \
+    '{"requestedAt":"2026-09-10T17:42:12Z"}'
+
+  # A usage or quota notice is account state: it needs no request naming the
+  # head, and the driver's CLI wakes on it the same way.
+  check_provider_state yes \
+    "{$trusted,\"issueComments\":[{\"user\":{\"login\":\"bot\"},\"created_at\":\"2026-01-02\",\"body\":\"$quota\"}],\"reviews\":[]}" \
+    "a quota notice counts with no request naming the head" \
+    '{"requestedAt":null}'
 
   rm -r "$state_fixture"
 
