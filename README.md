@@ -51,43 +51,68 @@ workflow to an immutable commit from this repository.
 
 ## Runner
 
-`review-gate` and `delivery-evidence` take their runner from one selector:
+Every consumer job (`validate`, `review-gate`, `delivery-evidence`) takes its
+runner from one selector:
 
 ```yaml
 runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
 ```
 
-With the `LINUX_RUNNER` variable unset, both run on GitHub-hosted
-`ubuntu-latest`, exactly as before. Setting it moves them, in every consumer,
-to the self-hosted runner with that label. The `self-hosted` label is always
-required as well, so the variable can never name a hosted image (AUT-1595).
-Both jobs execute only code pinned here and data read from the API, never the
-pull request's code.
+With the `LINUX_RUNNER` variable unset, every job runs on GitHub-hosted
+`ubuntu-latest`, exactly as before. Set, it runs on a self-hosted runner with
+that label, and the `self-hosted` label is always required, so the variable can
+never name a hosted image (AUT-1595). The `source contract` job runs only in
+this public repository and stays on `ubuntu-latest` by name.
 
-`validate` does not take the setting, and neither does the `source contract`
-job. Both execute the candidate's code (`validate` runs the target's declared
-commands), so each runs on a fresh GitHub-hosted runner every time. On a
-persistent self-hosted runner, a pull request could modify the host and reach
-every later job there, including `review-gate`, which receives the fallback
-reviewer's credential (touchstone-workflows#48). The workflow cannot prove
-that a runner is ephemeral, so moving `validate` off hosted runners needs an
-ephemeral one-job runner and its own reviewed change.
+**`LINUX_RUNNER` names only single-use runners.** `validate` runs the
+candidate's declared commands. On a persistent self-hosted runner, a pull
+request could modify the host and reach every later job there, including
+`review-gate`, which receives the fallback reviewer's credential
+(touchstone-workflows#48). The workflow cannot see whether a runner is
+ephemeral, so the guarantee lives where runners are registered:
+`runner/linux-runner.sh` is the only thing that registers runners with this
+label. For each job it asks GitHub for a just-in-time configuration, which
+registers a runner for exactly one job, and starts a fresh container that
+holds that configuration and nothing else: no volume, no Docker socket, no
+host network, no credential (`tests/test-runner.sh` pins this). Never register
+a long-lived runner with the label or into its group.
 
-To move the two gates to a self-hosted runner (Phase 2), register the runner in
-a group restricted to the private consumers, then:
+The variable's repositories and the runner group's repositories must be the
+same set. A repository that resolves the variable but is outside the group
+queues its jobs forever. A public repository must be in neither, because it
+takes fork pull requests.
+
+### Running the runners (AUT-1596)
+
+On the host: Docker, and `gh` logged in with `admin:org`. Once per
+organization, create the group for the private consumers that use it:
 
 ```bash
-gh variable set LINUX_RUNNER --org autumngarage --visibility private --body '<runner label>'
+gh api -X POST orgs/autumngarage/actions/runner-groups -f name=linux-ephemeral \
+  -f visibility=selected -F allows_public_repositories=false \
+  -F 'selected_repository_ids[]=<repository id>'   # one per repository
 ```
 
-`--visibility private` is load-bearing. The public repositories accept pull
-requests from forks, and `validate` executes the candidate's code, so a public
-repository must never resolve the variable or reach a persistent runner. Undo
-the move with `gh variable delete LINUX_RUNNER --org autumngarage`.
+Then, on the host, from a checkout of this repository:
+
+```bash
+bash runner/linux-runner.sh build     # the job image, from runner/Dockerfile
+bash runner/linux-runner.sh install   # a LaunchAgent that keeps the slots running, under caffeinate
+bash runner/linux-runner.sh status
+gh variable set LINUX_RUNNER --org autumngarage --visibility selected \
+  --repos '<the group repositories, comma-separated>' --body linux-ephemeral
+```
+
+`caffeinate -i` keeps the Mac from idle-sleeping while the agent runs; a
+closed lid still sleeps it, and queued jobs wait until it wakes. To move the
+fleet to another machine, install there and uninstall here
+(`bash runner/linux-runner.sh uninstall`); the label does not change. To go
+back to GitHub-hosted runners, `gh variable delete LINUX_RUNNER --org
+autumngarage`.
 
 A required workflow runs in the consumer repository's context and reads the
 variables visible to that repository; a repository variable overrides the
 organization's. Confirm on the first run after setting it: the job's "Set up
 job" step names the runner that took it. If the organization variable does not
 resolve there, set it per repository instead:
-`gh variable set LINUX_RUNNER -R autumngarage/<repository> --body '<runner label>'`.
+`gh variable set LINUX_RUNNER -R autumngarage/<repository> --body linux-ephemeral`.

@@ -29,28 +29,30 @@ assert_active_line() {
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
 
-# AUT-1595: the jobs that execute only pinned code take their runner from the
-# LINUX_RUNNER setting. Unset, it is GitHub-hosted Linux exactly as before;
-# set, self-hosted is always required, so the setting can never name a hosted
-# image. Touchstone's shared hosted-runner check (AUT-1592) accepts this shape.
+# AUT-1595/AUT-1596: every consumer job takes its runner from the LINUX_RUNNER
+# setting. Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted
+# is always required, so the setting can never name a hosted image, and it
+# names only the single-use runners runner/linux-runner.sh registers -- the
+# boundary that lets validate, which runs candidate code, use it at all.
+# Touchstone's shared hosted-runner check (AUT-1592) accepts this shape.
 # shellcheck disable=SC2016
 runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
-for gate in "$review_gate" "$delivery_evidence"; do
+for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
   [ "$(active_count "$gate" "$runner_selector")" -eq 1 ] \
-    || fail "$gate: its job must take its runner from the LINUX_RUNNER selector"
+    || fail "$gate: its consumer job must take its runner from the LINUX_RUNNER selector"
 done
-# validate executes candidate code, so no job in it may reach a persistent
-# runner through a setting (touchstone-workflows#48).
-if grep -Eq '^[^#]*runs-on:.*vars\.' "$workflow"; then
-  fail "$workflow: a job that executes candidate code takes its runner from a setting"
-fi
 # Self-test fixtures append jobs of their own; only production is exhaustive.
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 2 ] \
-    || fail "$workflow: both jobs must run on GitHub-hosted ubuntu-latest"
+  # The source contract job runs this public repository's candidate tests. A
+  # public repository never resolves the setting, and never reaches these
+  # runners, so it stays GitHub-hosted by name.
+  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 1 ] \
+    || fail "$workflow: the source contract job must run on GitHub-hosted ubuntu-latest"
+  [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 2 ] \
+    || fail "$workflow: a job takes its runner from somewhere other than the selector or ubuntu-latest"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
       || fail "$gate: a job takes its runner from somewhere other than the LINUX_RUNNER selector"
@@ -1388,6 +1390,9 @@ fi
 if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-run-block-scope.sh" \
     || fail "cross-step shell scope check failed"
+  # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
+    || fail "runner supervisor check failed"
 fi
 
 echo "workflow contract passed"
