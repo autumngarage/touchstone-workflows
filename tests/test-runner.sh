@@ -91,7 +91,9 @@ has 'runner_group_id=7' "registration binds the runner group"
 has 'labels[]=self-hosted' "registration carries the self-hosted label every selector requires"
 has 'labels[]=linux-ephemeral' "registration carries the label LINUX_RUNNER names"
 run_line="$(grep '^docker run ' "$tmp/calls")"
-for arg in '--rm' '--init' '--memory 6g' '--cpus 4' '--pull never' './run.sh --jitconfig SINGLE-USE-CONFIG'; do
+# --pids-limit keeps a pull request that forks without end inside its own
+# container instead of exhausting the VM every slot shares.
+for arg in '--rm' '--init' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' './run.sh --jitconfig SINGLE-USE-CONFIG'; do
   case "$run_line" in *"$arg"*) ;; *) fail "container is missing '$arg': $run_line" ;; esac
 done
 for forbidden in ' -v ' '--volume' '--mount' '--privileged' 'docker.sock' '--network' ' -e ' '--env' 'GH_TOKEN' '--cap-add'; do

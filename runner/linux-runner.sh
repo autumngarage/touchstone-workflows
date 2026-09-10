@@ -25,6 +25,9 @@
 #   LINUX_RUNNER_SLOTS    jobs run at once (2)
 #   LINUX_RUNNER_MEMORY   memory limit per job container (6g)
 #   LINUX_RUNNER_CPUS     CPU limit per job container (4)
+#   LINUX_RUNNER_PIDS     process limit per job container (4096): a pull
+#                         request that forks without end exhausts its own
+#                         container, not the VM every slot shares
 #   LINUX_RUNNER_IMAGE    job image tag (linux-ephemeral-runner:local)
 #
 # The host needs docker and a gh login with admin:org. The token is used here
@@ -40,6 +43,7 @@ LABEL="${LINUX_RUNNER_LABEL:-linux-ephemeral}"
 SLOTS="${LINUX_RUNNER_SLOTS:-2}"
 MEMORY="${LINUX_RUNNER_MEMORY:-6g}"
 CPUS="${LINUX_RUNNER_CPUS:-4}"
+PIDS="${LINUX_RUNNER_PIDS:-4096}"
 IMAGE="${LINUX_RUNNER_IMAGE:-linux-ephemeral-runner:local}"
 # A test seam and a one-shot probe: stop each slot after this many jobs. Unset
 # (the default) means forever.
@@ -61,6 +65,7 @@ die() {
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
 case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
+case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 
 need() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH; $2"
@@ -119,7 +124,7 @@ run_slot() {
     started="$(date +%s)"
     rc=0
     docker run --rm --init --name "$name" \
-      --memory "$MEMORY" --cpus "$CPUS" --pull never \
+      --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
       "$IMAGE" ./run.sh --jitconfig "$jit" || rc=$?
     forget_runner "$id"
     rm -f "$state_dir/slot-$slot"
@@ -214,6 +219,7 @@ cmd_install() {
     <key>LINUX_RUNNER_SLOTS</key><string>$SLOTS</string>
     <key>LINUX_RUNNER_MEMORY</key><string>$MEMORY</string>
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
+    <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
   </dict>
   <key>RunAtLoad</key><true/>
