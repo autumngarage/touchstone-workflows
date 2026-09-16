@@ -146,8 +146,8 @@ jobs:
 
           # The fallback reviewer reuses the local tier's prompt rather than
           # keeping a second copy that can drift from it.
-          prompt_revision="9818742198e3cb774a5d3ab5c738cc5985159e36"
-          prompt_sha256="bf7024bc8d3a92f2dc264c51c121ce410d32f4f4dbbac6ce731754a5adf8f57a"
+          prompt_revision="6880de24dab3bd163ba994f709bcf297af2ae3fc"
+          prompt_sha256="416026b71db3ab556bb0d246d062a3d5eaabe8f02706c0a2d394bb370324e56b"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${prompt_revision}/config/review-normal-prompt.md" \
             -o "$RUNNER_TEMP/review-prompt.md"
