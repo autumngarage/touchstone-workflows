@@ -68,7 +68,11 @@ No runner volume or writable cache is shared between job containers.
 
 A consumer must also invoke this pinned workflow through `workflow_call` on
 default-branch pushes to produce reusable default-branch caches. PR-only caches
-are confined to their merge refs and do not seed other PRs. The producer uses
+are confined to their merge refs and do not seed other PRs, so required PR and
+merge-group runs only restore. Successful default-branch pushes and manual
+runs save after validation and the toolchain check; exact cache hits need no
+upload. Existing candidate caches can still restore within their GitHub scope.
+The producer uses
 the same validator, so it cannot drift into a second validation implementation.
 The protected workflow pin, consumer producer and repository opt-in must all be
 deployed before measuring cold/warm improvements. Passing the source contract
