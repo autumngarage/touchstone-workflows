@@ -73,6 +73,10 @@ assert_count 1 '--json'
 assert_count 1 '^  merge_group:'
 assert_count 1 'types: \[checks_requested\]'
 
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  python3 "$repo_root/tests/test-swift-cache.py"
+fi
+
 if grep -Eq 'tests/test-\*\.sh|(^|[^[:alnum:]_-])(npm|pip|uv|brew|apt-get)([^[:alnum:]_-]|$)' "$workflow"; then
   fail "required workflow must invoke only the declaration engine"
 fi
