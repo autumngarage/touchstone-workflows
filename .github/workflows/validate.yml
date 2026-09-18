@@ -97,6 +97,9 @@ jobs:
           CACHE_ARCH: ${{ runner.arch }}
           CACHE_GRAPH: ${{ hashFiles('**/Package.swift', '**/Package.resolved', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}
           CACHE_REVISION: ${{ github.sha }}
+          CACHE_EVENT: ${{ github.event_name }}
+          CACHE_REF: ${{ github.ref }}
+          CACHE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if ! command -v swift >/dev/null 2>&1; then
@@ -107,10 +110,18 @@ jobs:
           prefix="swiftpm-build-v1-${CACHE_OS}-${CACHE_ARCH}-${toolchain}-${CACHE_GRAPH}-"
           printf 'enabled=true\ntoolchain=%s\nprefix=%s\nkey=%s%s\n' \
             "$toolchain" "$prefix" "$prefix" "$CACHE_REVISION" >>"$GITHUB_OUTPUT"
+          save=false
+          if [ -n "$CACHE_DEFAULT_BRANCH" ] && [ "$CACHE_REF" = "refs/heads/$CACHE_DEFAULT_BRANCH" ]; then
+            case "$CACHE_EVENT" in
+              push|workflow_dispatch) save=true ;;
+            esac
+          fi
+          printf 'save=%s\n' "$save" >>"$GITHUB_OUTPUT"
 
       - name: Restore Swift build cache
+        id: restore-swift-cache
         if: steps.swift-cache.outputs.enabled == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
           key: ${{ steps.swift-cache.outputs.key }}
@@ -145,3 +156,10 @@ jobs:
             echo "SWIFT_BUILD_CACHE requires validation setup to retain the preinstalled Swift toolchain." >&2
             exit 1
           fi
+
+      - name: Save default-branch Swift build cache
+        if: success() && steps.swift-cache.outputs.save == 'true' && steps.restore-swift-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build
+          key: ${{ steps.swift-cache.outputs.key }}
