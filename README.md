@@ -52,6 +52,28 @@ Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
 workflow to an immutable commit from this repository.
 
+## Swift build caches
+
+Consumers can opt into the validation workflow's SwiftPM cache with the
+repository variable `SWIFT_BUILD_CACHE=true`. It applies to Linux runners with
+a preinstalled Swift toolchain and a checked-in `Package.resolved`. Validation
+setup must retain that toolchain; a change fails the job before cache save.
+Without a preinstalled toolchain, validation runs normally without a cache.
+
+The workflow owns the cache key and its inputs. It separates platform,
+architecture, toolchain and dependency/build declarations, with a compatible
+restore prefix across revisions. Cached `.build` output accelerates compilation;
+the declared validation command always runs, including on an exact cache hit.
+No runner volume or writable cache is shared between job containers.
+
+A consumer must also invoke this pinned workflow through `workflow_call` on
+default-branch pushes to produce reusable default-branch caches. PR-only caches
+are confined to their merge refs and do not seed other PRs. The producer uses
+the same validator, so it cannot drift into a second validation implementation.
+The protected workflow pin, consumer producer and repository opt-in must all be
+deployed before measuring cold/warm improvements. Passing the source contract
+alone is not evidence of a consumer cache hit or reduced build time.
+
 ## Runner
 
 Every consumer job (`validate`, `review-gate`, `delivery-evidence`) takes its

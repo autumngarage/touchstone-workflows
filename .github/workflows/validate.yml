@@ -8,6 +8,9 @@ name: validate
 # installed here.
 
 on:
+  # Consumers may invoke this same validator on their default branch to
+  # produce a cache that later PR and merge-queue runs can restore.
+  workflow_call:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -86,6 +89,33 @@ jobs:
           git config --global user.name "Touchstone CI"
           git config --global init.defaultBranch main
 
+      - name: Identify optional Swift build cache
+        id: swift-cache
+        if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
+        env:
+          CACHE_OS: ${{ runner.os }}
+          CACHE_ARCH: ${{ runner.arch }}
+          CACHE_GRAPH: ${{ hashFiles('**/Package.swift', '**/Package.resolved', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}
+          CACHE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if ! command -v swift >/dev/null 2>&1; then
+            echo "Swift cache skipped: the runner has no preinstalled toolchain."
+            exit 0
+          fi
+          toolchain="$(swift --version | sha256sum | cut -d ' ' -f 1)"
+          prefix="swiftpm-build-v1-${CACHE_OS}-${CACHE_ARCH}-${toolchain}-${CACHE_GRAPH}-"
+          printf 'enabled=true\ntoolchain=%s\nprefix=%s\nkey=%s%s\n' \
+            "$toolchain" "$prefix" "$prefix" "$CACHE_REVISION" >>"$GITHUB_OUTPUT"
+
+      - name: Restore Swift build cache
+        if: steps.swift-cache.outputs.enabled == 'true'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .build
+          key: ${{ steps.swift-cache.outputs.key }}
+          restore-keys: ${{ steps.swift-cache.outputs.prefix }}
+
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
@@ -103,3 +133,15 @@ jobs:
           bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
             --json
+
+      - name: Verify cached toolchain stayed in force
+        if: steps.swift-cache.outputs.enabled == 'true'
+        env:
+          EXPECTED_TOOLCHAIN: ${{ steps.swift-cache.outputs.toolchain }}
+        run: |
+          set -euo pipefail
+          actual="$(swift --version | sha256sum | cut -d ' ' -f 1)"
+          if [ "$actual" != "$EXPECTED_TOOLCHAIN" ]; then
+            echo "SWIFT_BUILD_CACHE requires validation setup to retain the preinstalled Swift toolchain." >&2
+            exit 1
+          fi
