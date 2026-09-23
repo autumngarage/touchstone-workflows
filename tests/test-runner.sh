@@ -55,7 +55,11 @@ cat >"$bin/docker" <<'EOF'
 printf 'docker %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
   image) [ ! -f "$FAKE_STATE/no-image" ] ;;
-  run) exit "${FAKE_DOCKER_RC:-0}" ;;
+  run)
+    # What the container reads on stdin, where the configuration must arrive.
+    printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS"
+    exit "${FAKE_DOCKER_RC:-0}"
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -136,13 +140,20 @@ has 'labels[]=linux-ephemeral' "registration carries the label LINUX_RUNNER name
 run_line="$(grep '^docker run ' "$tmp/calls")"
 # --pids-limit keeps a pull request that forks without end inside its own
 # container instead of exhausting the VM every slot shares.
-for arg in '--rm' '--init' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' './run.sh --jitconfig SINGLE-USE-CONFIG'; do
+# The last literal is the container's own command text, matched as written.
+# shellcheck disable=SC2016
+for arg in '--rm' '--init' ' -i ' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' 'exec ./run.sh --jitconfig "$jit"'; do
   case "$run_line" in *"$arg"*) ;; *) fail "container is missing '$arg': $run_line" ;; esac
 done
 for forbidden in ' -v ' '--volume' '--mount' '--privileged' 'docker.sock' '--network' ' -e ' '--env' 'GH_TOKEN' '--cap-add'; do
   case "$run_line" in *"$forbidden"*) fail "container must not get '$forbidden': $run_line" ;; esac
 done
-ok "the container gets the single-use configuration and nothing else"
+# macOS shows every user's process arguments to every other user: the
+# configuration is a runner credential, so it reaches the container on stdin
+# and never appears in the host's docker arguments.
+case "$run_line" in *SINGLE-USE-CONFIG*) fail "the single-use configuration is a host process argument: $run_line" ;; esac
+has 'docker-stdin SINGLE-USE-CONFIG' "the configuration arrives on the container's stdin"
+ok "the container gets the single-use configuration, on stdin, and nothing else"
 has '-X DELETE orgs/autumngarage/actions/runners/4242' "cleanup"
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"

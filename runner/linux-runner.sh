@@ -207,9 +207,15 @@ run_slot() {
     log "slot $slot: runner $name ($id) is waiting for a job"
     started="$(date +%s)"
     rc=0
-    docker run --rm --init --name "$name" \
+    # The single-use configuration goes in on stdin, never as an argument:
+    # macOS shows every user's process arguments to every other user, so on
+    # a Mac shared with a persistent macOS runner, `docker run ... --jitconfig
+    # <config>` would hand the runner credential to that runner's jobs for as
+    # long as this job ran. Inside the container it becomes run.sh's argument,
+    # visible only in the container's own VM.
+    printf '%s\n' "$jit" | docker run --rm --init -i --name "$name" \
       --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
-      "$IMAGE" ./run.sh --jitconfig "$jit" || rc=$?
+      "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
     forget_runner "$id"
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
