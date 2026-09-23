@@ -20,6 +20,7 @@ mkdir -p "$bin"
 cat >"$bin/gh" <<'EOF'
 #!/usr/bin/env bash
 printf 'gh %s\n' "$*" >>"$FAKE_CALLS"
+[ -n "${GH_TOKEN:-}" ] && printf 'gh-token %s\n' "$GH_TOKEN" >>"$FAKE_CALLS"
 case "$*" in
   *runner-groups/*/repositories*)
     [ -f "$FAKE_STATE/empty-group" ] && exit 0
@@ -70,12 +71,42 @@ cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "$*" >>"$FAKE_CALLS"
 EOF
+cat >"$bin/colima" <<'EOF'
+#!/usr/bin/env bash
+printf 'colima %s\n' "$*" >>"$FAKE_CALLS"
+case "$1" in
+  status) [ -f "$FAKE_STATE/colima-up" ] ;;
+  start) [ ! -f "$FAKE_STATE/colima-fails" ] ;;
+esac
+EOF
+# id: root unless the not-root flag is set; the user and group names the
+# daemon install asks for are the real ones, so stat's owner check agrees.
+real_user="$(id -un)"
+real_group="$(id -gn)"
+cat >"$bin/id" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+  -u) if [ -f "\$FAKE_STATE/not-root" ]; then echo 501; else echo 0; fi ;;
+  -un) echo "$real_user" ;;
+  -gn) echo "$real_group" ;;
+esac
+EOF
+cat >"$bin/dscl" <<'EOF'
+#!/usr/bin/env bash
+[ -f "$FAKE_STATE/no-user" ] && exit 56
+echo "NFSHomeDirectory: $FAKE_HOME"
+EOF
+cat >"$bin/chown" <<'EOF'
+#!/usr/bin/env bash
+printf 'chown %s\n' "$*" >>"$FAKE_CALLS"
+EOF
 chmod +x "$bin"/*
 
 # runner ARGS...: run the script against the fakes with a fresh call log and
 # state; stdout+stderr land in $tmp/out and the exit code in $rc.
 runner() {
-  rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/home"
+  rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/daemons"
+  [ -n "${KEEP_HOME:-}" ] || rm -rf "${tmp:?}/home"
   mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
   : >"$tmp/calls"
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
@@ -83,6 +114,8 @@ runner() {
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
     LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
+    LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
+    LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -164,5 +197,78 @@ grep -Fq "<string>$tmp/state/linux-runner.sh</string>" "$plist" || fail "the age
 grep -Fq '<key>LINUX_RUNNER_LABEL</key><string>linux-ephemeral</string>' "$plist" || fail "the agent lost its label"
 has 'launchctl bootstrap' "install"
 ok "the LaunchAgent runs a copy of the supervisor under caffeinate"
+
+echo "==> a headless host starts its own Colima VM"
+ENGINE=colima runner run
+[ "$rc" -eq 0 ] || fail "a colima run exited $rc: $(cat "$tmp/out")"
+has 'colima start --vm-type vz' "a stopped VM"
+has 'docker run ' "colima run"
+FLAGS=colima-up ENGINE=colima runner run
+lacks '^colima start' "a running VM"
+ok "the VM is started when it is down, and left alone when it is up"
+FLAGS=colima-fails ENGINE=colima runner run
+refused 'colima could not start its VM' "a VM that will not start"
+lacks 'generate-jitconfig' "no VM"
+ok "a VM that will not start registers nothing"
+runner run
+lacks '^colima' "the default engine"
+ok "the default engine never touches Colima"
+
+echo "==> a token file is private, reaches gh, and never a container"
+mkdir -p "$tmp/tok"
+printf 'ghp_FILETOKEN\n' >"$tmp/tok/token"
+chmod 644 "$tmp/tok/token"
+TOKEN_FILE="$tmp/tok/token" runner run
+refused 'make it private' "a readable token file"
+lacks 'generate-jitconfig' "readable token"
+chmod 600 "$tmp/tok/token"
+TOKEN_FILE="$tmp/tok/token" runner run
+[ "$rc" -eq 0 ] || fail "a private token file run exited $rc: $(cat "$tmp/out")"
+has 'gh-token ghp_FILETOKEN' "gh gets the file's token"
+if grep '^docker run ' "$tmp/calls" | grep -q 'FILETOKEN'; then fail "the token reached the container"; fi
+ok "gh runs with the file's token, and the container never sees it"
+
+echo "==> install-daemon runs the fleet at boot as its own user"
+user_state="$tmp/home/Library/Application Support/linux-ephemeral-runner"
+seed_token() {
+  rm -rf "${tmp:?}/home"
+  mkdir -p "$user_state"
+  printf 'ghp_DAEMON\n' >"$user_state/github-token"
+  chmod "${1:-600}" "$user_state/github-token"
+}
+seed_token
+KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon exited $rc: $(cat "$tmp/out")"
+dplist="$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist"
+[ -f "$dplist" ] || fail "install-daemon wrote no LaunchDaemon"
+grep -Fq "<key>UserName</key><string>$real_user</string>" "$dplist" || fail "the daemon does not run as the fleet's user"
+grep -Fq "<key>LINUX_RUNNER_ENGINE</key><string>colima</string>" "$dplist" || fail "the daemon does not use Colima"
+grep -Fq "<key>LINUX_RUNNER_TOKEN_FILE</key><string>$user_state/github-token</string>" "$dplist" || fail "the daemon has no token file"
+grep -Fq "<string>$user_state/linux-runner.sh</string>" "$dplist" || fail "the daemon does not run the installed copy"
+grep -Fq "<key>HOME</key><string>$tmp/home</string>" "$dplist" || fail "the daemon's HOME is not the user's"
+grep -Fq 'ghp_DAEMON' "$dplist" && fail "the token was written into the plist"
+[ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
+has 'launchctl bootstrap system' "install-daemon"
+has "chown $real_user:" "the installed copy belongs to the fleet's user"
+ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token"
+seed_token
+FLAGS=not-root KEEP_HOME=1 runner install-daemon "$real_user"
+refused 'run it with sudo' "a non-root install"
+FLAGS=no-user KEEP_HOME=1 runner install-daemon nobody-here
+refused "no local user 'nobody-here'" "a missing user"
+rm -rf "${tmp:?}/home"; mkdir -p "$tmp/home"
+KEEP_HOME=1 runner install-daemon "$real_user"
+refused "no token for $real_user" "a missing token"
+seed_token 644
+KEEP_HOME=1 runner install-daemon "$real_user"
+refused 'must be private' "a readable token"
+runner install-daemon
+refused 'usage: sudo bash runner/linux-runner.sh install-daemon USER' "no user named"
+[ ! -f "$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist" ] || fail "a refused install left a LaunchDaemon"
+ok "install-daemon refuses without root, a real user, or that user's private token"
+runner uninstall-daemon
+[ "$rc" -eq 0 ] || fail "uninstall-daemon exited $rc"
+has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstall-daemon"
+ok "uninstall-daemon boots the daemon out"
 
 echo "runner supervisor passed"
