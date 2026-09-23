@@ -114,6 +114,11 @@ ensure_engine() {
   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
 }
 
+# A file's permission bits and owner. GNU stat first: on Linux `stat -f` means
+# --file-system and succeeds with the wrong answer, while BSD stat refuses -c.
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+file_owner() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1"; }
+
 # gh's credential when it cannot use a login keychain: the token file, which
 # must be private to its owner, since whoever reads it can register runners.
 load_token() {
@@ -121,7 +126,7 @@ load_token() {
   [ -z "${GH_TOKEN:-}" ] || return 0
   [ -n "$TOKEN_FILE" ] || return 0
   [ -r "$TOKEN_FILE" ] || die "the token file $TOKEN_FILE is missing or unreadable"
-  mode="$(stat -f %Lp "$TOKEN_FILE" 2>/dev/null || stat -c %a "$TOKEN_FILE")"
+  mode="$(file_mode "$TOKEN_FILE")"
   case "$mode" in
     600 | 400) ;;
     *) die "the token file $TOKEN_FILE is mode $mode; make it private: chmod 600 '$TOKEN_FILE'" ;;
@@ -341,9 +346,9 @@ cmd_install_daemon() {
   user_state="$home/Library/Application Support/linux-ephemeral-runner"
   token="$user_state/github-token"
   [ -f "$token" ] || die "no token for $user at $token; as $user, write a token that can manage the organization's self-hosted runners there, mode 600"
-  [ "$(stat -f %Su "$token" 2>/dev/null || stat -c %U "$token")" = "$user" ] \
+  [ "$(file_owner "$token")" = "$user" ] \
     || die "$token must belong to $user"
-  case "$(stat -f %Lp "$token" 2>/dev/null || stat -c %a "$token")" in
+  case "$(file_mode "$token")" in
     600 | 400) ;;
     *) die "$token must be private to $user: chmod 600 it" ;;
   esac
