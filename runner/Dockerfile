@@ -33,7 +33,7 @@ RUN set -eux; \
   apt-get install -y --no-install-recommends /tmp/gh.deb \
     binutils gawk gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
     libncurses-dev libpython3-dev libsqlite3-0 libsqlite3-dev libstdc++-13-dev \
-    libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zlib1g-dev; \
+    libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zip zlib1g-dev; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
 ARG NODE_VERSION=22.23.2
