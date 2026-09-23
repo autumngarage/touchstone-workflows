@@ -142,6 +142,42 @@ fleet to another machine, install there and uninstall here
 back to GitHub-hosted runners, `gh variable delete LINUX_RUNNER --org
 autumngarage`.
 
+#### On a headless Mac that runs other CI too
+
+A LaunchAgent lives in its user's login session, and `admin:org` in a login
+keychain is readable by anything that runs as that user. On a Mac that also
+hosts a persistent macOS runner, whose jobs run branch code as their own
+user, run the fleet at boot as an account that runs nothing else, with a
+token only it can read:
+
+1. Create a standard account for the fleet (e.g. `linuxci`) and never log in
+   as it. Install Colima and the Docker CLI once (`brew install colima docker`;
+   Docker Desktop needs a login session, Colima does not).
+2. Create a fine-grained token owned by the organization with one
+   organization permission, **Self-hosted runners: read and write**, and write
+   it where the daemon reads it, private to the fleet's account:
+
+   ```bash
+   sudo -u linuxci -H bash -c 'd="$HOME/Library/Application Support/linux-ephemeral-runner"
+     mkdir -p "$d" && umask 077 && cat >"$d/github-token"'   # paste the token, then Ctrl-D
+   ```
+
+3. Build the image as that account, from a checkout it can read (the build
+   starts the account's Colima VM; `sudo` resets `PATH`, so name Homebrew's),
+   then install the daemon:
+
+   ```bash
+   sudo -u linuxci -H env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
+     LINUX_RUNNER_ENGINE=colima bash runner/linux-runner.sh build
+   sudo bash runner/linux-runner.sh install-daemon linuxci
+   bash runner/linux-runner.sh status
+   ```
+
+The daemon starts before anyone logs in and after every reboot, starts the
+Colima VM if it is down, and keeps the slots running; its log is the
+account's `~/Library/Logs/linux-ephemeral-runner.log`. `sudo bash
+runner/linux-runner.sh uninstall-daemon` removes it.
+
 A required workflow runs in the consumer repository's context and reads the
 variables visible to that repository; a repository variable overrides the
 organization's. Confirm on the first run after setting it: the job's "Set up
