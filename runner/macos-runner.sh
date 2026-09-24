@@ -35,6 +35,11 @@
 # is). A slot's runner files are copied from slot 1, so every slot runs the
 # same runner version with the same `.path` and `.env`.
 #
+# Root is used only to become USER. USER's home is writable by USER's jobs,
+# so every file operation in it -- creating, copying, removing a slot -- runs
+# as USER and can reach nothing USER cannot already reach; a slot path that
+# is a symlink is refused.
+#
 # Configuration, from the environment (defaults in parentheses):
 #   MACOS_RUNNER_ORG         organization (autumngarage)
 #   MACOS_RUNNER_NAME        slot 1's runner name; slot N is NAME-N (ci-studio)
@@ -95,6 +100,9 @@ require_user() {
   case "$1" in *[!A-Za-z0-9._-]*) die "invalid user '$1'" ;; esac
   [ -d "$HOME_ROOT/$1" ] || die "no home directory for '$1' under $HOME_ROOT"
 }
+refuse_symlink() { # path
+  [ ! -L "$1" ] || die "$1 is a symlink; a slot is a directory in the account's home"
+}
 require_count() { # value what minimum
   case "$1" in '' | *[!0-9]*) die "$2 must be a positive integer, not '$1'" ;; esac
   [ "$1" -ge "$3" ] || die "$2 must be at least $3, not $1"
@@ -113,6 +121,7 @@ cmd_install() {
   while [ "$slot" -le "$slots" ]; do
     dir="$(slot_dir "$user" "$slot")"
     name="$(slot_name "$slot")"
+    refuse_symlink "$dir"
     if [ -f "$dir/.runner" ]; then
       echo "slot $slot ($name) already registered at $dir"
       slot=$((slot + 1))
@@ -122,19 +131,16 @@ cmd_install() {
     [ -n "${MACOS_RUNNER_TOKEN:-}" ] \
       || die "slot $slot needs registering: set MACOS_RUNNER_TOKEN (see the header)"
     echo "adding slot $slot ($name) at $dir"
-    mkdir -p "$dir"
+    as_user "$user" mkdir -p "$dir" || die "could not create $dir as $user"
     # The runner's files, not slot 1's identity or state: its registration,
     # credentials, service marker, job workspace, and diagnostics stay behind.
-    rsync -a \
+    # svc.sh and runsvc.sh are left out too: config.sh writes the slot's own
+    # svc.sh, and `svc.sh install` writes its runsvc.sh.
+    as_user "$user" rsync -a \
       --exclude '/.runner' --exclude '/.credentials' --exclude '/.credentials_rsaparams' \
       --exclude '/.service' --exclude '/_work' --exclude '/_diag' \
       --exclude '/svc.sh' --exclude '/runsvc.sh' \
-      "$source/" "$dir/"
-    # svc.sh and runsvc.sh are left out too: config.sh writes the slot's own
-    # svc.sh, and `svc.sh install` writes its runsvc.sh.
-    if [ -z "${MACOS_RUNNER_AS:-}" ]; then
-      chown -R "$user" "$dir" || die "could not give $dir to $user"
-    fi
+      "$source/" "$dir/" || die "could not copy slot 1's runner files to $dir as $user"
     (cd "$dir" && as_user "$user" ./config.sh --unattended \
       --url "https://github.com/$ORG" --token "$MACOS_RUNNER_TOKEN" \
       --name "$name" --labels "$POOL" --runnergroup "$GROUP" \
@@ -156,12 +162,13 @@ cmd_uninstall_slot() {
   require_count "$slot" SLOT 2
   require_root
   dir="$(slot_dir "$user" "$slot")"
+  refuse_symlink "$dir"
   [ -f "$dir/.runner" ] || die "slot $slot is not a configured runner at $dir"
   [ -n "${MACOS_RUNNER_REMOVE_TOKEN:-}" ] || die "set MACOS_RUNNER_REMOVE_TOKEN (see the header)"
   (cd "$dir" && as_user "$user" ./svc.sh stop; as_user "$user" ./svc.sh uninstall) || true
   (cd "$dir" && as_user "$user" ./config.sh remove --token "$MACOS_RUNNER_REMOVE_TOKEN") \
     || die "config.sh could not deregister slot $slot; its files are left at $dir"
-  rm -rf "$dir"
+  as_user "$user" rm -rf "$dir" || die "slot $slot is deregistered but $dir could not be removed as $user"
   echo "slot $slot ($(slot_name "$slot")) removed"
 }
 

@@ -2,7 +2,8 @@
 # runner/macos-runner.sh (AUT-2013): a pool of macOS runner slots in one CI
 # account. Slot 1 is the existing runner and is never re-registered; added
 # slots copy its runner files but not its identity, register with the pool
-# label, and start their own LaunchAgent; install is idempotent.
+# label, and start their own LaunchAgent; install is idempotent. Every file
+# operation in the account's home runs as the account, never as root.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,11 +50,11 @@ chmod +x svc.sh
 EOF
 chmod +x "$slot1/config.sh"
 
-# Runs a command "as USER": records the user and runs it here.
+# Runs a command "as USER": records the user and the command, and runs it here.
 as_user="$tmp/as-user"
 cat >"$as_user" <<'EOF'
 #!/usr/bin/env bash
-printf 'as %s\n' "$1" >>"$FAKE_CALLS"
+printf 'as %s\n' "$*" >>"$FAKE_CALLS"
 shift
 exec "$@"
 EOF
@@ -107,8 +108,10 @@ for n in 2 3; do
     || fail "slot $n was not registered as ci-studio-$n with only the pool label: $(cat "$calls")"
   grep -q "^svc $d install$" "$calls" || fail "slot $n's LaunchAgent was not installed"
   grep -q "^svc $d start$" "$calls" || fail "slot $n's LaunchAgent was not started"
+  grep -q "^as ci mkdir -p $d$" "$calls" || fail "slot $n's directory was not created as the account"
+  grep -q "^as ci rsync -a .* $slot1/ $d/$" "$calls" || fail "slot $n's files were not copied as the account"
+  grep -q "^as ci ./config.sh " "$calls" || fail "the runner tools did not run as the account"
 done
-grep -q '^as ci$' "$calls" || fail "the runner tools did not run as the account"
 ! grep -q "^config $slot1 " "$calls" || fail "slot 1 was re-registered"
 grep -q 'slots 1..3 present for ci (2 added)' <<<"$out" || fail "the summary did not count the added slots: $out"
 grep -q "labels\\[\\]=ci-studio-pool" <<<"$out" || fail "install did not print slot 1's pool-label command"
@@ -126,6 +129,24 @@ out="$(run env MACOS_RUNNER_TOKEN=regtok FAKE_CONFIG_FAILS=1 bash "$script" inst
   && fail "a failed registration reported success"
 grep -q 'could not register slot 4' <<<"$out" || fail "the failure did not name the slot: $out"
 ok "a failed registration names the slot"
+rm -rf "$home/ci/actions-runner-4"
+
+echo "==> a slot path the account turned into a symlink is refused"
+# A job running as the account can plant a symlink where a later slot goes.
+elsewhere="$tmp/elsewhere"
+mkdir -p "$elsewhere"
+ln -s "$elsewhere" "$home/ci/actions-runner-4"
+: >"$calls"
+out="$(run env MACOS_RUNNER_TOKEN=regtok bash "$script" install ci 4 2>&1)" \
+  && fail "installed a slot through a symlink"
+grep -q 'is a symlink' <<<"$out" || fail "the refusal did not name the symlink: $out"
+[ -z "$(ls -A "$elsewhere")" ] || fail "install wrote through the symlink: $(ls -A "$elsewhere")"
+! grep -q '^config' "$calls" || fail "a slot was registered through a symlink"
+echo '{}' >"$elsewhere/.runner"
+refused "uninstalling a symlinked slot" env MACOS_RUNNER_REMOVE_TOKEN=rmtok bash "$script" uninstall-slot ci 4
+[ -f "$elsewhere/.runner" ] || fail "uninstall-slot removed files through a symlink"
+rm "$home/ci/actions-runner-4"
+ok "nothing is written, registered, or removed through a symlink"
 
 echo "==> uninstall-slot deregisters and removes one added slot"
 : >"$calls"
@@ -133,6 +154,7 @@ run bash "$script" uninstall-slot ci 3 >/dev/null 2>&1 && fail "removed a slot w
 out="$(run env MACOS_RUNNER_REMOVE_TOKEN=rmtok bash "$script" uninstall-slot ci 3)"
 [ ! -e "$home/ci/actions-runner-3" ] || fail "slot 3's files remain"
 grep -q "^config $home/ci/actions-runner-3 remove --token rmtok$" "$calls" || fail "slot 3 was not deregistered: $(cat "$calls")"
+grep -q "^as ci rm -rf $home/ci/actions-runner-3$" "$calls" || fail "slot 3 was not removed as the account"
 [ -f "$home/ci/actions-runner-2/.runner" ] || fail "removing slot 3 touched slot 2"
 ok "slot 3 stopped, deregistered, and removed; slot 2 untouched"
 
