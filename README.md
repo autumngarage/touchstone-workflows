@@ -184,3 +184,56 @@ organization's. Confirm on the first run after setting it: the job's "Set up
 job" step names the runner that took it. If the organization variable does not
 resolve there, set it per repository instead:
 `gh variable set LINUX_RUNNER -R autumngarage/<repository> --body linux-ephemeral`.
+
+### macOS runner pool (AUT-2013)
+
+The consumer workflows above never run on macOS. A consumer's own macOS
+workflow (nyx's `macos.yml`, hesperus's) runs in a CI account on the Mac,
+whose first runner (`ci-studio`) was registered by hand and is named by the
+consumer's `MACOS_RUNNER` variable. `runner/macos-runner.sh` adds a pool beside
+it: slots of single-use runners in the same account's login session, where UI
+tests have a window server, so one Mac runs several macOS jobs at once with
+no second account to maintain.
+
+Each slot asks GitHub for a just-in-time configuration labeled
+`ci-studio-pool`, starts that runner as a one-shot launchd job in the
+account's GUI domain (the keys `ci-studio`'s own service uses), and waits for
+it to exit. A job that selects `ci-studio-pool` takes whichever slot is free;
+`MACOS_RUNNER_SLOTS` sets how many there are. nyx's test shards select the
+pool through `MACOS_TEST_RUNNER=ci-studio-pool`; unsetting that variable puts
+them back on `ci-studio`. `ci-studio` alone keeps its name label, and work
+that must not overlap itself in the account selects it: cleanup that stops the
+account's processes (hesperus), and the smoke, whose macOS grants belong to
+that runner.
+
+**The account never holds an organization credential.** Its jobs can rewrite
+anything in its home, so the supervisor runs as root with a token only root
+can read, and GitHub fixes each runner's name, labels, and group: the account
+only ever receives one runner's own configuration, in the launchd job's
+environment and never as a process argument. Root does no file work in the
+account's home; the account copies `ci-studio`'s runner files into each slot
+(`tests/test-macos-runner.sh` pins both). The runners are single-use, but the
+host is shared with `ci-studio`'s persistent runner, so the pool registers
+into the same runner group, `macos`, and checks it before every registration
+as `linux-runner.sh` does: visible only to selected repositories, and holding
+only private ones.
+
+On the Mac, with the account logged in and `ci-studio` registered, give root a
+copy of the Linux fleet's token (the same one permission, **Self-hosted
+runners: read and write**), then install:
+
+```bash
+state="/Library/Application Support/com.autumngarage.macos-pool-runner"
+sudo install -d -m 700 -o root -g wheel "$state"
+sudo install -m 600 -o root -g wheel \
+  "/Users/linuxci/Library/Application Support/linux-ephemeral-runner/github-token" "$state/github-token"
+sudo bash runner/macos-runner.sh install-daemon      # MACOS_RUNNER_SLOTS=3 for more slots
+sudo bash runner/macos-runner.sh status
+gh variable set MACOS_TEST_RUNNER --repo autumngarage/nyx --body ci-studio-pool
+```
+
+The daemon starts at boot and waits for the account's login session, which
+auto-login brings back after a restart; its log is
+`/Library/Logs/com.autumngarage.macos-pool-runner.log`. `sudo bash
+runner/macos-runner.sh uninstall-daemon` stops the pool and removes its
+registrations. Rotating the token means replacing both copies.
