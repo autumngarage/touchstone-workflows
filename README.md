@@ -184,3 +184,40 @@ organization's. Confirm on the first run after setting it: the job's "Set up
 job" step names the runner that took it. If the organization variable does not
 resolve there, set it per repository instead:
 `gh variable set LINUX_RUNNER -R autumngarage/<repository> --body linux-ephemeral`.
+
+## macOS runner slots (AUT-2013)
+
+The consumer workflows above never run on macOS. A consumer's own macOS
+workflow (nyx's `macos.yml`, hesperus's) runs on a persistent self-hosted
+runner in a CI account on the Mac, named by its `MACOS_RUNNER` variable.
+`runner/macos-runner.sh` adds more runners, called slots, to that account, so
+one Mac runs several macOS jobs at once without another account to maintain:
+
+```bash
+token="$(gh api -X POST orgs/autumngarage/actions/runners/registration-token --jq .token)"
+sudo MACOS_RUNNER_TOKEN="$token" bash runner/macos-runner.sh install ci 2
+```
+
+Slot 1 is the account's existing runner (`ci-studio`) and is never
+re-registered. Slot N is `ci-studio-N` in `~ci/actions-runner-N`, with a copy
+of slot 1's runner files (same version, `.path`, and `.env`) but none of its
+registration, credentials, or work directory, and its own LaunchAgent in the
+account's login session. `install` adds only the missing slots, so raising N
+adds capacity and rerunning it changes nothing. `sudo
+MACOS_RUNNER_REMOVE_TOKEN=… bash runner/macos-runner.sh uninstall-slot ci N`
+removes one added slot.
+
+Every slot carries the pool label `ci-studio-pool`; slot 1 gets it once with
+the command `install` prints. A job that selects the pool takes whichever slot
+is free. Slot 1 alone keeps the name label `ci-studio`, and work that must not
+overlap itself in the account selects that name: cleanup that stops the
+account's processes (hesperus) and work that holds macOS privacy grants (the
+smoke, whose grants belong to one runner). Everything else may select the pool,
+for example nyx's test shards through `MACOS_TEST_RUNNER=ci-studio-pool`;
+unsetting that variable puts them back on slot 1.
+
+The slots share one trust model with slot 1: persistent runners for private
+repositories whose workflows never let fork pull requests reach them, in an
+account that holds no credential beyond each runner's own registration. They
+are not single-use and never carry `LINUX_RUNNER`'s label.
+`tests/test-macos-runner.sh` pins the installer.

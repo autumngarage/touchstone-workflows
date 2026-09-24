@@ -1447,6 +1447,9 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
   # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
     || fail "runner supervisor check failed"
+  # The macOS runner slots keep slot 1's identity out of every added slot.
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-macos-runner.sh" \
+    || fail "macOS runner slot check failed"
 fi
 
 echo "workflow contract passed"
