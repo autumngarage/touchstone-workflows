@@ -79,24 +79,19 @@ BACKOFF_MAX=300
 AGENT_ID="com.autumngarage.linux-ephemeral-runner"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# log, die, need, the token file, the runner-group check, and just-in-time
+# registration, shared with runner/macos-runner.sh.
+# shellcheck source=runner/jit.sh
+. "$here/jit.sh"
+
 state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
 host="$(hostname -s 2>/dev/null || hostname)"
 prefix="$LABEL-$host"
-
-log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
-die() {
-  printf 'ERROR: %s\n' "$*" >&2
-  exit 1
-}
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
 case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker or colima, not '$ENGINE'" ;; esac
-
-need() {
-  command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH; $2"
-}
 
 # The Docker engine the slots run containers on. Docker Desktop lives in a
 # login session, so a host with nobody logged in uses this user's Colima VM,
@@ -112,61 +107,6 @@ ensure_engine() {
       || die "colima could not start its VM; see 'colima start' as $(id -un)"
   fi
   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
-}
-
-# A file's permission bits and owner. GNU stat first: on Linux `stat -f` means
-# --file-system and succeeds with the wrong answer, while BSD stat refuses -c.
-file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
-file_owner() { stat -c %U "$1" 2>/dev/null || stat -f %Su "$1"; }
-
-# gh's credential when it cannot use a login keychain: the token file, which
-# must be private to its owner, since whoever reads it can register runners.
-load_token() {
-  local mode
-  [ -z "${GH_TOKEN:-}" ] || return 0
-  [ -n "$TOKEN_FILE" ] || return 0
-  [ -r "$TOKEN_FILE" ] || die "the token file $TOKEN_FILE is missing or unreadable"
-  mode="$(file_mode "$TOKEN_FILE")"
-  case "$mode" in
-    600 | 400) ;;
-    *) die "the token file $TOKEN_FILE is mode $mode; make it private: chmod 600 '$TOKEN_FILE'" ;;
-  esac
-  GH_TOKEN="$(tr -d '[:space:]' <"$TOKEN_FILE")"
-  [ -n "$GH_TOKEN" ] || die "the token file $TOKEN_FILE is empty"
-  export GH_TOKEN
-}
-
-# The one runner group this fleet registers into, checked as the host's trust
-# boundary: exactly one group of that name, visible only to repositories named
-# one by one, closed to public repositories, and holding only private ones. A
-# public repository takes fork pull requests; if the group ever admitted one,
-# a stranger's code could run here. Prints the group's id, or dies.
-group_id() {
-  local groups count gid repos public
-  groups="$(gh api --paginate "orgs/$ORG/actions/runner-groups" \
-    --jq ".runner_groups[] | select(.name == \"$GROUP\") | {id, visibility, allows_public_repositories} | tojson")" \
-    || die "could not list $ORG's runner groups; check 'gh auth status' for admin:org"
-  count="$(printf '%s\n' "$groups" | grep -c '"id"' || true)"
-  [ "$count" -eq 1 ] || die "expected one runner group named '$GROUP' in $ORG, found $count; create it as README.md \"Runner\" describes"
-  printf '%s' "$groups" | jq -e '.visibility == "selected" and .allows_public_repositories == false' >/dev/null \
-    || die "runner group '$GROUP' must be visible only to selected repositories and closed to public ones: $groups"
-  gid="$(printf '%s' "$groups" | jq -r '.id')"
-  repos="$(gh api --paginate "orgs/$ORG/actions/runner-groups/$gid/repositories" \
-    --jq '.repositories[] | "\(.full_name) \(.private)"')" \
-    || die "could not list the repositories of runner group '$GROUP'"
-  [ -n "$repos" ] || die "runner group '$GROUP' has no repositories; no job could reach these runners"
-  public="$(printf '%s\n' "$repos" | awk '$2 != "true" { print $1 }')"
-  [ -z "$public" ] || die "runner group '$GROUP' admits a repository that is not private: $public"
-  printf '%s\n' "$gid"
-}
-
-# Best effort: GitHub removes a single-use runner after its job, so a 404 here
-# is the normal case. A runner that never took a job would otherwise stay
-# registered, offline, until GitHub expires it.
-forget_runner() {
-  local id="$1"
-  [ -n "$id" ] || return 0
-  gh api -X DELETE "orgs/$ORG/actions/runners/$id" >/dev/null 2>&1 || true
 }
 
 run_slot() {
@@ -185,11 +125,7 @@ run_slot() {
       continue
     fi
     name="$prefix-$slot-$(date +%s)"
-    # A just-in-time registration gets only the labels it is given, not the
-    # defaults config.sh adds, and every workflow selector requires both.
-    if ! response="$(gh api -X POST "orgs/$ORG/actions/runners/generate-jitconfig" \
-      -f name="$name" -F runner_group_id="$gid" -f "labels[]=self-hosted" -f "labels[]=$LABEL" \
-      -f work_folder=_work 2>&1)"; then
+    if ! response="$(request_jit "$name" "$gid")"; then
       log "slot $slot: could not register a runner ($response); retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
@@ -284,6 +220,7 @@ cmd_install() {
   # A copy, so a checkout that later switches branches cannot change what runs.
   installed="$state_dir/linux-runner.sh"
   cp "$here/linux-runner.sh" "$installed"
+  cp "$here/jit.sh" "$state_dir/jit.sh"
   plist="$(plist_path)"
   log_file="$HOME/Library/Logs/linux-ephemeral-runner.log"
   path_value="$(dirname "$(command -v docker)"):$(dirname "$(command -v gh)"):$(dirname "$(command -v jq)"):/usr/bin:/bin:/usr/sbin:/sbin"
@@ -361,7 +298,8 @@ cmd_install_daemon() {
   # A copy, so a checkout that later switches branches cannot change what runs.
   installed="$user_state/linux-runner.sh"
   cp "$here/linux-runner.sh" "$installed"
-  chown "$user:$group" "$installed"
+  cp "$here/jit.sh" "$user_state/jit.sh"
+  chown "$user:$group" "$installed" "$user_state/jit.sh"
   log_dir="$home/Library/Logs"
   mkdir -p "$log_dir"
   chown "$user:$group" "$log_dir"
