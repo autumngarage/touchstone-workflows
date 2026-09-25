@@ -1,0 +1,32 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+#
+# This repository holds the gates themselves, and the gates deliberately
+# exclude it: review-gate.yml, validate.yml and delivery-evidence.yml all
+# carry `if: github.repository != 'autumngarage/touchstone-workflows'`, so a
+# pull request here cannot run its own modified gate to pass itself. Correct,
+# and it left this repository with no reviewer at all -- the one place in the
+# system where unreviewed code could merge was the place that defines what
+# "reviewed" means. Six pull requests landed that way on 2026-09-03.
+#
+# The reviewer therefore has to be one a pull request cannot modify. CodeRabbit
+# runs outside the repository, so nothing in a branch changes what it does.
+# Its findings arrive as review threads, and this repository already sets
+# required_review_thread_resolution, so they block the merge until answered.
+#
+# The organization default disables auto review outside a docs-review label
+# (autumngarage/coderabbit/.coderabbit.yaml). This file overrides that here.
+reviews:
+  review_status: true
+  auto_review:
+    enabled: true
+  path_instructions:
+    - path: ".github/workflows/**"
+      instructions: >-
+        These workflows are required checks pinned by exact SHA in consumer
+        rulesets, and they gate every merge in the organization. Weigh three
+        things above style. First, permissions: the gates run read-only, and a
+        step needing write is a change in posture, not a fix. Second, whether a
+        verdict could be forged -- evidence read back from a comment can be
+        posted by anything with a token, so a pass must be derived in-run.
+        Third, fail-closed: any error, timeout, malformed body or missing
+        credential must leave the gate closed, never open.
