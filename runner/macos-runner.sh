@@ -72,6 +72,10 @@ MAX_JOBS="${MACOS_RUNNER_MAX_JOBS:-}"
 POLL=10
 BACKOFF_START=15
 BACKOFF_MAX=300
+# Seconds a leftover process gets to exit on SIGTERM before SIGKILL.
+REAP_GRACE=5
+# A test seam: what signals leftovers (default: the shell's kill).
+KILL_CMD="${MACOS_RUNNER_KILL_CMD:-kill}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # log, die, need, the token file, the runner-group check, and just-in-time
@@ -164,6 +168,30 @@ exit_code() {
   printf '%s\n' "$out" | awk -F' = ' '/^[[:space:]]*last exit code = / && !done { split($2, a, ":"); print a[1]; done = 1 }'
 }
 
+# What a slot's job left running is ended before the slot's next job. A test
+# that moves its children into a session of their own escapes the process
+# group launchd ends with the job, and the runner's own cleanup misses them
+# too (actions/runner#4601); every job shares the account, so leftovers pile
+# up, and one holding a pipe or a lock is the shape of the hangs AUT-2058
+# fixed. Only processes naming this slot's work directory are touched -- the
+# trailing slash keeps pool-1 from matching pool-10 -- because another slot's
+# job is not this slot's to end (AUT-2076).
+reap_slot() {
+  local work pids
+  work="$(slot_dir "$1")/_work/"
+  pids="$(pgrep -U "$uid" -f "$work" 2>/dev/null | tr '\n' ' ' || true)"
+  [ -n "${pids// /}" ] || return 0
+  log "slot $1: ending $(printf '%s' "$pids" | wc -w | tr -d ' ') process(es) its last job left running: $pids"
+  # shellcheck disable=SC2086 # one argument per pid
+  "$KILL_CMD" -TERM $pids 2>/dev/null || true
+  sleep "$REAP_GRACE"
+  pids="$(pgrep -U "$uid" -f "$work" 2>/dev/null | tr '\n' ' ' || true)"
+  [ -n "${pids// /}" ] || return 0
+  log "slot $1: killing $pids, which ignored SIGTERM"
+  # shellcheck disable=SC2086 # one argument per pid
+  "$KILL_CMD" -KILL $pids 2>/dev/null || true
+}
+
 wait_for_job() {
   while [ "$(slot_job "$1")" = running ]; do sleep "$POLL"; done
 }
@@ -214,6 +242,7 @@ run_slot() {
     # A runner a previous supervisor started finishes its job first.
     wait_for_job "$slot"
     launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    reap_slot "$slot"
     if ! session_up; then
       log "slot $slot: $RUN_USER is not logged in; registering nothing, retrying in ${backoff}s"
       sleep "$backoff"

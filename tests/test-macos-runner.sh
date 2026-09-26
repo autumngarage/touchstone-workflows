@@ -144,6 +144,29 @@ cat >"$bin/chown" <<'EOF'
 #!/usr/bin/env bash
 printf 'chown %s\n' "$*" >>"$FAKE_CALLS"
 EOF
+# pgrep: the processes a slot's job left behind. With the leftover flag set,
+# pool slot 1 has two; one survives SIGTERM when the resist flag is set too.
+cat >"$bin/pgrep" <<'EOF'
+#!/usr/bin/env bash
+printf 'pgrep %s\n' "$*" >>"$FAKE_CALLS"
+case "$*" in
+  *"/actions-runner-pool-1/_work/")
+    [ -f "$FAKE_STATE/leftover" ] || exit 1
+    if [ -f "$FAKE_STATE/termed" ]; then
+      [ -f "$FAKE_STATE/resist" ] || exit 1
+      echo 4102
+    else
+      printf '4101\n4102\n'
+    fi
+    ;;
+  *) exit 1 ;;
+esac
+EOF
+cat >"$bin/fake-kill" <<'EOF'
+#!/usr/bin/env bash
+printf 'kill %s\n' "$*" >>"$FAKE_CALLS"
+[ "$1" != -TERM ] || touch "$FAKE_STATE/termed"
+EOF
 chmod +x "$bin"/*
 
 home="$tmp/home"
@@ -185,6 +208,7 @@ runner() {
     MACOS_RUNNER_STATE_DIR="$tmp/state" MACOS_RUNNER_TOKEN_FILE="${TOKEN_FILE:-$tmp/tok/token}" \
     MACOS_RUNNER_SLOTS="${SLOTS:-1}" MACOS_RUNNER_MAX_JOBS="${JOBS:-1}" \
     MACOS_RUNNER_DAEMON_DIR="$tmp/daemons" MACOS_RUNNER_LOG="$tmp/logs/pool.log" \
+    MACOS_RUNNER_KILL_CMD="$bin/fake-kill" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -262,6 +286,20 @@ BEFORE=leftover runner run
 [ "$rc" -eq 0 ] || fail "adopting a running job exited $rc: $(cat "$tmp/out")"
 [ "$(line_of 'sleep 10')" -lt "$(line_of 'generate-jitconfig')" ] || fail "a new runner was registered while the old one ran: $(cat "$tmp/calls")"
 ok "the slot waits for its running job before registering another"
+
+echo "==> what a slot's job left running is ended before its next job (AUT-2076)"
+FLAGS=leftover runner run
+[ "$rc" -eq 0 ] || fail "a run with leftovers exited $rc: $(cat "$tmp/out")"
+has "pgrep -U 502 -f $home/actions-runner-pool-1/_work/" "the leftovers are found by this slot's work directory"
+has 'kill -TERM 4101 4102' "the leftovers are asked to end"
+lacks '^kill -KILL' "processes that ended on SIGTERM are not killed"
+[ "$(line_of 'kill -TERM')" -lt "$(line_of 'generate-jitconfig')" ] || fail "the next runner was registered before the leftovers were ended: $(cat "$tmp/calls")"
+FLAGS="leftover resist" runner run
+has 'kill -KILL 4102' "a leftover that ignores SIGTERM is killed"
+SLOTS=2 FLAGS=leftover runner run
+grep -q "pgrep -U 502 -f $home/actions-runner-pool-2/_work/" "$tmp/calls" || fail "slot 2 was not checked for its own leftovers"
+[ "$(grep -c '^kill -TERM' "$tmp/calls")" -eq 1 ] || fail "a slot ended another slot's processes: $(grep '^kill' "$tmp/calls")"
+ok "leftovers are ended by slot, TERM then KILL, before the slot registers again"
 
 echo "==> the account must be logged in"
 FLAGS=no-session runner run
