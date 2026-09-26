@@ -150,6 +150,11 @@ cat >"$bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 printf 'pgrep %s\n' "$*" >>"$FAKE_CALLS"
 case "$*" in
+  *"Runner"*"Listener"*)
+    # The live runners: another slot's listener, when one is running.
+    [ -f "$FAKE_STATE/foreign" ] && echo 7001
+    exit 0
+    ;;
   *"/actions-runner-pool-1/_work/")
     [ -f "$FAKE_STATE/leftover" ] || exit 1
     if [ -f "$FAKE_STATE/termed" ]; then
@@ -157,9 +162,23 @@ case "$*" in
       echo 4102
     else
       printf '4101\n4102\n'
+      # A running job on another slot whose arguments name this slot's path.
+      [ -f "$FAKE_STATE/foreign" ] && echo 4103
     fi
     ;;
   *) exit 1 ;;
+esac
+EOF
+# ps -o ppid= -p PID: 4101 and 4102 are orphans; 4103 runs under the live
+# listener 7001 (through its worker 7002).
+cat >"$bin/ps" <<'EOF'
+#!/usr/bin/env bash
+pid="${!#}"
+case "$pid" in
+  4101 | 4102 | 7001) echo 1 ;;
+  4103) echo 7002 ;;
+  7002) echo 7001 ;;
+  *) echo 1 ;;
 esac
 EOF
 cat >"$bin/fake-kill" <<'EOF'
@@ -299,6 +318,11 @@ has 'kill -KILL 4102' "a leftover that ignores SIGTERM is killed"
 SLOTS=2 FLAGS=leftover runner run
 grep -q "pgrep -U 502 -f $home/actions-runner-pool-2/_work/" "$tmp/calls" || fail "slot 2 was not checked for its own leftovers"
 [ "$(grep -c '^kill -TERM' "$tmp/calls")" -eq 1 ] || fail "a slot ended another slot's processes: $(grep '^kill' "$tmp/calls")"
+# A process whose arguments name this slot's work directory but that runs
+# under another slot's live runner belongs to a running job: never ended.
+FLAGS="leftover foreign" runner run
+has 'kill -TERM 4101 4102' "the orphaned leftovers are still ended"
+grep '^kill' "$tmp/calls" | grep -q 4103 && fail "a process under another slot's live runner was signalled: $(grep '^kill' "$tmp/calls")"
 ok "leftovers are ended by slot, TERM then KILL, before the slot registers again"
 
 echo "==> the account must be logged in"
