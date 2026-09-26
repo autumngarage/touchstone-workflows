@@ -234,6 +234,9 @@ gh variable set MACOS_TEST_RUNNER --repo autumngarage/nyx --body ci-studio-pool
 
 The daemon starts at boot and waits for the account's login session, which
 auto-login brings back after a restart; its log is
-`/Library/Logs/com.autumngarage.macos-pool-runner.log`. `sudo bash
+`/Library/Logs/com.autumngarage.macos-pool-runner.log`. After each job, and before the slot registers its next runner, the
+supervisor ends any process in the account that still names that slot's work
+directory: a test's children can outlive the job's own process group, and
+every job shares the account (AUT-2076). `sudo bash
 runner/macos-runner.sh uninstall-daemon` stops the pool and removes its
 registrations. Rotating the token means replacing both copies.

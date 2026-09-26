@@ -72,6 +72,10 @@ MAX_JOBS="${MACOS_RUNNER_MAX_JOBS:-}"
 POLL=10
 BACKOFF_START=15
 BACKOFF_MAX=300
+# Seconds a leftover process gets to exit on SIGTERM before SIGKILL.
+REAP_GRACE=5
+# A test seam: what signals leftovers (default: the shell's kill).
+KILL_CMD="${MACOS_RUNNER_KILL_CMD:-kill}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # log, die, need, the token file, the runner-group check, and just-in-time
@@ -164,6 +168,58 @@ exit_code() {
   printf '%s\n' "$out" | awk -F' = ' '/^[[:space:]]*last exit code = / && !done { split($2, a, ":"); print a[1]; done = 1 }'
 }
 
+# What a slot's job left running is ended before the slot's next job. A test
+# that moves its children into a session of their own escapes the process
+# group launchd ends with the job, and the runner's own cleanup misses them
+# too (actions/runner#4601); every job shares the account, so leftovers pile
+# up, and one holding a pipe or a lock is the shape of the hangs AUT-2058
+# fixed (AUT-2076).
+#
+# A command line naming this slot's work directory is a candidate, not a
+# verdict: every runner shares the account, so another slot's running job --
+# or ci-studio's -- could name this path in its arguments. What makes a
+# process a leftover is provenance: a running job's processes all descend
+# from its live runner, while a leftover of this slot's ended job has none
+# above it (this slot's runner has exited by now). So a candidate is ended
+# only when no live runner process of any slot is among its ancestors. The
+# trailing slash keeps pool-1 from matching pool-10.
+live_runner_pids() {
+  pgrep -U "$uid" -f '/actions-runner[^/]*/(bin/Runner\.(Listener|Worker)|bin/RunnerService\.js|run\.sh|run-helper\.sh|runsvc\.sh)' 2>/dev/null | tr '\n' ' ' || true
+}
+# under_live_runner PID ROOTS: whether PID or an ancestor is one of ROOTS.
+under_live_runner() {
+  local p="$1" roots="$2" hops=0
+  while [ -n "$p" ] && [ "$p" -gt 1 ] && [ "$hops" -lt 64 ]; do
+    case " $roots " in *" $p "*) return 0 ;; esac
+    p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    hops=$((hops + 1))
+  done
+  return 1
+}
+leftovers() { # slot
+  local work roots pid out=""
+  work="$(slot_dir "$1")/_work/"
+  roots="$(live_runner_pids)"
+  for pid in $(pgrep -U "$uid" -f "$work" 2>/dev/null || true); do
+    under_live_runner "$pid" "$roots" || out="$out $pid"
+  done
+  printf '%s' "${out# }"
+}
+reap_slot() {
+  local pids
+  pids="$(leftovers "$1")"
+  [ -n "$pids" ] || return 0
+  log "slot $1: ending $(printf '%s' "$pids" | wc -w | tr -d ' ') process(es) its last job left running: $pids"
+  # shellcheck disable=SC2086 # one argument per pid
+  "$KILL_CMD" -TERM $pids 2>/dev/null || true
+  sleep "$REAP_GRACE"
+  pids="$(leftovers "$1")"
+  [ -n "$pids" ] || return 0
+  log "slot $1: killing $pids, which ignored SIGTERM"
+  # shellcheck disable=SC2086 # one argument per pid
+  "$KILL_CMD" -KILL $pids 2>/dev/null || true
+}
+
 wait_for_job() {
   while [ "$(slot_job "$1")" = running ]; do sleep "$POLL"; done
 }
@@ -214,6 +270,7 @@ run_slot() {
     # A runner a previous supervisor started finishes its job first.
     wait_for_job "$slot"
     launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+    reap_slot "$slot"
     if ! session_up; then
       log "slot $slot: $RUN_USER is not logged in; registering nothing, retrying in ${backoff}s"
       sleep "$backoff"
