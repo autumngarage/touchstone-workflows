@@ -240,3 +240,12 @@ directory: a test's children can outlive the job's own process group, and
 every job shares the account (AUT-2076). `sudo bash
 runner/macos-runner.sh uninstall-daemon` stops the pool and removes its
 registrations. Rotating the token means replacing both copies.
+
+### Disposable macOS release runner (AUT-2077)
+
+`runner/macos-release-vm.sh` runs one JIT runner in a fresh, digest-pinned
+Tart guest and removes the guest afterward. It reuses the registration
+contract in `runner/jit.sh`. Its setup, trust boundary, and interrupted-run
+recovery are documented in [runner/release-vm.md](runner/release-vm.md).
+This is a release-runner pilot, not a migration of the shared test pool;
+enabling signing credentials requires the rollout checks in that document.
