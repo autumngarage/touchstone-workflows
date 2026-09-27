@@ -1451,6 +1451,8 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
   # CI account whose jobs share its host.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-macos-runner.sh" \
     || fail "macOS runner pool check failed"
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-release-vm.py" \
+    || fail "disposable release VM check failed"
 fi
 
 echo "workflow contract passed"
