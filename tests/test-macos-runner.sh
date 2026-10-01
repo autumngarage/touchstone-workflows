@@ -186,6 +186,27 @@ cat >"$bin/fake-kill" <<'EOF'
 printf 'kill %s\n' "$*" >>"$FAKE_CALLS"
 [ "$1" != -TERM ] || touch "$FAKE_STATE/termed"
 EOF
+# The lost-session probes and the restart itself: the console's owner (root
+# is the login window), the boot time, the auto-login account, and a restart
+# that only records that it was asked for.
+cat >"$bin/fake-console" <<'EOF'
+#!/usr/bin/env bash
+[ ! -f "$FAKE_STATE/console-fails" ] || exit 1
+cat "$FAKE_STATE/console" 2>/dev/null || echo root
+EOF
+cat >"$bin/fake-boot" <<'EOF'
+#!/usr/bin/env bash
+cat "$FAKE_STATE/boot" 2>/dev/null || echo 0
+EOF
+cat >"$bin/fake-autologin" <<'EOF'
+#!/usr/bin/env bash
+[ ! -f "$FAKE_STATE/no-autologin" ] || exit 1
+cat "$FAKE_STATE/autologin" 2>/dev/null || echo ci
+EOF
+cat >"$bin/fake-restart" <<'EOF'
+#!/usr/bin/env bash
+printf 'restart %s\n' "$*" >>"$FAKE_CALLS"
+EOF
 chmod +x "$bin"/*
 
 home="$tmp/home"
@@ -228,6 +249,9 @@ runner() {
     MACOS_RUNNER_SLOTS="${SLOTS:-1}" MACOS_RUNNER_MAX_JOBS="${JOBS:-1}" \
     MACOS_RUNNER_DAEMON_DIR="$tmp/daemons" MACOS_RUNNER_LOG="$tmp/logs/pool.log" \
     MACOS_RUNNER_KILL_CMD="$bin/fake-kill" \
+    MACOS_RUNNER_RESTART_AFTER="${RESTART_AFTER:-}" MACOS_RUNNER_RESTART_CMD="$bin/fake-restart now" \
+    MACOS_RUNNER_CONSOLE_USER_CMD="$bin/fake-console" MACOS_RUNNER_BOOT_TIME_CMD="$bin/fake-boot" \
+    MACOS_RUNNER_AUTOLOGIN_CMD="$bin/fake-autologin" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -333,6 +357,84 @@ FLAGS=session-drops runner run
 [ "$rc" -eq 0 ] || fail "a session that returns exited $rc: $(cat "$tmp/out")"
 [ "$(line_of 'sleep 15')" -lt "$(line_of 'generate-jitconfig')" ] || fail "a runner was registered with no session: $(cat "$tmp/calls")"
 ok "no session registers nothing; a slot waits for the session to return"
+
+echo "==> a lost session restarts the Mac only when that is safe and useful"
+now="$(date +%s)"
+lost_at() { echo "$1" >"$tmp/state/session-lost-since"; }
+long_lost() { lost_at $((now - 900)); }
+# Off unless asked for: the default never restarts, however long it has been.
+FLAGS=no-session BEFORE=long_lost runner run
+refused 'ci is not logged in' "a lost session with no restart configured"
+lacks 'restart' "the default"
+# Asked for, but only just lost: the moment is remembered, nothing restarts.
+FLAGS=no-session RESTART_AFTER=300 runner run
+lacks 'restart' "a session lost a moment ago"
+[ "$(cat "$tmp/state/session-lost-since")" -ge "$now" ] || fail "the moment the session was lost was not recorded"
+# Lost for longer than the limit, nobody at the console, auto-login is the
+# account's: one restart, recorded, and the mark cleared so the next boot
+# starts its own count.
+FLAGS=no-session RESTART_AFTER=300 BEFORE=long_lost runner run
+has 'restart now' "a session lost for 900s"
+[ "$(grep -c '^restart' "$tmp/calls")" -eq 1 ] || fail "restarted more than once: $(grep '^restart' "$tmp/calls")"
+[ "$(grep -c . "$tmp/state/restarts")" -eq 1 ] || fail "the restart was not recorded"
+[ ! -e "$tmp/state/session-lost-since" ] || fail "the mark survived the restart; the next boot would restart again at once"
+grep -q 'restarting the Mac so auto-login restores it' "$tmp/logs/pool.log" 2>/dev/null \
+  || grep -q 'restarting the Mac so auto-login restores it' "$tmp/out" || fail "the restart was not logged: $(cat "$tmp/out")"
+# Never under a person.
+someone() { long_lost; echo henry >"$tmp/fake/console"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=someone runner run
+lacks 'restart' "someone at the console"
+grep -q 'henry is at the console' "$tmp/out" || fail "the reason was not logged: $(cat "$tmp/out")"
+# An owner that cannot be read is not "nobody": an empty answer and a probe
+# that fails both hold the restart.
+unreadable() { long_lost; : >"$tmp/fake/console"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=unreadable runner run
+lacks 'restart' "a console owner that reads as empty"
+grep -q "console's owner could not be read" "$tmp/out" || fail "the unreadable console was not named: $(cat "$tmp/out")"
+FLAGS="no-session console-fails" RESTART_AFTER=300 BEFORE=long_lost runner run
+lacks 'restart' "a console probe that fails"
+# Never when a restart would not bring the session back.
+other_autologin() { long_lost; echo henry >"$tmp/fake/autologin"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=other_autologin runner run
+lacks 'restart' "auto-login for another account"
+FLAGS="no-session no-autologin" RESTART_AFTER=300 BEFORE=long_lost runner run
+lacks 'restart' "auto-login off"
+grep -q "auto-login is 'off'" "$tmp/out" || fail "auto-login off was not named: $(cat "$tmp/out")"
+# Never a loop: two restarts in the last day and it waits for a person; a
+# restart older than a day does not count.
+twice() { long_lost; printf '%s\n%s\n' $((now - 7200)) $((now - 3600)) >"$tmp/state/restarts"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=twice runner run
+lacks 'restart' "two restarts already today"
+grep -q 'already restarted 2 times' "$tmp/out" || fail "the restart limit was not named: $(cat "$tmp/out")"
+once_and_old() { long_lost; printf '%s\n%s\n' $((now - 200000)) $((now - 3600)) >"$tmp/state/restarts"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=once_and_old runner run
+has 'restart now' "one restart today and one two days ago"
+# A mark from before this boot is not this boot's: the count starts at boot.
+just_booted() { long_lost; echo $((now - 60)) >"$tmp/fake/boot"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=just_booted runner run
+lacks 'restart' "a mark older than the boot, one minute after boot"
+[ "$(cat "$tmp/state/session-lost-since")" -eq $((now - 60)) ] || fail "the mark was not moved up to the boot time: $(cat "$tmp/state/session-lost-since")"
+# A session that is there clears the mark.
+RESTART_AFTER=300 BEFORE=long_lost runner run
+[ "$rc" -eq 0 ] || fail "a run with a session exited $rc: $(cat "$tmp/out")"
+[ ! -e "$tmp/state/session-lost-since" ] || fail "a returned session left its mark"
+lacks 'restart' "a session that is up"
+# A session lost and back before the limit leaves no mark: the next loss
+# counts from its own start, not from the earlier one.
+FLAGS=session-drops RESTART_AFTER=300 runner run
+[ "$rc" -eq 0 ] || fail "a session that returns exited $rc: $(cat "$tmp/out")"
+lacks 'restart' "a session that came back before the limit"
+[ ! -e "$tmp/state/session-lost-since" ] || fail "a session that came back left its mark for the next loss to inherit"
+# The setting is a number, and installing it needs the account's auto-login.
+RESTART_AFTER=soon runner run
+refused 'must be a number of seconds' "a restart setting that is not a number"
+FLAGS=no-autologin RESTART_AFTER=300 runner install-daemon
+refused 'needs auto-login set to ci' "installing the restart without auto-login"
+RESTART_AFTER=300 runner install-daemon
+[ "$rc" -eq 0 ] || fail "install-daemon with a restart setting exited $rc: $(cat "$tmp/out")"
+grep -q '<key>MACOS_RUNNER_RESTART_AFTER</key><string>300</string>' "$tmp/daemons/com.autumngarage.macos-pool-runner.plist" \
+  || fail "the daemon was not given the restart setting"
+ok "a lost session restarts once, never under a person, never without auto-login, never in a loop"
 
 echo "==> failures back off instead of spinning"
 FLAGS=jit-fails runner run

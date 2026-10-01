@@ -240,3 +240,15 @@ directory: a test's children can outlive the job's own process group, and
 every job shares the account (AUT-2076). `sudo bash
 runner/macos-runner.sh uninstall-daemon` stops the pool and removes its
 registrations. Rotating the token means replacing both copies.
+
+**A lost session restarts the Mac, when asked to (AUT-2179).** The runners live
+in the account's login session, and macOS ends every session when its window
+server dies. Auto-login only happens at boot, so the pool and `ci-studio` then
+stay down until a person logs the account in, and a login without a restart
+leaves the account's per-user daemons from the old session, which breaks
+xcodebuild's app launches. With `MACOS_RUNNER_RESTART_AFTER=<seconds>` in the
+environment of `install-daemon`, the supervisor restarts the Mac once the
+account has had no session for that long. It does so only when nobody is at
+the console, auto-login is configured for the account, and it has restarted
+fewer than twice in the last 24 hours; otherwise it logs why it is waiting.
+The default is 0: never restart.
