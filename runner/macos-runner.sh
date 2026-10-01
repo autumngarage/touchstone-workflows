@@ -50,6 +50,23 @@
 #   MACOS_RUNNER_TOKEN_FILE the GitHub token, private to root (STATE_DIR/github-token);
 #                           the kind linux-runner.sh uses: a fine-grained token with
 #                           the organization permission "Self-hosted runners: read and write"
+#   MACOS_RUNNER_RESTART_AFTER
+#                           seconds USER may be without a login session before the
+#                           supervisor restarts the Mac (0, the default: never); see
+#                           "A lost session" below
+#
+# A lost session. The runners need USER's login session, and macOS ends every
+# session when its window server dies: on 2026-09-30 a watchdog killed
+# WindowServer, auto-login only happens at boot, and the pool and the first
+# runner were down for nine hours until a person logged USER in -- which then
+# left the session half-working, because USER's per-user daemons were the old
+# session's. Only a restart brings back a clean session by itself. So with
+# MACOS_RUNNER_RESTART_AFTER set, the supervisor restarts the Mac once USER has
+# had no session for that long, and only when a restart is both safe and
+# useful: nobody is at the console (its owner is root, the login window),
+# auto-login is configured for USER, and it has restarted fewer than
+# RESTART_LIMIT times in the last day, so a Mac whose auto-login is broken is
+# left for a person instead of restarting forever.
 #
 # Runs under macOS's /bin/bash 3.2: no associative arrays, mapfile, or wait -n.
 
@@ -76,6 +93,15 @@ BACKOFF_MAX=300
 REAP_GRACE=5
 # A test seam: what signals leftovers (default: the shell's kill).
 KILL_CMD="${MACOS_RUNNER_KILL_CMD:-kill}"
+RESTART_AFTER="${MACOS_RUNNER_RESTART_AFTER:-0}"
+# Automatic restarts allowed in any 24 hours.
+RESTART_LIMIT=2
+# Test seams: what restarts the Mac, and what reports the console's owner, the
+# boot time in epoch seconds, and the auto-login account.
+RESTART_CMD="${MACOS_RUNNER_RESTART_CMD:-shutdown -r now}"
+CONSOLE_USER_CMD="${MACOS_RUNNER_CONSOLE_USER_CMD:-stat -f %Su /dev/console}"
+BOOT_TIME_CMD="${MACOS_RUNNER_BOOT_TIME_CMD:-}"
+AUTOLOGIN_CMD="${MACOS_RUNNER_AUTOLOGIN_CMD:-defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # log, die, need, the token file, the runner-group check, and just-in-time
@@ -86,6 +112,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 case "$SLOTS" in '' | *[!0-9]* | 0) die "MACOS_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
 case "$MAX_JOBS" in *[!0-9]*) die "MACOS_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$RUN_USER" in '' | *[!A-Za-z0-9._-]*) die "MACOS_RUNNER_USER must be an account name, not '$RUN_USER'" ;; esac
+case "$RESTART_AFTER" in '' | *[!0-9]*) die "MACOS_RUNNER_RESTART_AFTER must be a number of seconds, not '$RESTART_AFTER'" ;; esac
 
 require_root() {
   [ "$(id -u)" -eq 0 ] || die "$1 needs root; run it with sudo"
@@ -146,6 +173,75 @@ prepare_slot() {
 # A logged-in account has a GUI domain; without one there is no window
 # server for UI tests, and nothing to start a runner in.
 session_up() { launchctl print "gui/$uid" >/dev/null 2>&1; }
+
+console_user() { $CONSOLE_USER_CMD 2>/dev/null || true; }
+autologin_user() { $AUTOLOGIN_CMD 2>/dev/null || true; }
+boot_time() {
+  if [ -n "$BOOT_TIME_CMD" ]; then
+    $BOOT_TIME_CMD 2>/dev/null || true
+  else
+    sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9][0-9]*\).*/\1/p'
+  fi
+}
+
+# Why a lost session is not being restarted, logged once per reason rather
+# than on every look.
+hold_restart() {
+  [ "$(cat "$state_dir/session-lost-reason" 2>/dev/null || true)" = "$1" ] && return 0
+  printf '%s\n' "$1" >"$state_dir/session-lost-reason"
+  log "$RUN_USER has no login session; not restarting the Mac: $1"
+}
+
+# USER has no login session. Remember since when, and restart the Mac once
+# that has lasted RESTART_AFTER seconds and a restart is safe and useful (see
+# "A lost session" above). The invariant: never restart under a person, never
+# when auto-login would not bring USER back, never more than RESTART_LIMIT
+# times a day.
+session_lost() {
+  local now since boot lost auto owner recent stamp
+  [ "$RESTART_AFTER" -gt 0 ] || return 0
+  now="$(date +%s)"
+  since="$(cat "$state_dir/session-lost-since" 2>/dev/null || true)"
+  case "$since" in '' | *[!0-9]*) since="$now" ;; esac
+  # A mark from before this boot says nothing about this boot's session: at
+  # boot the daemon starts before auto-login has finished.
+  boot="$(boot_time)"
+  case "$boot" in '' | *[!0-9]*) boot=0 ;; esac
+  [ "$since" -ge "$boot" ] || since="$boot"
+  printf '%s\n' "$since" >"$state_dir/session-lost-since"
+  lost=$((now - since))
+  [ "$lost" -ge "$RESTART_AFTER" ] || return 0
+  auto="$(autologin_user)"
+  if [ "$auto" != "$RUN_USER" ]; then
+    hold_restart "auto-login is '${auto:-off}', not $RUN_USER, so a restart would not bring the session back"
+    return 0
+  fi
+  owner="$(console_user)"
+  case "$owner" in
+    '' | root | loginwindow | _windowserver) ;;
+    *)
+      hold_restart "$owner is at the console"
+      return 0
+      ;;
+  esac
+  recent=0
+  if [ -f "$state_dir/restarts" ]; then
+    while read -r stamp; do
+      case "$stamp" in '' | *[!0-9]*) continue ;; esac
+      [ $((now - stamp)) -ge 86400 ] || recent=$((recent + 1))
+    done <"$state_dir/restarts"
+  fi
+  if [ "$recent" -ge "$RESTART_LIMIT" ]; then
+    hold_restart "it has already restarted $recent times in the last 24 hours; $RUN_USER's auto-login needs a person"
+    return 0
+  fi
+  printf '%s\n' "$now" >>"$state_dir/restarts"
+  rm -f "$state_dir/session-lost-since" "$state_dir/session-lost-reason"
+  log "$RUN_USER has had no login session for ${lost}s and nobody is at the console; restarting the Mac so auto-login restores it"
+  $RESTART_CMD || log "the restart command failed: $RESTART_CMD"
+}
+
+session_back() { rm -f "$state_dir/session-lost-since" "$state_dir/session-lost-reason"; }
 
 # The slot's launchd job: running (or about to start), done, or absent. The
 # job's own state is the first `state =` line launchctl prints.
@@ -272,6 +368,9 @@ run_slot() {
     launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
     reap_slot "$slot"
     if ! session_up; then
+      # One slot speaks for the pool: two slots reading the mark at the same
+      # moment would otherwise each restart and each count against the limit.
+      [ "$slot" -ne 1 ] || session_lost
       log "slot $slot: $RUN_USER is not logged in; registering nothing, retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
@@ -372,10 +471,16 @@ cmd_run() {
   load_token
   resolve_user
   refuse_symlinked_slots
-  session_up || die "$RUN_USER is not logged in; the pool's runners start in $RUN_USER's login session"
-  gid="$(group_id)"
   mkdir -p "$state_dir"
   chmod 700 "$state_dir"
+  # launchd starts this again a minute after it exits, so a session that
+  # stays lost is looked at once a minute until it returns or the Mac restarts.
+  if ! session_up; then
+    session_lost
+    die "$RUN_USER is not logged in; the pool's runners start in $RUN_USER's login session"
+  fi
+  session_back
+  gid="$(group_id)"
   trap stop_slots INT TERM
   log "supervising $SLOTS slot(s) for label $LABEL in $ORG runner group $GROUP ($gid) as $RUN_USER"
   slot=1
@@ -408,6 +513,10 @@ cmd_install_daemon() {
   # The token and the group, checked now rather than in the daemon's log.
   load_token
   group_id >/dev/null
+  # A restart only restores the session when auto-login is USER's.
+  if [ "$RESTART_AFTER" -gt 0 ] && [ "$(autologin_user)" != "$RUN_USER" ]; then
+    die "MACOS_RUNNER_RESTART_AFTER needs auto-login set to $RUN_USER (it is '$(autologin_user)'): a restart would not bring $RUN_USER's session back"
+  fi
   # A copy, so a checkout that later switches branches cannot change what runs.
   cp "$here/macos-runner.sh" "$here/jit.sh" "$state_dir/"
   plist="$(daemon_plist_path)"
@@ -434,6 +543,7 @@ cmd_install_daemon() {
     <key>MACOS_RUNNER_USER</key><string>$RUN_USER</string>
     <key>MACOS_RUNNER_STATE_DIR</key><string>$state_dir</string>
     <key>MACOS_RUNNER_TOKEN_FILE</key><string>$TOKEN_FILE</string>
+    <key>MACOS_RUNNER_RESTART_AFTER</key><string>$RESTART_AFTER</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -448,7 +558,11 @@ EOF
   launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
   launchctl bootstrap system "$plist" \
     || die "launchctl could not load $plist"
-  log "installed $AGENT_ID: $SLOTS slot(s) for $RUN_USER; logs in $LOG_FILE"
+  if [ "$RESTART_AFTER" -gt 0 ]; then
+    log "installed $AGENT_ID: $SLOTS slot(s) for $RUN_USER, restarting the Mac after ${RESTART_AFTER}s without $RUN_USER's session; logs in $LOG_FILE"
+  else
+    log "installed $AGENT_ID: $SLOTS slot(s) for $RUN_USER; logs in $LOG_FILE"
+  fi
 }
 
 cmd_uninstall_daemon() {
@@ -466,6 +580,11 @@ cmd_status() {
   launchctl print "system/$AGENT_ID" 2>/dev/null | grep -E '^\s*(state|pid|last exit code) =' \
     || echo "the daemon $AGENT_ID is not loaded"
   resolve_user
+  if [ "$RESTART_AFTER" -gt 0 ]; then
+    echo "restart: after ${RESTART_AFTER}s without $RUN_USER's session (auto-login: $(autologin_user); console: $(console_user); restarts recorded: $(grep -c . "$state_dir/restarts" 2>/dev/null || echo 0))"
+  else
+    echo "restart: never (MACOS_RUNNER_RESTART_AFTER is 0)"
+  fi
   slot=1
   while [ "$slot" -le "$SLOTS" ]; do
     echo "slot $slot: $(slot_job "$slot")"
