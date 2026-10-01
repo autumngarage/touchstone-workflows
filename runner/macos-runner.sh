@@ -63,7 +63,8 @@
 # session's. Only a restart brings back a clean session by itself. So with
 # MACOS_RUNNER_RESTART_AFTER set, the supervisor restarts the Mac once USER has
 # had no session for that long, and only when a restart is both safe and
-# useful: nobody is at the console (its owner is root, the login window),
+# useful: nobody is at the console (its owner reads as root, the login window;
+# an owner that cannot be read holds the restart),
 # auto-login is configured for USER, and it has restarted fewer than
 # RESTART_LIMIT times in the last day, so a Mac whose auto-login is broken is
 # left for a person instead of restarting forever.
@@ -216,9 +217,15 @@ session_lost() {
     hold_restart "auto-login is '${auto:-off}', not $RUN_USER, so a restart would not bring the session back"
     return 0
   fi
+  # Only the login window authorizes a restart. An owner that cannot be read
+  # is not proof that nobody is there.
   owner="$(console_user)"
   case "$owner" in
-    '' | root | loginwindow | _windowserver) ;;
+    root) ;;
+    '')
+      hold_restart "the console's owner could not be read"
+      return 0
+      ;;
     *)
       hold_restart "$owner is at the console"
       return 0
@@ -376,6 +383,9 @@ run_slot() {
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
+    # The session is here: a loss that ended before the limit leaves no mark
+    # for the next loss to inherit.
+    [ "$slot" -ne 1 ] || session_back
     if ! prepare_slot "$slot"; then
       log "slot $slot: $RUN_USER could not copy the runner's files; retrying in ${backoff}s"
       sleep "$backoff"

@@ -191,6 +191,7 @@ EOF
 # that only records that it was asked for.
 cat >"$bin/fake-console" <<'EOF'
 #!/usr/bin/env bash
+[ ! -f "$FAKE_STATE/console-fails" ] || exit 1
 cat "$FAKE_STATE/console" 2>/dev/null || echo root
 EOF
 cat >"$bin/fake-boot" <<'EOF'
@@ -384,6 +385,14 @@ someone() { long_lost; echo henry >"$tmp/fake/console"; }
 FLAGS=no-session RESTART_AFTER=300 BEFORE=someone runner run
 lacks 'restart' "someone at the console"
 grep -q 'henry is at the console' "$tmp/out" || fail "the reason was not logged: $(cat "$tmp/out")"
+# An owner that cannot be read is not "nobody": an empty answer and a probe
+# that fails both hold the restart.
+unreadable() { long_lost; : >"$tmp/fake/console"; }
+FLAGS=no-session RESTART_AFTER=300 BEFORE=unreadable runner run
+lacks 'restart' "a console owner that reads as empty"
+grep -q "console's owner could not be read" "$tmp/out" || fail "the unreadable console was not named: $(cat "$tmp/out")"
+FLAGS="no-session console-fails" RESTART_AFTER=300 BEFORE=long_lost runner run
+lacks 'restart' "a console probe that fails"
 # Never when a restart would not bring the session back.
 other_autologin() { long_lost; echo henry >"$tmp/fake/autologin"; }
 FLAGS=no-session RESTART_AFTER=300 BEFORE=other_autologin runner run
@@ -410,6 +419,12 @@ RESTART_AFTER=300 BEFORE=long_lost runner run
 [ "$rc" -eq 0 ] || fail "a run with a session exited $rc: $(cat "$tmp/out")"
 [ ! -e "$tmp/state/session-lost-since" ] || fail "a returned session left its mark"
 lacks 'restart' "a session that is up"
+# A session lost and back before the limit leaves no mark: the next loss
+# counts from its own start, not from the earlier one.
+FLAGS=session-drops RESTART_AFTER=300 runner run
+[ "$rc" -eq 0 ] || fail "a session that returns exited $rc: $(cat "$tmp/out")"
+lacks 'restart' "a session that came back before the limit"
+[ ! -e "$tmp/state/session-lost-since" ] || fail "a session that came back left its mark for the next loss to inherit"
 # The setting is a number, and installing it needs the account's auto-login.
 RESTART_AFTER=soon runner run
 refused 'must be a number of seconds' "a restart setting that is not a number"
