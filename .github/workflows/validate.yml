@@ -11,6 +11,18 @@ on:
   # Consumers may invoke this same validator on their default branch to
   # produce a cache that later PR and merge-queue runs can restore.
   workflow_call:
+    inputs:
+      # For the cache seed alone. A seed that starts with no cache to restore
+      # (a new runner architecture, a changed package graph) builds everything
+      # from nothing, and on a hosted runner that takes longer than a pull
+      # request's limit; the limit then cancels the only run that could have
+      # saved the cache, and every later run starts just as cold (AUT-2174).
+      # Pull requests, pushes, and the merge queue never pass an input, so
+      # they keep the default.
+      timeout_minutes:
+        description: Job time limit in minutes. Raise it only for a cache seed that may build cold.
+        type: number
+        default: 20
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -76,7 +88,7 @@ jobs:
     # throwaway container, and nothing else (AUT-1596). See "Runner" in
     # README.md.
     runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
