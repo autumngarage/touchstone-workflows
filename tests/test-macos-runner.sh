@@ -207,6 +207,20 @@ cat >"$bin/fake-restart" <<'EOF'
 #!/usr/bin/env bash
 printf 'restart %s\n' "$*" >>"$FAKE_CALLS"
 EOF
+# A login session older than the window server: exit 0 says so.
+cat >"$bin/fake-stale" <<'EOF'
+#!/usr/bin/env bash
+# stale-while-running: fresh when the supervisor starts and when the slot
+# registers its runner, stale from the third look on, which is the slot
+# waiting on its job.
+if [ -f "$FAKE_STATE/stale-while-running" ]; then
+  count="$(cat "$FAKE_STATE/stale-count" 2>/dev/null || echo 0)"
+  echo $((count + 1)) >"$FAKE_STATE/stale-count"
+  [ "$count" -ge 2 ]
+  exit
+fi
+[ -f "$FAKE_STATE/stale-session" ]
+EOF
 chmod +x "$bin"/*
 
 home="$tmp/home"
@@ -252,6 +266,7 @@ runner() {
     MACOS_RUNNER_RESTART_AFTER="${RESTART_AFTER:-}" MACOS_RUNNER_RESTART_CMD="$bin/fake-restart now" \
     MACOS_RUNNER_CONSOLE_USER_CMD="$bin/fake-console" MACOS_RUNNER_BOOT_TIME_CMD="$bin/fake-boot" \
     MACOS_RUNNER_AUTOLOGIN_CMD="$bin/fake-autologin" \
+    MACOS_RUNNER_SESSION_STALE_CMD="$bin/fake-stale" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -419,6 +434,31 @@ RESTART_AFTER=300 BEFORE=long_lost runner run
 [ "$rc" -eq 0 ] || fail "a run with a session exited $rc: $(cat "$tmp/out")"
 [ ! -e "$tmp/state/session-lost-since" ] || fail "a returned session left its mark"
 lacks 'restart' "a session that is up"
+# A session that outlived its window server is lost too (AUT-2255): launchd
+# still has the account's domain, and nothing in it can reach the display.
+# Nothing is registered into it, the log says which kind of loss it is, and
+# the restart follows the same rules.
+FLAGS=stale-session runner run
+refused 'older than the window server' "a session that predates the window server"
+lacks 'generate-jitconfig' "a stale session"
+lacks 'restart' "a stale session with no restart configured"
+FLAGS=stale-session RESTART_AFTER=300 runner run
+lacks 'restart' "a session that went stale a moment ago"
+[ "$(cat "$tmp/state/session-lost-since")" -ge "$now" ] || fail "the moment the session went stale was not recorded"
+FLAGS=stale-session RESTART_AFTER=300 BEFORE=long_lost runner run
+has 'restart now' "a session stale for 900s"
+[ "$(grep -c '^restart' "$tmp/calls")" -eq 1 ] || fail "a stale session restarted more than once: $(grep '^restart' "$tmp/calls")"
+grep -q 'older than the window server.*restarting the Mac so auto-login restores it' "$tmp/out" || fail "the restart did not say the session was stale: $(cat "$tmp/out")"
+FLAGS=stale-session RESTART_AFTER=300 BEFORE=someone runner run
+lacks 'restart' "a stale session with someone at the console"
+grep -q 'older than the window server.*henry is at the console' "$tmp/out" || fail "the hold did not name the stale session and the person: $(cat "$tmp/out")"
+# A session that goes stale under a running job: the slot is waiting on that
+# job, and the count toward the restart starts there, not when the job ends.
+FLAGS=stale-while-running RESTART_AFTER=300 POLLS=2 runner run
+[ "$rc" -eq 0 ] || fail "a run whose session went stale under its job exited $rc: $(cat "$tmp/out")"
+has 'generate-jitconfig' "a session that was fresh when the runner registered"
+[ -f "$tmp/state/session-lost-since" ] || fail "a session that went stale while the slot waited on its job did not start the restart's count: $(cat "$tmp/out")"
+lacks 'restart' "a session stale for less than the limit under a running job"
 # A session lost and back before the limit leaves no mark: the next loss
 # counts from its own start, not from the earlier one.
 FLAGS=session-drops RESTART_AFTER=300 runner run
