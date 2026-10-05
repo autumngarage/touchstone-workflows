@@ -210,6 +210,15 @@ EOF
 # A login session older than the window server: exit 0 says so.
 cat >"$bin/fake-stale" <<'EOF'
 #!/usr/bin/env bash
+# stale-while-running: fresh when the supervisor starts and when the slot
+# registers its runner, stale from the third look on, which is the slot
+# waiting on its job.
+if [ -f "$FAKE_STATE/stale-while-running" ]; then
+  count="$(cat "$FAKE_STATE/stale-count" 2>/dev/null || echo 0)"
+  echo $((count + 1)) >"$FAKE_STATE/stale-count"
+  [ "$count" -ge 2 ]
+  exit
+fi
 [ -f "$FAKE_STATE/stale-session" ]
 EOF
 chmod +x "$bin"/*
@@ -443,6 +452,13 @@ grep -q 'older than the window server.*restarting the Mac so auto-login restores
 FLAGS=stale-session RESTART_AFTER=300 BEFORE=someone runner run
 lacks 'restart' "a stale session with someone at the console"
 grep -q 'older than the window server.*henry is at the console' "$tmp/out" || fail "the hold did not name the stale session and the person: $(cat "$tmp/out")"
+# A session that goes stale under a running job: the slot is waiting on that
+# job, and the count toward the restart starts there, not when the job ends.
+FLAGS=stale-while-running RESTART_AFTER=300 POLLS=2 runner run
+[ "$rc" -eq 0 ] || fail "a run whose session went stale under its job exited $rc: $(cat "$tmp/out")"
+has 'generate-jitconfig' "a session that was fresh when the runner registered"
+[ -f "$tmp/state/session-lost-since" ] || fail "a session that went stale while the slot waited on its job did not start the restart's count: $(cat "$tmp/out")"
+lacks 'restart' "a session stale for less than the limit under a running job"
 # A session lost and back before the limit leaves no mark: the next loss
 # counts from its own start, not from the earlier one.
 FLAGS=session-drops RESTART_AFTER=300 runner run

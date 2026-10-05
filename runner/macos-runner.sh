@@ -102,6 +102,10 @@ KILL_CMD="${MACOS_RUNNER_KILL_CMD:-kill}"
 RESTART_AFTER="${MACOS_RUNNER_RESTART_AFTER:-0}"
 # Automatic restarts allowed in any 24 hours.
 RESTART_LIMIT=2
+# A login window more than this many seconds older than the window server is
+# a session from before the window server was replaced. At boot the two start
+# within a second or two of each other, in either order.
+STALE_GAP=60
 # Test seams: what restarts the Mac, and what reports the console's owner, the
 # boot time in epoch seconds, the auto-login account, and (exit 0) a login
 # session older than the window server.
@@ -186,10 +190,10 @@ started_at() {
   LC_ALL=C date -j -f '%a %b %d %T %Y' "$at" +%s 2>/dev/null || true
 }
 
-# USER's login window started before the running window server, so the
-# session belongs to a window server that is gone. At boot the two start in
-# the same second, which is not stale. Anything that cannot be read is not
-# stale either: a probe that fails must never be what restarts the Mac.
+# USER's login window is more than STALE_GAP seconds older than the running
+# window server, so the session belongs to a window server that is gone.
+# Anything that cannot be read is not stale: a probe that fails must never be
+# what restarts the Mac.
 session_stale() {
   local lw ws lw_at ws_at
   if [ -n "$SESSION_STALE_CMD" ]; then
@@ -203,7 +207,7 @@ session_stale() {
   ws_at="$(started_at "$ws")"
   case "$lw_at" in '' | *[!0-9]*) return 1 ;; esac
   case "$ws_at" in '' | *[!0-9]*) return 1 ;; esac
-  [ "$lw_at" -lt "$ws_at" ]
+  [ $((ws_at - lw_at)) -gt "$STALE_GAP" ]
 }
 
 # A logged-in account has a GUI domain; without one there is no window
@@ -371,8 +375,17 @@ reap_slot() {
   "$KILL_CMD" -KILL $pids 2>/dev/null || true
 }
 
+# The first slot keeps the session's watch while it waits, too: a job that
+# hangs in a session whose window server has just died would otherwise hold
+# the restart up for as long as it hangs. A restart from here ends the jobs
+# that are running, which that session could not have finished.
 wait_for_job() {
-  while [ "$(slot_job "$1")" = running ]; do sleep "$POLL"; done
+  while [ "$(slot_job "$1")" = running ]; do
+    if [ "$1" -eq 1 ]; then
+      if session_up; then session_back; else session_lost; fi
+    fi
+    sleep "$POLL"
+  done
 }
 
 # The job definition, private to root. KeepAlive is absent: the runner exits
