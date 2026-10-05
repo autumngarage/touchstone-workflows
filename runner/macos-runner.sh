@@ -60,9 +60,14 @@
 # WindowServer, auto-login only happens at boot, and the pool and the first
 # runner were down for nine hours until a person logged USER in -- which then
 # left the session half-working, because USER's per-user daemons were the old
-# session's. Only a restart brings back a clean session by itself. So with
+# session's. Only a restart brings back a clean session by itself. A session
+# can also outlive its window server: on 2026-10-05 the watchdog killed
+# WindowServer again, the owner's session ended, and USER's loginwindow kept
+# running, cut off from the new window server -- still "logged in" to launchd,
+# while every app test hung and nobody could log USER in until a restart
+# (AUT-2255). That is a lost session too. So with
 # MACOS_RUNNER_RESTART_AFTER set, the supervisor restarts the Mac once USER has
-# had no session for that long, and only when a restart is both safe and
+# had no usable session for that long, and only when a restart is both safe and
 # useful: nobody is at the console (its owner reads as root, the login window;
 # an owner that cannot be read holds the restart),
 # auto-login is configured for USER, and it has restarted fewer than
@@ -98,11 +103,13 @@ RESTART_AFTER="${MACOS_RUNNER_RESTART_AFTER:-0}"
 # Automatic restarts allowed in any 24 hours.
 RESTART_LIMIT=2
 # Test seams: what restarts the Mac, and what reports the console's owner, the
-# boot time in epoch seconds, and the auto-login account.
+# boot time in epoch seconds, the auto-login account, and (exit 0) a login
+# session older than the window server.
 RESTART_CMD="${MACOS_RUNNER_RESTART_CMD:-shutdown -r now}"
 CONSOLE_USER_CMD="${MACOS_RUNNER_CONSOLE_USER_CMD:-stat -f %Su /dev/console}"
 BOOT_TIME_CMD="${MACOS_RUNNER_BOOT_TIME_CMD:-}"
 AUTOLOGIN_CMD="${MACOS_RUNNER_AUTOLOGIN_CMD:-defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser}"
+SESSION_STALE_CMD="${MACOS_RUNNER_SESSION_STALE_CMD:-}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # log, die, need, the token file, the runner-group check, and just-in-time
@@ -171,9 +178,50 @@ prepare_slot() {
       "$first/" "$dir/"
 }
 
+# When a process started, in epoch seconds; nothing when it is gone.
+started_at() {
+  local at
+  at="$(LC_ALL=C ps -o lstart= -p "$1" 2>/dev/null | sed 's/ *$//' || true)"
+  [ -n "$at" ] || return 0
+  LC_ALL=C date -j -f '%a %b %d %T %Y' "$at" +%s 2>/dev/null || true
+}
+
+# USER's login window started before the running window server, so the
+# session belongs to a window server that is gone. At boot the two start in
+# the same second, which is not stale. Anything that cannot be read is not
+# stale either: a probe that fails must never be what restarts the Mac.
+session_stale() {
+  local lw ws lw_at ws_at
+  if [ -n "$SESSION_STALE_CMD" ]; then
+    $SESSION_STALE_CMD
+    return
+  fi
+  lw="$(pgrep -u "$uid" -x loginwindow 2>/dev/null | head -1 || true)"
+  ws="$(pgrep -x WindowServer 2>/dev/null | head -1 || true)"
+  [ -n "$lw" ] && [ -n "$ws" ] || return 1
+  lw_at="$(started_at "$lw")"
+  ws_at="$(started_at "$ws")"
+  case "$lw_at" in '' | *[!0-9]*) return 1 ;; esac
+  case "$ws_at" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$lw_at" -lt "$ws_at" ]
+}
+
 # A logged-in account has a GUI domain; without one there is no window
-# server for UI tests, and nothing to start a runner in.
-session_up() { launchctl print "gui/$uid" >/dev/null 2>&1; }
+# server for UI tests, and nothing to start a runner in. A domain whose login
+# window predates the window server has none either. session_gap says which,
+# for the log.
+session_gap=""
+session_up() {
+  if ! launchctl print "gui/$uid" >/dev/null 2>&1; then
+    session_gap="is not logged in"
+    return 1
+  fi
+  if session_stale; then
+    session_gap="has a login session older than the window server, which cannot reach the display"
+    return 1
+  fi
+  session_gap=""
+}
 
 console_user() { $CONSOLE_USER_CMD 2>/dev/null || true; }
 autologin_user() { $AUTOLOGIN_CMD 2>/dev/null || true; }
@@ -190,10 +238,10 @@ boot_time() {
 hold_restart() {
   [ "$(cat "$state_dir/session-lost-reason" 2>/dev/null || true)" = "$1" ] && return 0
   printf '%s\n' "$1" >"$state_dir/session-lost-reason"
-  log "$RUN_USER has no login session; not restarting the Mac: $1"
+  log "$RUN_USER ${session_gap:-has no usable login session}; not restarting the Mac: $1"
 }
 
-# USER has no login session. Remember since when, and restart the Mac once
+# USER has no usable login session. Remember since when, and restart the Mac once
 # that has lasted RESTART_AFTER seconds and a restart is safe and useful (see
 # "A lost session" above). The invariant: never restart under a person, never
 # when auto-login would not bring USER back, never more than RESTART_LIMIT
@@ -244,7 +292,7 @@ session_lost() {
   fi
   printf '%s\n' "$now" >>"$state_dir/restarts"
   rm -f "$state_dir/session-lost-since" "$state_dir/session-lost-reason"
-  log "$RUN_USER has had no login session for ${lost}s and nobody is at the console; restarting the Mac so auto-login restores it"
+  log "$RUN_USER ${session_gap:-has no usable login session}, for ${lost}s now, and nobody is at the console; restarting the Mac so auto-login restores it"
   $RESTART_CMD || log "the restart command failed: $RESTART_CMD"
 }
 
@@ -378,7 +426,7 @@ run_slot() {
       # One slot speaks for the pool: two slots reading the mark at the same
       # moment would otherwise each restart and each count against the limit.
       [ "$slot" -ne 1 ] || session_lost
-      log "slot $slot: $RUN_USER is not logged in; registering nothing, retrying in ${backoff}s"
+      log "slot $slot: $RUN_USER $session_gap; registering nothing, retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
@@ -487,7 +535,7 @@ cmd_run() {
   # stays lost is looked at once a minute until it returns or the Mac restarts.
   if ! session_up; then
     session_lost
-    die "$RUN_USER is not logged in; the pool's runners start in $RUN_USER's login session"
+    die "$RUN_USER $session_gap; the pool's runners start in $RUN_USER's login session"
   fi
   session_back
   gid="$(group_id)"

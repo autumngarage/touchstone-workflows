@@ -255,7 +255,10 @@ stay down until a person logs the account in, and a login without a restart
 leaves the account's per-user daemons from the old session, which breaks
 xcodebuild's app launches. With `MACOS_RUNNER_RESTART_AFTER=<seconds>` in the
 environment of `install-daemon`, the supervisor restarts the Mac once the
-account has had no session for that long. It does so only when nobody is at
+account has had no usable session for that long. A session whose login window
+started before the running window server counts as lost too (AUT-2255): the
+account still reads as logged in, but nothing in it can reach the display and
+no runner is registered into it. It restarts only when nobody is at
 the console, auto-login is configured for the account, and it has restarted
 fewer than twice in the last 24 hours; otherwise it logs why it is waiting.
 The default is 0: never restart.
