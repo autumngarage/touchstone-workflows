@@ -595,7 +595,7 @@ FLAGS=daemon-busy BEFORE=seed_token TOKEN_FILE="$tmp/state/github-token" runner 
 # is the command that starts the pool, because the old daemon is gone.
 FLAGS=daemon-stuck BEFORE=seed_token TOKEN_FILE="$tmp/state/github-token" runner install-daemon
 refused "sudo launchctl bootstrap system" "a daemon launchd will not load"
-grep -q 'the old daemon is stopped' "$tmp/out" || fail "the refusal did not say the pool is stopped: $(cat "$tmp/out")"
+grep -q 'the old service is stopped and the pool is not running' "$tmp/out" || fail "the refusal did not say the pool is stopped: $(cat "$tmp/out")"
 grep -q 'Input/output error' "$tmp/out" || fail "the refusal did not carry launchd's reason: $(cat "$tmp/out")"
 # An old daemon that outlives the wait is still the service launchd lists, so
 # finding one there is not the new daemon loaded: the install fails, having

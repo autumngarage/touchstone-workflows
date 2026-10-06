@@ -258,9 +258,7 @@ cmd_install() {
 </dict>
 </plist>
 EOF
-  launchctl bootout "gui/$(id -u)/$AGENT_ID" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$(id -u)" "$plist" \
-    || die "launchctl could not load $plist"
+  replace_service "gui/$(id -u)" "$AGENT_ID" "$plist" "the fleet"
   log "installed $AGENT_ID; logs in $log_file"
 }
 
@@ -351,9 +349,7 @@ cmd_install_daemon() {
 EOF
   chown root:wheel "$plist"
   chmod 644 "$plist"
-  launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
-  launchctl bootstrap system "$plist" \
-    || die "launchctl could not load $plist"
+  replace_service system "$AGENT_ID" "$plist" "the fleet"
   log "installed $AGENT_ID as $user; logs in $log_file"
 }
 

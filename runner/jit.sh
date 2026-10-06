@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 #
 # runner/jit.sh -- what every runner supervisor here shares, sourced rather
-# than run: its GitHub credential, the runner group it registers into, and the
-# just-in-time registrations it asks GitHub for. A supervisor sources it from
-# its own directory, so an installed copy carries it alongside.
+# than run: its GitHub credential, the runner group it registers into, the
+# just-in-time registrations it asks GitHub for, and how it replaces its own
+# launchd service. A supervisor sources it from its own directory, so an
+# installed copy carries it alongside.
 #
 # The caller sets ORG, GROUP, LABEL, and TOKEN_FILE before calling these.
 #
@@ -17,6 +18,47 @@ die() {
 
 need() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH; $2"
+}
+
+# How long replace_service waits, in all, for the service it is replacing to
+# leave launchd and for the new one to load.
+REPLACE_WAIT=60
+
+# replace_service DOMAIN LABEL PLIST WHAT: loads PLIST as DOMAIN/LABEL in
+# place of whatever is loaded there. DOMAIN is `system` or `gui/<uid>`; WHAT
+# names what the service runs ("the pool"), for the message.
+#
+# launchd may still be ending the old service when bootout returns: a
+# supervisor's TERM handler stops each slot and deregisters each runner
+# first. A bootstrap in that window fails with the old service already gone,
+# which on 2026-10-05 left the macOS pool stopped until a person loaded it by
+# hand (AUT-2258). So this waits for the service to leave, then loads the new
+# one, trying again for REPLACE_WAIT seconds in all, and if it still will not
+# load says what does.
+replace_service() {
+  local domain="$1" label="$2" plist="$3" what="$4" waited=0 why load
+  load="launchctl bootstrap $domain '$plist'"
+  [ "$domain" != system ] || load="sudo $load"
+  launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+  # Nothing is loaded over an old service that has not left: launchd would
+  # refuse it, and the service still listed would be the one about to exit.
+  while launchctl print "$domain/$label" >/dev/null 2>&1; do
+    [ "$waited" -lt "$REPLACE_WAIT" ] \
+      || die "the service being replaced was still in launchd ${waited}s after its bootout, so the new one was not loaded; $what stops when the old one exits. When 'launchctl print $domain/$label' finds no service, load the new one with: $load"
+    sleep 1
+    waited=$((waited + 1))
+  done
+  while :; do
+    # A bootstrap that reports failure can still have loaded the service; the
+    # old one is gone by here, so a service launchd lists is the new one.
+    if why="$(launchctl bootstrap "$domain" "$plist" 2>&1)" || launchctl print "$domain/$label" >/dev/null 2>&1; then
+      return 0
+    fi
+    [ "$waited" -lt "$REPLACE_WAIT" ] \
+      || die "launchctl could not load $plist after ${waited}s (${why:-no message}); the old service is stopped and $what is not running. Load it with: $load"
+    sleep 2
+    waited=$((waited + 2))
+  done
 }
 
 # A file's permission bits and owner. GNU stat first: on Linux `stat -f` means
