@@ -638,12 +638,17 @@ EOF
   # load say what does.
   launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
   waited=0
-  while launchctl print "system/$AGENT_ID" >/dev/null 2>&1 && [ "$waited" -lt "$INSTALL_WAIT" ]; do
+  # Nothing is loaded over an old daemon that has not left: launchd would
+  # refuse it, and the service still listed would be the one about to exit.
+  while launchctl print "system/$AGENT_ID" >/dev/null 2>&1; do
+    [ "$waited" -lt "$INSTALL_WAIT" ] \
+      || die "the daemon being replaced was still in launchd ${waited}s after its bootout, so the new one was not loaded; the pool stops when the old one exits. When 'sudo launchctl print system/$AGENT_ID' finds no service, load the new one with: sudo launchctl bootstrap system '$plist'"
     sleep 1
     waited=$((waited + 1))
   done
   while :; do
-    # A bootstrap that reports failure can still have loaded the service.
+    # A bootstrap that reports failure can still have loaded the service; the
+    # old one is gone by here, so a service launchd lists is the new one.
     if why="$(launchctl bootstrap system "$plist" 2>&1)" || launchctl print "system/$AGENT_ID" >/dev/null 2>&1; then
       break
     fi

@@ -84,6 +84,8 @@ case "$1" in
         fi
         ;;
       system/*)
+        # daemon-stays: the daemon being replaced never leaves.
+        [ ! -f "$FAKE_STATE/daemon-stays" ] || exit 0
         # daemon-lingers: the daemon being replaced is still there for the
         # first two looks after its bootout.
         [ -f "$FAKE_STATE/daemon-lingers" ] || exit 113
@@ -97,8 +99,9 @@ case "$1" in
   bootstrap)
     if [ "$2" = system ]; then
       # daemon-busy: launchd refuses the first two loads, as it does while
-      # the old daemon is still exiting. daemon-stuck: it refuses them all.
-      if [ -f "$FAKE_STATE/daemon-stuck" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+      # the old daemon is still exiting. daemon-stuck: it refuses them all,
+      # as it does (daemon-stays) over a service that is still loaded.
+      if [ -f "$FAKE_STATE/daemon-stuck" ] || [ -f "$FAKE_STATE/daemon-stays" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
       if [ -f "$FAKE_STATE/daemon-busy" ]; then
         count="$(cat "$FAKE_STATE/busy-count" 2>/dev/null || echo 0)"
         echo $((count + 1)) >"$FAKE_STATE/busy-count"
@@ -594,6 +597,14 @@ FLAGS=daemon-stuck BEFORE=seed_token TOKEN_FILE="$tmp/state/github-token" runner
 refused "sudo launchctl bootstrap system" "a daemon launchd will not load"
 grep -q 'the old daemon is stopped' "$tmp/out" || fail "the refusal did not say the pool is stopped: $(cat "$tmp/out")"
 grep -q 'Input/output error' "$tmp/out" || fail "the refusal did not carry launchd's reason: $(cat "$tmp/out")"
+# An old daemon that outlives the wait is still the service launchd lists, so
+# finding one there is not the new daemon loaded: the install fails, having
+# tried no load, and names the command for when the old one has gone.
+FLAGS=daemon-stays BEFORE=seed_token TOKEN_FILE="$tmp/state/github-token" runner install-daemon
+refused "sudo launchctl bootstrap system" "an install over a daemon that never left"
+grep -q 'was still in launchd 60s after its bootout' "$tmp/out" || fail "the refusal did not say the old daemon was still there: $(cat "$tmp/out")"
+lacks 'launchctl bootstrap system' "an install over a daemon that never left"
+grep -q 'installed com.autumngarage.macos-pool-runner' "$tmp/out" && fail "an install over a daemon that never left reported success: $(cat "$tmp/out")"
 ok "install-daemon waits for the daemon it replaces, retries the load, and names the command if it cannot"
 runner uninstall-daemon
 [ "$rc" -eq 0 ] || fail "uninstall-daemon exited $rc"
