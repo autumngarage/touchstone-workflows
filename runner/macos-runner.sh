@@ -106,6 +106,9 @@ RESTART_LIMIT=2
 # a session from before the window server was replaced. At boot the two start
 # within a second or two of each other, in either order.
 STALE_GAP=60
+# How long install-daemon waits, in all, for a daemon it is replacing to
+# leave launchd and for the new one to load.
+INSTALL_WAIT=60
 # Test seams: what restarts the Mac, and what reports the console's owner, the
 # boot time in epoch seconds, the auto-login account, and (exit 0) a login
 # session older than the window server.
@@ -568,7 +571,7 @@ daemon_plist_path() { printf '%s/%s.plist\n' "$DAEMON_DIR" "$AGENT_ID"; }
 # root, which waits for USER's login session (auto-login brings it back after
 # a restart). The token must already be in place, private to root.
 cmd_install_daemon() {
-  local plist
+  local plist waited why
   require_root "install-daemon"
   need launchctl "install-daemon needs macOS launchd"
   resolve_user
@@ -626,9 +629,29 @@ cmd_install_daemon() {
 EOF
   chown root:wheel "$plist"
   chmod 644 "$plist"
+  # launchd may still be ending the old daemon when bootout returns: the
+  # supervisor's TERM handler boots out each slot and deregisters each runner
+  # first. A bootstrap in that window fails with the old daemon already gone,
+  # which on 2026-10-05 left the pool stopped until a person loaded it by
+  # hand (AUT-2258). So wait for the service to leave, then load the new one,
+  # trying again for INSTALL_WAIT seconds in all, and if it still will not
+  # load say what does.
   launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
-  launchctl bootstrap system "$plist" \
-    || die "launchctl could not load $plist"
+  waited=0
+  while launchctl print "system/$AGENT_ID" >/dev/null 2>&1 && [ "$waited" -lt "$INSTALL_WAIT" ]; do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  while :; do
+    # A bootstrap that reports failure can still have loaded the service.
+    if why="$(launchctl bootstrap system "$plist" 2>&1)" || launchctl print "system/$AGENT_ID" >/dev/null 2>&1; then
+      break
+    fi
+    [ "$waited" -lt "$INSTALL_WAIT" ] \
+      || die "launchctl could not load $plist after ${waited}s (${why:-no message}); the old daemon is stopped and no pool runner is running. Load it with: sudo launchctl bootstrap system '$plist'"
+    sleep 2
+    waited=$((waited + 2))
+  done
   if [ "$RESTART_AFTER" -gt 0 ]; then
     log "installed $AGENT_ID: $SLOTS slot(s) for $RUN_USER, restarting the Mac after ${RESTART_AFTER}s without $RUN_USER's session; logs in $LOG_FILE"
   else
