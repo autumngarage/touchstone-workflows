@@ -74,6 +74,29 @@ EOF
 cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "$*" >>"$FAKE_CALLS"
+case "$1" in
+  print)
+    # service-stays: the service being replaced never leaves.
+    [ ! -f "$FAKE_STATE/service-stays" ] || exit 0
+    # service-lingers: it is still there for the first two looks after its
+    # bootout. Otherwise nothing is loaded.
+    [ -f "$FAKE_STATE/service-lingers" ] || exit 113
+    count="$(cat "$FAKE_STATE/linger-count" 2>/dev/null || echo 0)"
+    echo $((count + 1)) >"$FAKE_STATE/linger-count"
+    [ "$count" -lt 2 ] || exit 113
+    ;;
+  bootstrap)
+    # service-busy: launchd refuses the first two loads, as it does while the
+    # old service is still exiting. service-stuck: it refuses them all, as it
+    # does (service-stays) over a service that is still loaded.
+    if [ -f "$FAKE_STATE/service-stuck" ] || [ -f "$FAKE_STATE/service-stays" ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+    if [ -f "$FAKE_STATE/service-busy" ]; then
+      count="$(cat "$FAKE_STATE/busy-count" 2>/dev/null || echo 0)"
+      echo $((count + 1)) >"$FAKE_STATE/busy-count"
+      if [ "$count" -lt 2 ]; then echo "Bootstrap failed: 5: Input/output error" >&2; exit 5; fi
+    fi
+    ;;
+esac
 EOF
 cat >"$bin/colima" <<'EOF'
 #!/usr/bin/env bash
@@ -280,6 +303,45 @@ runner install-daemon
 refused 'usage: sudo bash runner/linux-runner.sh install-daemon USER' "no user named"
 [ ! -f "$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist" ] || fail "a refused install left a LaunchDaemon"
 ok "install-daemon refuses without root, a real user, or that user's private token"
+
+echo "==> replacing a running fleet never leaves it stopped without saying how to start it"
+# launchd is still ending the old service when bootout returns, and a load in
+# that window fails with the old one already gone (AUT-2258 on the macOS
+# pool, AUT-2275 here). Both installs wait for it to leave and try the load
+# again, through the one replace_service in jit.sh.
+line_of() { grep -nF -- "$1" "$tmp/calls" | head -1 | cut -d: -f1; }
+seed_token
+FLAGS=service-lingers KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon over a daemon that was still leaving exited $rc: $(cat "$tmp/out")"
+[ "$(line_of 'sleep 1')" -lt "$(line_of 'launchctl bootstrap system')" ] || fail "the new daemon was loaded before the old one had left: $(cat "$tmp/calls")"
+seed_token
+FLAGS=service-busy KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon gave up on a load launchd refused twice: $(cat "$tmp/out")"
+[ "$(grep -c 'launchctl bootstrap system' "$tmp/calls")" -eq 3 ] || fail "expected the load to be tried three times: $(grep 'bootstrap system' "$tmp/calls")"
+# A load that never succeeds is given up on after the wait, and the message
+# is the command that starts the fleet, because the old daemon is gone.
+seed_token
+FLAGS=service-stuck KEEP_HOME=1 runner install-daemon "$real_user"
+refused "sudo launchctl bootstrap system '$dplist'" "a daemon launchd will not load"
+grep -q 'the old service is stopped and the fleet is not running' "$tmp/out" || fail "the refusal did not say the fleet is stopped: $(cat "$tmp/out")"
+grep -q 'Input/output error' "$tmp/out" || fail "the refusal did not carry launchd's reason: $(cat "$tmp/out")"
+# An old daemon that outlives the wait is still the service launchd lists, so
+# finding one there is not the new daemon loaded: the install fails, having
+# tried no load, and names the command for when the old one has gone.
+seed_token
+FLAGS=service-stays KEEP_HOME=1 runner install-daemon "$real_user"
+refused "sudo launchctl bootstrap system '$dplist'" "an install over a daemon that never left"
+grep -q 'was still in launchd 60s after its bootout' "$tmp/out" || fail "the refusal did not say the old daemon was still there: $(cat "$tmp/out")"
+lacks 'launchctl bootstrap system' "an install over a daemon that never left"
+grep -q 'installed com.autumngarage.linux-ephemeral-runner' "$tmp/out" && fail "an install over a daemon that never left reported success: $(cat "$tmp/out")"
+# The login-session agent is replaced the same way, in its own domain and
+# with no sudo in the command it names.
+FLAGS=service-lingers runner install
+[ "$rc" -eq 0 ] || fail "install over an agent that was still leaving exited $rc: $(cat "$tmp/out")"
+[ "$(line_of 'sleep 1')" -lt "$(line_of 'launchctl bootstrap gui/')" ] || fail "the new agent was loaded before the old one had left: $(cat "$tmp/calls")"
+FLAGS=service-stuck runner install
+refused "Load it with: launchctl bootstrap gui/" "an agent launchd will not load"
+ok "both installs wait for the service they replace, retry the load, and name the command if they cannot"
 runner uninstall-daemon
 [ "$rc" -eq 0 ] || fail "uninstall-daemon exited $rc"
 has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstall-daemon"
