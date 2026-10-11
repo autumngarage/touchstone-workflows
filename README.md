@@ -87,20 +87,30 @@ the merge queue cannot pass an input and keep 20 minutes.
 
 ## Runner
 
-Every consumer job (`validate`, `review-gate`, `delivery-evidence`) takes its
-runner from one selector:
+Every consumer job takes its runner from a selector of one shape. `validate`
+reads `LINUX_RUNNER`:
 
 ```yaml
 runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
 ```
 
-With the `LINUX_RUNNER` variable unset, every job runs on GitHub-hosted
-`ubuntu-latest`, exactly as before. Set, it runs on a self-hosted runner with
-that label, and the `self-hosted` label is always required, so the variable can
-never name a hosted image (AUT-1595). The `source contract` job runs only in
+The two gate jobs, `review-gate` and `delivery-evidence`, read
+`LINUX_GATE_RUNNER` in the same shape. They run for seconds, and on one
+variable they waited in line behind validations: on a repository with two
+runners of its own, 23 minutes on average on 2026-10-11, long enough for
+`touchstone pr open` to give up on them (AUT-2452). So a repository that sets
+only `LINUX_RUNNER` validates on its own runners and runs its gates on
+GitHub-hosted ones, where they start at once and bill a minute each. Set
+`LINUX_GATE_RUNNER` as well only when GitHub-hosted jobs cannot start, for
+example when the plan's included minutes are used up.
+
+With a variable unset, its jobs run on GitHub-hosted `ubuntu-latest`, exactly
+as before. Set, they run on a self-hosted runner with that label, and the
+`self-hosted` label is always required, so a variable can never name a hosted
+image (AUT-1595). The `source contract` job runs only in
 this public repository and stays on `ubuntu-latest` by name.
 
-**`LINUX_RUNNER` names only single-use runners.** `validate` runs the
+**Both variables name only single-use runners.** `validate` runs the
 candidate's declared commands. On a persistent self-hosted runner, a pull
 request could modify the host and reach every later job there, including
 `review-gate`, which receives the fallback reviewer's credential
@@ -116,10 +126,11 @@ registration the supervisor also checks the group itself: it must be visible
 only to selected repositories, closed to public ones, and hold only private
 repositories, or nothing is registered.
 
-The variable's repositories and the runner group's repositories must be the
-same set. A repository that resolves the variable but is outside the group
-queues its jobs forever. A public repository must be in neither, because it
-takes fork pull requests.
+`LINUX_RUNNER`'s repositories and the runner group's repositories must be the
+same set, and `LINUX_GATE_RUNNER`'s, when it is set, must all be among them. A
+repository that resolves a variable but is outside the group queues those
+jobs forever. A public repository must be in none of them, because it takes
+fork pull requests.
 
 ### Running the runners (AUT-1596)
 
