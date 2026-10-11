@@ -29,20 +29,35 @@ assert_active_line() {
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
 
-# AUT-1595/AUT-1596: every consumer job takes its runner from the LINUX_RUNNER
-# setting. Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted
-# is always required, so the setting can never name a hosted image, and it
-# names only the single-use runners runner/linux-runner.sh registers -- the
-# boundary that lets validate, which runs candidate code, use it at all.
-# Touchstone's shared hosted-runner check (AUT-1592) accepts this shape.
+# AUT-1595/AUT-1596: every consumer job takes its runner from a setting.
+# Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted is
+# always required, so the setting can never name a hosted image, and it names
+# only the single-use runners runner/linux-runner.sh registers -- the boundary
+# that lets validate, which runs candidate code, use it at all. Touchstone's
+# shared hosted-runner check (AUT-1592) accepts this shape.
+#
+# AUT-2452: validate reads LINUX_RUNNER and the two gate jobs read
+# LINUX_GATE_RUNNER. A gate job runs for seconds; on one setting it waited in
+# line behind eight-minute validations on a repository's two runners (23
+# minutes on average on 2026-10-11). Neither may read the other's setting: a
+# gate on LINUX_RUNNER is that wait again, and validate on LINUX_GATE_RUNNER
+# would leave the runners a repository set up for it.
 # shellcheck disable=SC2016
 runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
+# shellcheck disable=SC2016
+gate_runner_selector='runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_GATE_RUNNER)) || '\''ubuntu-latest'\'' }}'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
-for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
-  [ "$(active_count "$gate" "$runner_selector")" -eq 1 ] \
-    || fail "$gate: its consumer job must take its runner from the LINUX_RUNNER selector"
+[ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
+  || fail "$workflow: its consumer job must take its runner from the LINUX_RUNNER selector"
+[ "$(active_count "$workflow" "$gate_runner_selector")" -eq 0 ] \
+  || fail "$workflow: validate must not take its runner from the gate jobs' setting"
+for gate in "$review_gate" "$delivery_evidence"; do
+  [ "$(active_count "$gate" "$gate_runner_selector")" -eq 1 ] \
+    || fail "$gate: its consumer job must take its runner from the LINUX_GATE_RUNNER selector"
+  [ "$(active_count "$gate" "$runner_selector")" -eq 0 ] \
+    || fail "$gate: a gate job must not take its runner from validate's setting"
 done
 # Self-test fixtures append jobs of their own; only production is exhaustive.
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
@@ -55,7 +70,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     || fail "$workflow: a job takes its runner from somewhere other than the selector or ubuntu-latest"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
-      || fail "$gate: a job takes its runner from somewhere other than the LINUX_RUNNER selector"
+      || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
   done
 fi
 # AUT-2174: the time limit is 20 minutes for every event that cannot pass an
