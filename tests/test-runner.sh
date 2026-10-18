@@ -348,3 +348,24 @@ has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstal
 ok "uninstall-daemon boots the daemon out"
 
 echo "runner supervisor passed"
+
+# AUT-2593: the base installs a pinned, signature-verified toolchain, not a
+# floating executable that can stop working under the fleet's x64 emulator.
+# The Docker build additionally compiles and executes as its nonroot runner.
+python3 - "$root/runner/Dockerfile" <<'PY'
+from pathlib import Path
+import re
+import sys
+source = Path(sys.argv[1]).read_text()
+assert 'swiftly init' not in source and 'download.swift.org/swiftly' not in source
+assert re.search(r'ARG SWIFT_VERSION=\d+\.\d+\.\d+\n', source)
+assert re.search(r'ARG SWIFT_SIGNING_KEY=[A-F0-9]{40}\n', source)
+install = source[source.index('ARG SWIFT_SIGNING_KEY='):]
+assert "amd64) suffix=''" in install and "arm64) suffix='-aarch64'" in install
+assert '*) echo \'unsupported Swift architecture\' >&2; exit 1' in install
+assert install.index('gpg --batch --verify') < install.index('tar -xzf')
+assert 'ENV PATH=/opt/swift/usr/bin:$PATH\nUSER runner' in install
+assert 'swiftc "$probe/main.swift" -o "$probe/probe"' in install
+assert 'test "$("$probe/probe")" = \'runner Swift works\'' in install
+PY
+ok 'Swift source is pinned and verified before extraction; the nonroot build compiles and runs it'

@@ -12,8 +12,8 @@
 #     which hesperus's validate builds with.
 # Rebuild it with `bash runner/linux-runner.sh build`.
 #
-# Pinned: the base by digest, gh and Node by their release checksums. swiftly
-# verifies the toolchain's signature against swift.org's keys.
+# Pinned: the base by digest, gh and Node by release checksums, and Swift by
+# release version and its release signing key. No floating installer executes.
 FROM ghcr.io/actions/actions-runner:2.337.0@sha256:e5496277be5d09bc968b3d64911b74e219ac4a3f2edce956a3ecf9271bea1ef4
 
 USER root
@@ -53,19 +53,34 @@ RUN set -eux; \
   node --version; \
   npm --version
 
-USER runner
-# The version GitHub's ubuntu-24.04 image ships (image 20260831: 6.3.3). A
-# lower one fails hesperus's build: 6.2.4 cannot type-check
-# GateIsolation.swift:193 in reasonable time, and 6.3.3 compiles it.
+# Same signed archive used by the official Swift container. Do not execute
+# the floating Swiftly bootstrap: it crashes under x64 emulation (AUT-2593).
 ARG SWIFT_VERSION=6.3.3
-# swiftly's env.sh is bash; the default RUN shell is dash.
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ARG SWIFT_SIGNING_KEY=52BB7E3DE28A71BE22EC05FFEF80A866B47A981F
 RUN set -eux; \
-  curl -fsSL -o /tmp/swiftly.tar.gz "https://download.swift.org/swiftly/linux/swiftly-$(uname -m).tar.gz"; \
-  tar -xzf /tmp/swiftly.tar.gz -C /tmp; \
-  /tmp/swiftly init --quiet-shell-followup --assume-yes --skip-install; \
-  . "$HOME/.local/share/swiftly/env.sh"; \
-  swiftly install --use "$SWIFT_VERSION" --assume-yes; \
-  rm -f /tmp/swiftly /tmp/swiftly.tar.gz; \
-  swift --version
-ENV PATH=/home/runner/.local/share/swiftly/bin:$PATH
+  case "$(dpkg --print-architecture)" in \
+    amd64) suffix='' ;; \
+    arm64) suffix='-aarch64' ;; \
+    *) echo 'unsupported Swift architecture' >&2; exit 1 ;; \
+  esac; \
+  archive="https://download.swift.org/swift-${SWIFT_VERSION}-release/ubuntu2404${suffix}/swift-${SWIFT_VERSION}-RELEASE/swift-${SWIFT_VERSION}-RELEASE-ubuntu24.04${suffix}.tar.gz"; \
+  curl -fsSL "$archive" -o /tmp/swift.tar.gz; \
+  curl -fsSL "$archive.sig" -o /tmp/swift.tar.gz.sig; \
+  export GNUPGHOME="$(mktemp -d)"; \
+  gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$SWIFT_SIGNING_KEY"; \
+  gpg --batch --verify /tmp/swift.tar.gz.sig /tmp/swift.tar.gz; \
+  mkdir /opt/swift; \
+  tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=1 --no-same-owner; \
+  chmod -R a+rX /opt/swift; \
+  rm -rf "$GNUPGHOME" /tmp/swift.tar.gz /tmp/swift.tar.gz.sig
+ENV PATH=/opt/swift/usr/bin:$PATH
+USER runner
+# The same nonroot user that runs CI can compile and execute, not just print
+# a version. This also detects missing runtime libraries after installation.
+RUN set -eux; \
+  probe="$(mktemp -d)"; \
+  printf 'print("runner Swift works")\n' > "$probe/main.swift"; \
+  swift --version; \
+  swiftc "$probe/main.swift" -o "$probe/probe"; \
+  test "$("$probe/probe")" = 'runner Swift works'; \
+  rm -rf "$probe"
