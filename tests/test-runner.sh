@@ -24,6 +24,7 @@ printf 'gh %s\n' "$*" >>"$FAKE_CALLS"
 case "$*" in
   *runner-groups/*/repositories*)
     [ -f "$FAKE_STATE/empty-group" ] && exit 0
+    if [ -f "$FAKE_STATE/seed-only-group" ]; then echo "autumngarage/hesperus true"; exit 0; fi
     echo "autumngarage/vesper true"
     [ -f "$FAKE_STATE/public-repo" ] && echo "autumngarage/touchstone false"
     exit 0
@@ -263,11 +264,17 @@ has 'linux-ephemeral-runner:local-swift-cache' "the cache image's tag"
 [ "$(grep -c '^docker rm -f linux-ephemeral-testhost-1-' "$tmp/calls")" -ge 2 ] || fail "the seed's and the staging containers are not both removed: $(cat "$tmp/calls")"
 [ -z "$(ls "$tmp/state")" ] || fail "keeping the cache left state behind: $(ls "$tmp/state")"
 ok "a job GitHub records as the seed's success leaves its products in the cache image"
+# The cache image holds the seed repository's build, so a group that admits
+# any other repository never starts a job from it.
+KEEP_FAKE=1 CACHE_SEED=$seed runner run
+case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a group shared with another repository started a job from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
+grep -q "admits repositories other than autumngarage/hesperus; this job starts without its build cache" "$tmp/out" || fail "the shared group is not logged: $(cat "$tmp/out")"
+ok "a runner group shared with another repository never starts a job from the cache image"
 # The next job starts from the cache image, while it was made from this base.
-FLAGS='' KEEP_FAKE=1 CACHE_SEED=$seed runner run
+FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
 case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local-swift-cache bash -c"*) ;; *) fail "the next job did not start from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
 echo sha256:base-2 >"$tmp/fake/base-id"
-KEEP_FAKE=1 CACHE_SEED=$seed runner run
+FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
 case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a rebuilt base kept the old products: $(grep '^docker run ' "$tmp/calls")" ;; esac
 ok "jobs start from the cache image only while its base is the base image as it is"
 # An older seed that finishes last does not replace a newer one's products.

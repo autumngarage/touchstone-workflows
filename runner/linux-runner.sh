@@ -53,7 +53,9 @@
 #                         Swift build cache, e.g.
 #                         autumngarage/hesperus:swift-cache.yml (unset: off).
 #                         The token then also needs Actions read access to
-#                         that repository.
+#                         that repository. Jobs start from the cache image
+#                         only while the runner group admits that repository
+#                         and no other.
 #   LINUX_RUNNER_TOKEN_FILE  a file holding the GitHub token gh uses, read when
 #                         GH_TOKEN is unset; it must be readable by its owner
 #                         only. A daemon has no login keychain, so this is its
@@ -127,6 +129,16 @@ ensure_engine() {
       || die "colima could not start its VM; see 'colima start' as $(id -un)"
   fi
   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+}
+
+# Whether runner group GID admits the cache seed's repository and no other.
+# The cache image holds that repository's build: a job of any other
+# repository the group admits must never start from it.
+group_is_seed_only() {
+  local repos
+  repos="$(gh api --paginate "orgs/$ORG/actions/runner-groups/$1/repositories" \
+    --jq '.repositories[] | "\(.full_name) \(.private)"')" || return 1
+  [ "$repos" = "${CACHE_SEED%%:*} true" ]
 }
 
 # The image a job starts from: the cache image when it was made from the base
@@ -210,7 +222,7 @@ keep_cache() {
 
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
-  local gid name response jit id started rc
+  local gid name response jit id started rc image
   while :; do
     if [ -n "$MAX_JOBS" ] && [ "$jobs" -ge "$MAX_JOBS" ]; then
       wait
@@ -223,6 +235,14 @@ run_slot() {
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
+    fi
+    image="$IMAGE"
+    if [ -n "$CACHE_SEED" ]; then
+      if group_is_seed_only "$gid"; then
+        image="$(job_image)"
+      else
+        log "slot $slot: runner group '$GROUP' admits repositories other than ${CACHE_SEED%%:*}; this job starts without its build cache"
+      fi
     fi
     name="$prefix-$slot-$(date +%s)"
     if ! response="$(request_jit "$name" "$gid")"; then
@@ -253,7 +273,7 @@ run_slot() {
     # The container outlives its job only until keep_cache has looked at it.
     printf '%s\n' "$jit" | docker run --init -i --name "$name" \
       --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
-      "$(job_image)" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+      "$image" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
     forget_runner "$id"
     if [ -n "$CACHE_SEED" ]; then
       keep_cache "$name" &

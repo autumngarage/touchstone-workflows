@@ -74,7 +74,10 @@ their recorded key has the run's restore prefix, the same products
 record says that runner ran the seed workflow's job for a push to the default
 branch and the job succeeded; a key the job wrote proves nothing by itself.
 The products sit in an image no job writes, so each job still starts from a
-fresh container and nothing a pull request does reaches another job.
+fresh container and nothing a pull request does reaches another job. The
+image holds that repository's build, so a job starts from it only while the
+runner group admits that repository and no other; the supervisor checks the
+group before every registration.
 
 A consumer must also invoke this pinned workflow through `workflow_call` on
 default-branch pushes to produce reusable default-branch caches. PR-only caches
