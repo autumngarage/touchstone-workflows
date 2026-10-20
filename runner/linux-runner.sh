@@ -19,9 +19,17 @@
 # registers a runner for exactly one job, starts a fresh container from the
 # job image with that configuration, and waits for it to exit. The container
 # receives the single-use configuration and nothing else: no volume, no Docker
-# socket, no host network, no credential. Nothing a job does outlives its
-# container, which is what lets `validate` -- it runs the candidate's declared
+# socket, no host network, no credential. Nothing a job does reaches another
+# job, which is what lets `validate` -- it runs the candidate's declared
 # commands -- use these runners at all (see "Runner" in README.md).
+#
+# One exception, and only for code that has merged: with LINUX_RUNNER_CACHE_SEED
+# set, the build products of that repository's cache seed are kept in a job
+# image derived from the base one, so later jobs copy them instead of
+# downloading the same products from GitHub's cache (AUT-2672). They are kept
+# only when GitHub, not the container, says the finished runner ran that
+# workflow's job for a push to the default branch and the job succeeded. Every
+# job still starts in a fresh container of an image no job can write.
 #
 # Configuration, from the environment (defaults in parentheses):
 #   LINUX_RUNNER_ORG      organization (autumngarage)
@@ -40,6 +48,12 @@
 #                         (docker)
 #   LINUX_RUNNER_VM_CPUS  CPUs for the Colima VM (8)
 #   LINUX_RUNNER_VM_MEMORY  GiB for the Colima VM (16)
+#   LINUX_RUNNER_CACHE_SEED  OWNER/REPO:WORKFLOW_FILE, the workflow whose
+#                         default-branch push runs seed that repository's
+#                         Swift build cache, e.g.
+#                         autumngarage/hesperus:swift-cache.yml (unset: off).
+#                         The token then also needs Actions read access to
+#                         that repository.
 #   LINUX_RUNNER_TOKEN_FILE  a file holding the GitHub token gh uses, read when
 #                         GH_TOKEN is unset; it must be readable by its owner
 #                         only. A daemon has no login keychain, so this is its
@@ -70,6 +84,11 @@ ENGINE="${LINUX_RUNNER_ENGINE:-docker}"
 VM_CPUS="${LINUX_RUNNER_VM_CPUS:-8}"
 VM_MEMORY="${LINUX_RUNNER_VM_MEMORY:-16}"
 TOKEN_FILE="${LINUX_RUNNER_TOKEN_FILE:-}"
+CACHE_SEED="${LINUX_RUNNER_CACHE_SEED:-}"
+CACHE_IMAGE="$IMAGE-swift-cache"
+# Where validate.yml looks for them, and where its seed leaves its cache key.
+CACHE_ROOT=/home/runner/swift-build-cache
+CACHE_KEY_FILE=/home/runner/.touchstone-swift-cache-key
 DAEMON_DIR="${LINUX_RUNNER_DAEMON_DIR:-/Library/LaunchDaemons}"
 # A test seam and a one-shot probe: stop each slot after this many jobs. Unset
 # (the default) means forever.
@@ -92,6 +111,7 @@ case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive i
 case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker or colima, not '$ENGINE'" ;; esac
+case "$CACHE_SEED" in '' | */*:*.yml | */*:*.yaml) ;; *) die "LINUX_RUNNER_CACHE_SEED must be OWNER/REPO:WORKFLOW_FILE, not '$CACHE_SEED'" ;; esac
 
 # The Docker engine the slots run containers on. Docker Desktop lives in a
 # login session, so a host with nobody logged in uses this user's Colima VM,
@@ -109,11 +129,91 @@ ensure_engine() {
   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
 }
 
+# The image a job starts from: the cache image when it was made from the base
+# image as it is now, otherwise the base. A rebuilt base drops the products.
+job_image() {
+  local base made_from
+  if [ -n "$CACHE_SEED" ] \
+    && base="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" \
+    && made_from="$(docker image inspect -f '{{index .Config.Labels "touchstone.swift-cache.base"}}' "$CACHE_IMAGE" 2>/dev/null)" \
+    && [ "$made_from" = "$base" ]; then
+    printf '%s\n' "$CACHE_IMAGE"
+  else
+    printf '%s\n' "$IMAGE"
+  fi
+}
+
+# seed_run NAME: print the start time of the cache seed's run whose job ran on
+# runner NAME and succeeded, for a push to the repository's default branch.
+# GitHub's record is the only evidence: the container's files are the job's
+# own and prove nothing. The job's conclusion can reach the API a moment
+# after its runner exits, so ask again before giving up.
+seed_run() {
+  local name="$1" repo="${CACHE_SEED%%:*}" workflow="${CACHE_SEED#*:}" branch run started tries=0
+  branch="$(gh api "repos/$repo" --jq .default_branch)" || return 1
+  while [ "$tries" -lt 3 ]; do
+    while read -r run started; do
+      [ -n "$run" ] || continue
+      if gh api "repos/$repo/actions/runs/$run/jobs?per_page=100" \
+        --jq ".jobs[] | select(.runner_name == \"$name\" and .conclusion == \"success\") | .id" | grep -q .; then
+        printf '%s\n' "$started"
+        return 0
+      fi
+    done <<EOF
+$(gh api "repos/$repo/actions/workflows/$workflow/runs?branch=$branch&event=push&per_page=5" \
+      --jq ".workflow_runs[] | select(.head_branch == \"$branch\" and .head_repository.full_name == \"$repo\") | \"\\(.id) \\(.run_started_at)\"")
+EOF
+    tries=$((tries + 1))
+    sleep 10
+  done
+  return 1
+}
+
+# keep_cache NAME: after runner NAME's container has exited, keep its .build
+# in the cache image if that job was the cache seed, then remove the
+# container. Runs beside the slot, so the next job does not wait for it; one
+# at a time, and an older seed never replaces a newer one's products.
+keep_cache() {
+  local name="$1" repo="${CACHE_SEED%%:*}" src started base kept staging lock="$state_dir/keep-cache.lock"
+  src="/home/runner/_work/${repo#*/}/${repo#*/}/.build"
+  # Only the seed writes the key file, so most jobs stop here without asking
+  # GitHub anything.
+  if docker cp "$name:$CACHE_KEY_FILE" - >/dev/null 2>&1; then
+    if ! started="$(seed_run "$name")"; then
+      log "$name left a cache key, but GitHub records no successful $CACHE_SEED job on it; nothing kept"
+    else
+      until mkdir "$lock" 2>/dev/null; do sleep 5; done
+      kept="$(docker image inspect -f '{{index .Config.Labels "touchstone.swift-cache.seed-started"}}' "$CACHE_IMAGE" 2>/dev/null || true)"
+      base="$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null || true)"
+      staging="$name-cache"
+      if [ -n "$kept" ] && [ "$(job_image)" = "$CACHE_IMAGE" ] && ! [ "$kept" \< "$started" ]; then
+        log "$name ran the $CACHE_SEED seed started $started; $CACHE_IMAGE already holds one started $kept"
+      elif [ -n "$base" ] \
+        && docker run --name "$staging" --pull never "$IMAGE" mkdir -p "$CACHE_ROOT/$repo" >/dev/null \
+        && docker cp -a "$name:$src" - | docker cp -a - "$staging:$CACHE_ROOT/$repo" \
+        && docker cp -a "$name:$CACHE_KEY_FILE" - | docker cp -a - "$staging:$CACHE_ROOT/$repo" \
+        && docker commit \
+          --change "LABEL touchstone.swift-cache.base=$base" \
+          --change "LABEL touchstone.swift-cache.seed-started=$started" \
+          "$staging" "$CACHE_IMAGE" >/dev/null; then
+        log "kept the build products of the $CACHE_SEED seed started $started (runner $name) in $CACHE_IMAGE"
+        docker image prune -f --filter "label=touchstone.swift-cache.base" >/dev/null 2>&1 || true
+      else
+        log "could not keep the build products of the $CACHE_SEED seed on $name; jobs keep the previous ones"
+      fi
+      docker rm -f "$staging" >/dev/null 2>&1 || true
+      rmdir "$lock"
+    fi
+  fi
+  docker rm -f "$name" >/dev/null 2>&1 || true
+}
+
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
   local gid name response jit id started rc
   while :; do
     if [ -n "$MAX_JOBS" ] && [ "$jobs" -ge "$MAX_JOBS" ]; then
+      wait
       return 0
     fi
     # Before every registration, not once at start: the group is the
@@ -149,10 +249,17 @@ run_slot() {
     # <config>` would hand the runner credential to that runner's jobs for as
     # long as this job ran. Inside the container it becomes run.sh's argument,
     # visible only in the container's own VM.
-    printf '%s\n' "$jit" | docker run --rm --init -i --name "$name" \
+    #
+    # The container outlives its job only until keep_cache has looked at it.
+    printf '%s\n' "$jit" | docker run --init -i --name "$name" \
       --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
-      "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+      "$(job_image)" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
     forget_runner "$id"
+    if [ -n "$CACHE_SEED" ]; then
+      keep_cache "$name" &
+    else
+      docker rm -f "$name" >/dev/null 2>&1 || true
+    fi
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
     log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
@@ -193,6 +300,12 @@ cmd_run() {
     || die "image $IMAGE is missing; run 'bash runner/linux-runner.sh build' first"
   gid="$(group_id)"
   mkdir -p "$state_dir"
+  # What a supervisor that was killed left: its finished jobs' containers and
+  # the lock keep_cache holds while it builds the cache image.
+  docker ps -aq --filter "name=^$prefix-" | while read -r leftover; do
+    docker rm -f "$leftover" >/dev/null 2>&1 || true
+  done
+  rmdir "$state_dir/keep-cache.lock" 2>/dev/null || true
   trap stop_slots INT TERM
   log "supervising $SLOTS slot(s) for label $LABEL in $ORG runner group $GROUP ($gid)"
   slot=1
@@ -249,6 +362,7 @@ cmd_install() {
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
+    <key>LINUX_RUNNER_CACHE_SEED</key><string>$CACHE_SEED</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -338,6 +452,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
+    <key>LINUX_RUNNER_CACHE_SEED</key><string>$CACHE_SEED</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

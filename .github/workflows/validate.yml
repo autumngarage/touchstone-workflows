@@ -130,9 +130,36 @@ jobs:
           fi
           printf 'save=%s\n' "$save" >>"$GITHUB_OUTPUT"
 
+      # On the Mac's single-use runners the job image can hold the products
+      # of this repository's last cache seed (runner/linux-runner.sh,
+      # LINUX_RUNNER_CACHE_SEED; AUT-2672). Taken only when the recorded key
+      # carries this run's prefix: the toolchain and package graph that
+      # restore-keys would accept from GitHub's cache.
+      - name: Use the runner's Swift build cache
+        id: runner-swift-cache
+        if: steps.swift-cache.outputs.enabled == 'true'
+        env:
+          CACHE_PREFIX: ${{ steps.swift-cache.outputs.prefix }}
+          RUNNER_CACHE_ROOT: /home/runner/swift-build-cache
+        run: |
+          set -euo pipefail
+          cache="$RUNNER_CACHE_ROOT/$GITHUB_REPOSITORY"
+          key="$(cat "$cache/.touchstone-swift-cache-key" 2>/dev/null || true)"
+          case "$key" in
+            "$CACHE_PREFIX"?*) ;;
+            *)
+              echo "This runner holds no build cache for this toolchain and package graph."
+              exit 0
+              ;;
+          esac
+          [ -d "$cache/.build" ] && [ ! -e .build ] || exit 0
+          cp -a "$cache/.build" .build
+          echo "Build cache from this runner's image: $key"
+          echo 'hit=true' >>"$GITHUB_OUTPUT"
+
       - name: Restore Swift build cache
         id: restore-swift-cache
-        if: steps.swift-cache.outputs.enabled == 'true'
+        if: steps.swift-cache.outputs.enabled == 'true' && steps.runner-swift-cache.outputs.hit != 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
@@ -167,6 +194,20 @@ jobs:
           if [ "$actual" != "$EXPECTED_TOOLCHAIN" ]; then
             echo "SWIFT_BUILD_CACHE requires validation setup to retain the preinstalled Swift toolchain." >&2
             exit 1
+          fi
+
+      # Tells runner/linux-runner.sh which cache this seed's .build is. Outside
+      # .build, so GitHub's copy never carries it into other runs.
+      - name: Record the Swift build cache key
+        if: success() && steps.swift-cache.outputs.save == 'true'
+        env:
+          CACHE_KEY: ${{ steps.swift-cache.outputs.key }}
+          CACHE_KEY_FILE: /home/runner/.touchstone-swift-cache-key
+        run: |
+          set -euo pipefail
+          [ -d .build ] || exit 0
+          if [ -w "$(dirname "$CACHE_KEY_FILE")" ]; then
+            printf '%s\n' "$CACHE_KEY" >"$CACHE_KEY_FILE"
           fi
 
       - name: Save default-branch Swift build cache
