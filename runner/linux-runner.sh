@@ -36,6 +36,13 @@
 #   LINUX_RUNNER_GROUP    runner group, restricted to the private consumers (linux-ephemeral)
 #   LINUX_RUNNER_LABEL    the label the LINUX_RUNNER variable names (linux-ephemeral)
 #   LINUX_RUNNER_SLOTS    jobs run at once (2)
+#   LINUX_RUNNER_QUEUE_SLOTS  how many of those slots only merge-queue jobs
+#                         may take (0). Every other slot also carries the label
+#                         LABEL-shared, which validate.yml requires for every
+#                         event but merge_group; a freed runner otherwise goes
+#                         to whichever job GitHub picks, often a pull request
+#                         queued after the queue's (AUT-2704). Must be fewer
+#                         than LINUX_RUNNER_SLOTS
 #   LINUX_RUNNER_MEMORY   memory limit per job container (6g)
 #   LINUX_RUNNER_CPUS     CPU limit per job container (4)
 #   LINUX_RUNNER_PIDS     process limit per job container (4096): a pull
@@ -78,6 +85,7 @@ ORG="${LINUX_RUNNER_ORG:-autumngarage}"
 GROUP="${LINUX_RUNNER_GROUP:-linux-ephemeral}"
 LABEL="${LINUX_RUNNER_LABEL:-linux-ephemeral}"
 SLOTS="${LINUX_RUNNER_SLOTS:-2}"
+QUEUE_SLOTS="${LINUX_RUNNER_QUEUE_SLOTS:-0}"
 MEMORY="${LINUX_RUNNER_MEMORY:-6g}"
 CPUS="${LINUX_RUNNER_CPUS:-4}"
 PIDS="${LINUX_RUNNER_PIDS:-4096}"
@@ -110,6 +118,8 @@ host="$(hostname -s 2>/dev/null || hostname)"
 prefix="$LABEL-$host"
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
+case "$QUEUE_SLOTS" in '' | *[!0-9]*) die "LINUX_RUNNER_QUEUE_SLOTS must be a non-negative integer, not '$QUEUE_SLOTS'" ;; esac
+[ "$QUEUE_SLOTS" -lt "$SLOTS" ] || die "LINUX_RUNNER_QUEUE_SLOTS ($QUEUE_SLOTS) must be fewer than LINUX_RUNNER_SLOTS ($SLOTS), or no pull request could run"
 case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker or colima, not '$ENGINE'" ;; esac
@@ -222,7 +232,10 @@ keep_cache() {
 
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
-  local gid name response jit id started rc image
+  local gid name response jit id started rc image shared=""
+  # Slots 1..QUEUE_SLOTS are the merge queue's; only the others take the jobs
+  # that require LABEL-shared.
+  [ "$slot" -le "$QUEUE_SLOTS" ] || shared="$LABEL-shared"
   while :; do
     if [ -n "$MAX_JOBS" ] && [ "$jobs" -ge "$MAX_JOBS" ]; then
       wait
@@ -245,7 +258,7 @@ run_slot() {
       fi
     fi
     name="$prefix-$slot-$(date +%s)"
-    if ! response="$(request_jit "$name" "$gid")"; then
+    if ! response="$(request_jit "$name" "$gid" "$shared")"; then
       log "slot $slot: could not register a runner ($response); retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
@@ -327,7 +340,7 @@ cmd_run() {
   done
   rmdir "$state_dir/keep-cache.lock" 2>/dev/null || true
   trap stop_slots INT TERM
-  log "supervising $SLOTS slot(s) for label $LABEL in $ORG runner group $GROUP ($gid)"
+  log "supervising $SLOTS slot(s), $QUEUE_SLOTS for the merge queue only, for label $LABEL in $ORG runner group $GROUP ($gid)"
   slot=1
   while [ "$slot" -le "$SLOTS" ]; do
     run_slot "$slot" &
@@ -378,6 +391,7 @@ cmd_install() {
     <key>LINUX_RUNNER_GROUP</key><string>$GROUP</string>
     <key>LINUX_RUNNER_LABEL</key><string>$LABEL</string>
     <key>LINUX_RUNNER_SLOTS</key><string>$SLOTS</string>
+    <key>LINUX_RUNNER_QUEUE_SLOTS</key><string>$QUEUE_SLOTS</string>
     <key>LINUX_RUNNER_MEMORY</key><string>$MEMORY</string>
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
@@ -468,6 +482,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_GROUP</key><string>$GROUP</string>
     <key>LINUX_RUNNER_LABEL</key><string>$LABEL</string>
     <key>LINUX_RUNNER_SLOTS</key><string>$SLOTS</string>
+    <key>LINUX_RUNNER_QUEUE_SLOTS</key><string>$QUEUE_SLOTS</string>
     <key>LINUX_RUNNER_MEMORY</key><string>$MEMORY</string>
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>

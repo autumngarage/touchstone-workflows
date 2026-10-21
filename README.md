@@ -100,15 +100,26 @@ the merge queue cannot pass an input and keep 20 minutes.
 
 ## Runner
 
-Every consumer job takes its runner from a selector of one shape. `validate`
-reads `LINUX_RUNNER`:
+Every consumer job takes its runner from a variable. `validate` reads
+`LINUX_RUNNER`:
 
 ```yaml
-runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
+runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
 ```
 
+Outside the merge queue it also requires the label `LINUX_RUNNER-shared`,
+which `runner/linux-runner.sh` gives every slot except the first
+`LINUX_RUNNER_QUEUE_SLOTS` (0 by default). Those reserved slots take only
+merge-queue jobs, while queue jobs may take any slot. GitHub does not hand a
+freed runner to the job that has waited longest: on 2026-10-20, with three
+slots, a queue validation waited 26 minutes while freed slots went to pull
+requests queued after it (AUT-2704), and a pull request ships only through the
+queue. Give the runners the label before a consumer's validation pin requires
+it, or its pull-request jobs wait for a runner that never matches.
+
 The two gate jobs, `review-gate` and `delivery-evidence`, read
-`LINUX_GATE_RUNNER` in the same shape. They run for seconds, and on one
+`LINUX_GATE_RUNNER`, without the merge-queue split:
+`fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER))`. They run for seconds, and on one
 variable they waited in line behind validations: on a repository with two
 runners of its own, 23 minutes on average on 2026-10-11, long enough for
 `touchstone pr open` to give up on them (AUT-2452). So a repository that sets

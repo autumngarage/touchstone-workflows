@@ -86,8 +86,10 @@ jobs:
     # GitHub-hosted runners only for single-use ones: LINUX_RUNNER names the
     # runners runner/linux-runner.sh registers for exactly one job in a
     # throwaway container, and nothing else (AUT-1596). See "Runner" in
-    # README.md.
-    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
+    # README.md. Every event but the merge queue also requires
+    # LINUX_RUNNER-shared, so slots the runner reserves for the queue
+    # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
+    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
     steps:
       - name: Checkout target repository

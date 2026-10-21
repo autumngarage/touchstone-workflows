@@ -108,14 +108,16 @@ group_id() {
   printf '%s\n' "$gid"
 }
 
-# request_jit NAME GID: register NAME in runner group GID for exactly one job
-# and print GitHub's response, or fail with it. A just-in-time registration
-# gets only the labels it is given, not the defaults config.sh adds, and every
-# workflow selector requires both.
+# request_jit NAME GID [EXTRA_LABEL]: register NAME in runner group GID for
+# exactly one job and print GitHub's response, or fail with it. A just-in-time
+# registration gets only the labels it is given, not the defaults config.sh
+# adds, and every workflow selector requires self-hosted and LABEL.
 request_jit() {
+  local extra=()
+  [ -z "${3:-}" ] || extra=(-f "labels[]=$3")
   gh api -X POST "orgs/$ORG/actions/runners/generate-jitconfig" \
     -f name="$1" -F runner_group_id="$2" -f "labels[]=self-hosted" -f "labels[]=$LABEL" \
-    -f work_folder=_work 2>&1
+    ${extra[@]+"${extra[@]}"} -f work_folder=_work 2>&1
 }
 
 # Best effort: GitHub removes a single-use runner after its job, so a 404 here
