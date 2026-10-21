@@ -66,6 +66,19 @@ restore prefix across revisions. Cached `.build` output accelerates compilation;
 the declared validation command always runs, including on an exact cache hit.
 No runner volume or writable cache is shared between job containers.
 
+On the single-use Linux runners, the job image can carry the products of the
+consumer's last default-branch seed (`LINUX_RUNNER_CACHE_SEED`, AUT-2672), and
+validation copies them into place instead of downloading GitHub's cache when
+their recorded key has the run's restore prefix, the same products
+`restore-keys` would accept. The supervisor keeps them only when GitHub's own
+record says that runner ran the seed workflow's job for a push to the default
+branch and the job succeeded; a key the job wrote proves nothing by itself.
+The products sit in an image no job writes, so each job still starts from a
+fresh container and nothing a pull request does reaches another job. The
+image holds that repository's build, so a job starts from it only while the
+runner group admits that repository and no other; the supervisor checks the
+group before every registration.
+
 A consumer must also invoke this pinned workflow through `workflow_call` on
 default-branch pushes to produce reusable default-branch caches. PR-only caches
 are confined to their merge refs and do not seed other PRs, so required PR and
@@ -120,7 +133,9 @@ ephemeral, so the guarantee lives where runners are registered:
 label. For each job it asks GitHub for a just-in-time configuration, which
 registers a runner for exactly one job, and starts a fresh container that
 holds that configuration and nothing else: no volume, no Docker socket, no
-host network, no credential (`tests/test-runner.sh` pins this). Never register
+host network, no credential (`tests/test-runner.sh` pins this). The image can
+include a default-branch seed's build products (see "Swift build caches");
+nothing else from a finished job is ever kept. Never register
 a long-lived runner with the label or into its group. Before every
 registration the supervisor also checks the group itself: it must be visible
 only to selected repositories, closed to public ones, and hold only private

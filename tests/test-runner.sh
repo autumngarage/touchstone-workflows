@@ -24,6 +24,7 @@ printf 'gh %s\n' "$*" >>"$FAKE_CALLS"
 case "$*" in
   *runner-groups/*/repositories*)
     [ -f "$FAKE_STATE/empty-group" ] && exit 0
+    if [ -f "$FAKE_STATE/seed-only-group" ]; then echo "autumngarage/hesperus true"; exit 0; fi
     echo "autumngarage/vesper true"
     [ -f "$FAKE_STATE/public-repo" ] && echo "autumngarage/touchstone false"
     exit 0
@@ -48,18 +49,64 @@ case "$*" in
     ;;
   # GitHub has already removed a single-use runner that took its job.
   *"-X DELETE"*) exit 1 ;;
+  # The cache seed's record (AUT-2672): seed-run is a recent push run of the
+  # seed workflow; seed-job-ok says that run has a successful job on the
+  # runner the query names. The real jq does the selecting; this answers as
+  # it would.
+  *"repos/autumngarage/hesperus --jq .default_branch"*) echo main ;;
+  *"actions/workflows/swift-cache.yml/runs?branch=main&event=push"*)
+    [ -f "$FAKE_STATE/seed-run" ] && echo "77 ${FAKE_SEED_STARTED:-2026-10-20T10:00:00Z}"
+    exit 0
+    ;;
+  *"actions/runs/77/jobs"*)
+    [ -f "$FAKE_STATE/seed-job-ok" ] && echo 555
+    exit 0
+    ;;
 esac
 EOF
 cat >"$bin/docker" <<'EOF'
 #!/usr/bin/env bash
 printf 'docker %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
-  image) [ ! -f "$FAKE_STATE/no-image" ] ;;
+  image)
+    [ ! -f "$FAKE_STATE/no-image" ] || exit 1
+    [ "$2" = inspect ] || exit 0
+    # The base image's id; the cache image exists once commit made it.
+    case "$*" in
+      *-swift-cache*)
+        [ -f "$FAKE_STATE/cache-image" ] || exit 1
+        case "$*" in
+          *swift-cache.base*) cat "$FAKE_STATE/cache-base" ;;
+          *seed-started*) cat "$FAKE_STATE/cache-started" ;;
+        esac
+        ;;
+      *'{{.Id}}'*) cat "$FAKE_STATE/base-id" 2>/dev/null || echo sha256:base-1 ;;
+    esac
+    ;;
   run)
     # What the container reads on stdin, where the configuration must arrive.
-    printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS"
+    case " $* " in *" -i "*) printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS" ;; esac
     exit "${FAKE_DOCKER_RC:-0}"
     ;;
+  # Only the seed's validation writes the key file.
+  cp)
+    [ "$2" != -a ] || shift
+    case "$2" in *:/home/runner/.touchstone-swift-cache-key) [ -f "$FAKE_STATE/seed-key" ] || exit 1 ;; esac
+    [ "$3" != - ] || echo tar
+    case "$2" in *.build) [ ! -f "$FAKE_STATE/cp-fails" ] || exit 1 ;; esac
+    [ "$2" != - ] || cat >/dev/null
+    ;;
+  commit)
+    [ ! -f "$FAKE_STATE/commit-fails" ] || exit 1
+    for arg in "$@"; do
+      case "$arg" in
+        "LABEL touchstone.swift-cache.base="*) printf '%s\n' "${arg#*=}" >"$FAKE_STATE/cache-base" ;;
+        "LABEL touchstone.swift-cache.seed-started="*) printf '%s\n' "${arg#*=}" >"$FAKE_STATE/cache-started" ;;
+      esac
+    done
+    touch "$FAKE_STATE/cache-image"
+    ;;
+  ps) cat "$FAKE_STATE/leftovers" 2>/dev/null || true ;;
   *) exit 0 ;;
 esac
 EOF
@@ -130,9 +177,11 @@ EOF
 chmod +x "$bin"/*
 
 # runner ARGS...: run the script against the fakes with a fresh call log and
-# state; stdout+stderr land in $tmp/out and the exit code in $rc.
+# state; stdout+stderr land in $tmp/out and the exit code in $rc. KEEP_FAKE
+# keeps the fake engine's images from the previous call.
 runner() {
-  rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/daemons"
+  rm -rf "${tmp:?}/state" "${tmp:?}/daemons"
+  [ -n "${KEEP_FAKE:-}" ] || rm -rf "${tmp:?}/fake"
   [ -n "${KEEP_HOME:-}" ] || rm -rf "${tmp:?}/home"
   mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
   : >"$tmp/calls"
@@ -143,6 +192,7 @@ runner() {
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
+    LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" FAKE_SEED_STARTED="${SEED_STARTED:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -165,7 +215,7 @@ run_line="$(grep '^docker run ' "$tmp/calls")"
 # container instead of exhausting the VM every slot shares.
 # The last literal is the container's own command text, matched as written.
 # shellcheck disable=SC2016
-for arg in '--rm' '--init' ' -i ' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' 'exec ./run.sh --jitconfig "$jit"'; do
+for arg in '--init' ' -i ' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' 'exec ./run.sh --jitconfig "$jit"'; do
   case "$run_line" in *"$arg"*) ;; *) fail "container is missing '$arg': $run_line" ;; esac
 done
 for forbidden in ' -v ' '--volume' '--mount' '--privileged' 'docker.sock' '--network' ' -e ' '--env' 'GH_TOKEN' '--cap-add'; do
@@ -178,8 +228,78 @@ case "$run_line" in *SINGLE-USE-CONFIG*) fail "the single-use configuration is a
 has 'docker-stdin SINGLE-USE-CONFIG' "the configuration arrives on the container's stdin"
 ok "the container gets the single-use configuration, on stdin, and nothing else"
 has '-X DELETE orgs/autumngarage/actions/runners/4242' "cleanup"
+has 'docker rm -f linux-ephemeral-testhost-1-' "the finished job's container is removed"
+lacks 'docker cp|docker commit|actions/workflows' "with no cache seed configured, a finished container is only removed"
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"
+
+echo "==> the cache seed's products are kept only on GitHub's word (AUT-2672)"
+seed=autumngarage/hesperus:swift-cache.yml
+# A job that left no key: nothing asked, nothing kept, the container removed.
+CACHE_SEED=$seed runner run
+[ "$rc" -eq 0 ] || fail "a cache-seed run exited $rc: $(cat "$tmp/out")"
+lacks 'actions/workflows|docker commit' "a job with no cache key"
+has 'docker rm -f linux-ephemeral-testhost-1-' "a job with no cache key"
+run_line="$(grep '^docker run ' "$tmp/calls")"
+case "$run_line" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "with no cache image, a job must start from the base: $run_line" ;; esac
+# A key in the container is the job's own claim. A pull request's job can
+# write one too, so without GitHub's record of the seed nothing is kept.
+for flags in 'seed-key' 'seed-key seed-run'; do
+  FLAGS=$flags CACHE_SEED=$seed runner run
+  [ "$rc" -eq 0 ] || fail "$flags: exited $rc: $(cat "$tmp/out")"
+  has 'actions/workflows/swift-cache.yml/runs?branch=main&event=push' "$flags: GitHub is asked for the seed's default-branch push runs"
+  case "$flags" in *seed-run*) has 'select(.runner_name == "linux-ephemeral-testhost-1-' "$flags: and for a job on this very runner" ;; esac
+  lacks 'docker commit' "$flags: a job GitHub does not record as the seed"
+  grep -q 'GitHub records no successful autumngarage/hesperus:swift-cache.yml job' "$tmp/out" || fail "$flags: the refusal is not logged: $(cat "$tmp/out")"
+  has 'docker rm -f linux-ephemeral-testhost-1-' "$flags: an unproven container is removed"
+done
+ok "a container's own claim to be the seed keeps nothing"
+FLAGS='seed-key seed-run seed-job-ok' CACHE_SEED=$seed runner run
+[ "$rc" -eq 0 ] || fail "a seed run exited $rc: $(cat "$tmp/out")"
+has 'docker cp -a linux-ephemeral-testhost-1-' "the seed's .build is copied"
+has ':/home/runner/_work/hesperus/hesperus/.build -' "from the seed's workspace"
+has ':/home/runner/swift-build-cache/autumngarage/hesperus' "into the cache path validate.yml reads"
+has 'docker commit --change LABEL touchstone.swift-cache.base=sha256:base-1 --change LABEL touchstone.swift-cache.seed-started=2026-10-20T10:00:00Z' "the cache image records its base and its seed"
+has 'linux-ephemeral-runner:local-swift-cache' "the cache image's tag"
+[ "$(grep -c '^docker rm -f linux-ephemeral-testhost-1-' "$tmp/calls")" -ge 2 ] || fail "the seed's and the staging containers are not both removed: $(cat "$tmp/calls")"
+[ -z "$(ls "$tmp/state")" ] || fail "keeping the cache left state behind: $(ls "$tmp/state")"
+ok "a job GitHub records as the seed's success leaves its products in the cache image"
+# The cache image holds the seed repository's build, so a group that admits
+# any other repository never starts a job from it.
+KEEP_FAKE=1 CACHE_SEED=$seed runner run
+case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a group shared with another repository started a job from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
+grep -q "admits repositories other than autumngarage/hesperus; this job starts without its build cache" "$tmp/out" || fail "the shared group is not logged: $(cat "$tmp/out")"
+ok "a runner group shared with another repository never starts a job from the cache image"
+# The next job starts from the cache image, while it was made from this base.
+FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
+case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local-swift-cache bash -c"*) ;; *) fail "the next job did not start from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
+echo sha256:base-2 >"$tmp/fake/base-id"
+FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
+case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a rebuilt base kept the old products: $(grep '^docker run ' "$tmp/calls")" ;; esac
+ok "jobs start from the cache image only while its base is the base image as it is"
+# An older seed that finishes last does not replace a newer one's products.
+# (The run above found the seed's flags still set, so its cache image is now
+# made from base-2, by the same seed.)
+touch "$tmp/fake/seed-key" "$tmp/fake/seed-run" "$tmp/fake/seed-job-ok"
+SEED_STARTED=2026-10-20T09:00:00Z KEEP_FAKE=1 CACHE_SEED=$seed runner run
+lacks 'docker commit' "an older seed"
+grep -q 'already holds one started 2026-10-20T10:00:00Z' "$tmp/out" || fail "the older seed's refusal is not logged: $(cat "$tmp/out")"
+SEED_STARTED=2026-10-20T11:00:00Z KEEP_FAKE=1 CACHE_SEED=$seed runner run
+has 'touchstone.swift-cache.seed-started=2026-10-20T11:00:00Z' "a newer seed"
+ok "a newer seed replaces the products; an older one does not"
+FLAGS='seed-key seed-run seed-job-ok cp-fails' CACHE_SEED=$seed runner run
+[ "$rc" -eq 0 ] || fail "a failed copy stopped the slot: $(cat "$tmp/out")"
+lacks 'docker commit' "a failed copy"
+grep -q "jobs keep the previous ones" "$tmp/out" || fail "a failed copy is not logged: $(cat "$tmp/out")"
+ok "a copy that fails keeps nothing, says so, and the slot goes on"
+# What a killed supervisor left is cleared when the next one starts.
+mkdir -p "$tmp/fake"
+FLAGS='' runner run
+printf 'abc123\n' >"$tmp/fake/leftovers"
+KEEP_FAKE=1 runner run
+has 'docker ps -aq --filter name=^linux-ephemeral-testhost-' "leftovers are looked for"
+has 'docker rm -f abc123' "a leftover container is removed"
+ok "a restart removes the containers a killed supervisor left"
 
 echo "==> failures back off instead of spinning"
 FLAGS=jit-fails runner run
@@ -219,6 +339,10 @@ ok "a missing image registers nothing"
 SLOTS=0 runner run
 [ "$rc" -ne 0 ] || fail "zero slots was accepted"
 ok "the slot count must be a positive integer"
+CACHE_SEED=hesperus runner run
+refused 'LINUX_RUNNER_CACHE_SEED must be OWNER/REPO:WORKFLOW_FILE' "a malformed cache seed"
+lacks 'generate-jitconfig' "a malformed cache seed"
+ok "a malformed cache seed registers nothing"
 
 echo "==> install runs the supervisor from a copy, kept awake"
 runner install
@@ -288,6 +412,10 @@ cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did no
 has 'launchctl bootstrap system' "install-daemon"
 has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
 ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token"
+seed_token
+CACHE_SEED=autumngarage/hesperus:swift-cache.yml KEEP_HOME=1 runner install-daemon "$real_user"
+grep -Fq "<key>LINUX_RUNNER_CACHE_SEED</key><string>autumngarage/hesperus:swift-cache.yml</string>" "$dplist" || fail "the daemon lost its cache seed"
+ok "the LaunchDaemon carries the cache seed"
 seed_token
 FLAGS=not-root KEEP_HOME=1 runner install-daemon "$real_user"
 refused 'run it with sudo' "a non-root install"
