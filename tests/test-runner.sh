@@ -189,6 +189,7 @@ runner() {
   set +e
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
     LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
+    LINUX_RUNNER_QUEUE_SLOTS="${QUEUE_SLOTS:-}" \
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
@@ -210,6 +211,8 @@ has 'runner_group_id=7' "registration binds the runner group"
 # every job waits forever for a runner that never matches.
 has 'labels[]=self-hosted' "registration carries the self-hosted label every selector requires"
 has 'labels[]=linux-ephemeral' "registration carries the label LINUX_RUNNER names"
+# With no slot reserved, every slot takes every job, as before AUT-2704.
+has 'labels[]=linux-ephemeral-shared' "an unreserved slot carries the label validate requires outside the merge queue"
 run_line="$(grep '^docker run ' "$tmp/calls")"
 # --pids-limit keeps a pull request that forks without end inside its own
 # container instead of exhausting the VM every slot shares.
@@ -232,6 +235,28 @@ has 'docker rm -f linux-ephemeral-testhost-1-' "the finished job's container is 
 lacks 'docker cp|docker commit|actions/workflows' "with no cache seed configured, a finished container is only removed"
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"
+
+echo "==> slots reserved for the merge queue take only its jobs (AUT-2704)"
+SLOTS=3 QUEUE_SLOTS=1 runner run
+[ "$rc" -eq 0 ] || fail "a run with a reserved slot exited $rc: $(cat "$tmp/out")"
+registrations() { grep 'generate-jitconfig' "$tmp/calls" | grep -F -- "name=linux-ephemeral-testhost-$1-" || true; }
+for slot in 1 2 3; do
+  [ "$(registrations "$slot" | grep -c .)" -eq 1 ] || fail "slot $slot did not register exactly once: $(cat "$tmp/calls")"
+  registrations "$slot" | grep -Fq 'labels[]=self-hosted -f labels[]=linux-ephemeral' || fail "slot $slot lost its required labels: $(registrations "$slot")"
+done
+registrations 1 | grep -Fq 'linux-ephemeral-shared' && fail "the reserved slot carries the shared label: $(registrations 1)"
+for slot in 2 3; do
+  registrations "$slot" | grep -Fq 'labels[]=linux-ephemeral-shared' || fail "unreserved slot $slot lacks the shared label: $(registrations "$slot")"
+done
+grep -Fq 'supervising 3 slot(s), 1 for the merge queue only' "$tmp/out" || fail "the reservation is not logged: $(cat "$tmp/out")"
+ok "the first QUEUE_SLOTS slots lack the shared label; the others carry it"
+for bad in 3 4 x; do
+  SLOTS=3 QUEUE_SLOTS=$bad runner run
+  [ "$rc" -ne 0 ] || fail "QUEUE_SLOTS=$bad of 3 was accepted"
+  lacks 'generate-jitconfig' "QUEUE_SLOTS=$bad"
+done
+grep -Fq 'LINUX_RUNNER_QUEUE_SLOTS must be a non-negative integer' "$tmp/out" || fail "a malformed reservation was not named: $(cat "$tmp/out")"
+ok "a reservation that would leave pull requests no slot, or is not a number, registers nothing"
 
 echo "==> the cache seed's products are kept only on GitHub's word (AUT-2672)"
 seed=autumngarage/hesperus:swift-cache.yml
@@ -355,6 +380,7 @@ grep -Fq "<string>$tmp/state/linux-runner.sh</string>" "$plist" || fail "the age
 # The copy sources jit.sh from its own directory, so it must travel with it.
 cmp -s "$tmp/state/jit.sh" "$root/runner/jit.sh" || fail "install did not copy runner/jit.sh beside the supervisor"
 grep -Fq '<key>LINUX_RUNNER_LABEL</key><string>linux-ephemeral</string>' "$plist" || fail "the agent lost its label"
+grep -Fq '<key>LINUX_RUNNER_QUEUE_SLOTS</key><string>0</string>' "$plist" || fail "the agent lost its merge-queue reservation"
 has 'launchctl bootstrap' "install"
 ok "the LaunchAgent runs a copy of the supervisor under caffeinate"
 

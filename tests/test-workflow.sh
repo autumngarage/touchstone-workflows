@@ -42,8 +42,16 @@ assert_count 1 'name: validate \(ubuntu-latest\)'
 # minutes on average on 2026-10-11). Neither may read the other's setting: a
 # gate on LINUX_RUNNER is that wait again, and validate on LINUX_GATE_RUNNER
 # would leave the runners a repository set up for it.
+#
+# AUT-2704: every event but merge_group also requires LINUX_RUNNER-shared, the
+# label runner/linux-runner.sh gives every slot not reserved for the merge
+# queue. The queue's selector must stay a subset of the others', so a queue
+# job may take any slot.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
+runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == '\''merge_group'\'' && '\''["self-hosted","{0}"]'\'' || '\''["self-hosted","{0}","{0}-shared"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
+# The shape before AUT-2704, which would let any job take a reserved slot.
+# shellcheck disable=SC2016
+plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
 # shellcheck disable=SC2016
 gate_runner_selector='runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_GATE_RUNNER)) || '\''ubuntu-latest'\'' }}'
 active_count() {
@@ -53,10 +61,13 @@ active_count() {
   || fail "$workflow: its consumer job must take its runner from the LINUX_RUNNER selector"
 [ "$(active_count "$workflow" "$gate_runner_selector")" -eq 0 ] \
   || fail "$workflow: validate must not take its runner from the gate jobs' setting"
+[ "$(active_count "$workflow" "$plain_runner_selector")" -eq 0 ] \
+  || fail "$workflow: validate must keep the merge queue's reserved slots for the queue"
 for gate in "$review_gate" "$delivery_evidence"; do
   [ "$(active_count "$gate" "$gate_runner_selector")" -eq 1 ] \
     || fail "$gate: its consumer job must take its runner from the LINUX_GATE_RUNNER selector"
   [ "$(active_count "$gate" "$runner_selector")" -eq 0 ] \
+    && [ "$(active_count "$gate" "$plain_runner_selector")" -eq 0 ] \
     || fail "$gate: a gate job must not take its runner from validate's setting"
 done
 # Self-test fixtures append jobs of their own; only production is exhaustive.
