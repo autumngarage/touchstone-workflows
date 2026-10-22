@@ -427,6 +427,51 @@ has 'docker ps -aq --filter name=^linux-ephemeral-testhost-' "leftovers are look
 has 'docker rm -f abc123' "a leftover container is removed"
 ok "a restart removes the containers a killed supervisor left"
 
+echo "==> a stop signal drains: running jobs finish, nothing new registers (AUT-2763)"
+# A supervisor holding two jobs (4 s each). The first TERM arrives while they
+# run: both must finish, no third runner may register, and it exits cleanly.
+# Job control gives the supervisor its own process group, which stop_slots ends.
+set -m
+rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/home"
+mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
+: >"$tmp/calls"
+touch "$tmp/fake/delete-ok"
+PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+  LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=2 LINUX_RUNNER_MAX_JOBS=5 \
+  LINUX_RUNNER_ENGINE=docker LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
+  FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD=4 FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=none \
+  LINUX_RUNNER_DRAIN_INTERVAL=1 \
+  bash "$script" run >"$tmp/out" 2>&1 &
+sup=$!
+until [ "$(grep -c '^run$' "$tmp/fake/started" 2>/dev/null || echo 0)" -ge 2 ]; do /bin/sleep 0.2; done
+kill -TERM "$sup"
+/bin/sleep 1
+kill -0 "$sup" 2>/dev/null || fail "a stop signal ended the supervisor while jobs were running: $(cat "$tmp/out")"
+rc=0; wait "$sup" || rc=$?
+[ "$rc" -eq 0 ] || fail "a drained supervisor exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c 'generate-jitconfig' "$tmp/calls")" -eq 2 ] \
+  || fail "a runner registered after the stop signal: $(grep generate-jitconfig "$tmp/calls")"
+grep -Fq 'draining' "$tmp/out" || fail "the drain is not logged: $(cat "$tmp/out")"
+[ ! -e "$tmp/state/draining" ] || fail "the drain marker outlived the supervisor"
+ok "the first stop signal lets running jobs finish and registers nothing more"
+# A second signal stops at once.
+rm -rf "${tmp:?}/state" "${tmp:?}/fake"
+mkdir -p "$tmp/state" "$tmp/fake"
+: >"$tmp/calls"
+PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+  LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=1 LINUX_RUNNER_MAX_JOBS=5 \
+  LINUX_RUNNER_ENGINE=docker LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
+  FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD=30 FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=none \
+  bash "$script" run >"$tmp/out" 2>&1 &
+sup=$!
+until [ -f "$tmp/fake/started" ]; do /bin/sleep 0.2; done
+kill -TERM "$sup"; /bin/sleep 0.5; kill -TERM "$sup"
+/bin/sleep 1
+! kill -0 "$sup" 2>/dev/null || { kill -KILL "$sup" 2>/dev/null; fail "a second stop signal did not stop the supervisor"; }
+wait "$sup" 2>/dev/null || true
+set +m
+ok "a second stop signal stops at once"
+
 echo "==> failures back off instead of spinning"
 FLAGS=jit-fails runner run
 [ "$rc" -eq 0 ] || fail "a recovered registration failure exited $rc"
@@ -536,6 +581,7 @@ grep -Fq "<key>HOME</key><string>$tmp/home</string>" "$dplist" || fail "the daem
 grep -Fq 'ghp_DAEMON' "$dplist" && fail "the token was written into the plist"
 [ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
 cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
+grep -Fq '<key>ExitTimeOut</key><integer>5400</integer>' "$dplist" || fail "the daemon is not given time to drain before the service manager kills it"
 has 'launchctl bootstrap system' "install-daemon"
 has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
 ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token"

@@ -121,6 +121,8 @@ MAX_JOBS="${LINUX_RUNNER_MAX_JOBS:-}"
 BACKOFF_START=15
 # How often idle queue-only runners are reconsidered, and a test seam.
 JANITOR_INTERVAL="${LINUX_RUNNER_JANITOR_INTERVAL:-60}"
+# How often a draining supervisor removes the runners that have no job.
+DRAIN_INTERVAL="${LINUX_RUNNER_DRAIN_INTERVAL:-5}"
 BACKOFF_MAX=300
 AGENT_ID="com.autumngarage.linux-ephemeral-runner"
 
@@ -401,6 +403,10 @@ run_slot() {
       wait
       return 0
     fi
+    if [ -e "$state_dir/draining" ]; then
+      log "slot $slot: draining; registering nothing more"
+      return 0
+    fi
     # Before every registration, not once at start: the group is the
     # boundary, and it can be edited while the supervisor runs.
     if ! gid="$(group_id)"; then
@@ -459,6 +465,36 @@ run_slot() {
   done
 }
 
+# The first stop signal drains: nothing new registers, the registrations that
+# have no job are removed, and the jobs that run are left to finish, so a
+# restart cuts none of them (AUT-2763). A cancelled merge-queue job evicts its
+# entry and everything behind it. A second signal stops at once, and so does
+# the service manager's kill once its exit timeout has passed.
+drain_slots() {
+  trap stop_slots INT TERM
+  : >"$state_dir/draining"
+  log "stop requested: draining; running jobs finish first (signal again to stop at once)"
+  drain_idle &
+  drain_pid=$!
+}
+
+# drain_idle: while any runner of this host is registered, remove the ones
+# that have no job. GitHub refuses to remove a runner that has one, and that
+# refusal is what leaves it alone.
+drain_idle() {
+  local file id name busy
+  while ls "$state_dir"/slot-* >/dev/null 2>&1; do
+    for file in "$state_dir"/slot-*; do
+      [ -f "$file" ] || continue
+      read -r id name _ <"$file" || continue
+      busy="$(gh api "orgs/$ORG/actions/runners/$id" --jq .busy 2>/dev/null)" || continue
+      [ "$busy" = false ] || continue
+      gh api -X DELETE "orgs/$ORG/actions/runners/$id" >/dev/null 2>&1 || true
+    done
+    sleep "$DRAIN_INTERVAL"
+  done
+}
+
 # On stop, take down this host's job containers and the registrations that
 # have not taken a job yet, so nothing is left waiting for work.
 stop_slots() {
@@ -475,7 +511,7 @@ stop_slots() {
 }
 
 cmd_run() {
-  local gid slot pids janitor_pid
+  local gid slot pid pids janitor_pid drain_pid=""
   ensure_engine
   need gh "install the GitHub CLI and log in with admin:org"
   need jq "install jq"
@@ -490,7 +526,8 @@ cmd_run() {
     docker rm -f "$leftover" >/dev/null 2>&1 || true
   done
   rmdir "$state_dir/keep-cache.lock" "$state_dir/roles.lock" 2>/dev/null || true
-  trap stop_slots INT TERM
+  rm -f "$state_dir/draining"
+  trap drain_slots INT TERM
   log "supervising $SLOTS slot(s), $QUEUE_SLOTS kept ready for the merge queue, for label $LABEL in $ORG runner group $GROUP ($gid)"
   if [ "$QUEUE_SLOTS" -gt 0 ]; then can_read_runs "$gid"; fi
   slot=1
@@ -506,8 +543,13 @@ cmd_run() {
     janitor "$gid" 2>/dev/null &
     janitor_pid=$!
   fi
-  # shellcheck disable=SC2086
-  wait $pids || true
+  # A trapped signal ends a wait early; the slots are done when their
+  # processes are.
+  for pid in $pids; do
+    while kill -0 "$pid" 2>/dev/null; do wait "$pid" || true; done
+  done
+  if [ -n "$drain_pid" ]; then kill "$drain_pid" 2>/dev/null || true; fi
+  rm -f "$state_dir/draining"
   if [ -n "$janitor_pid" ]; then
     pkill -P "$janitor_pid" 2>/dev/null || true
     kill "$janitor_pid" 2>/dev/null || true
@@ -566,6 +608,7 @@ cmd_install() {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>60</integer>
+  <key>ExitTimeOut</key><integer>5400</integer>
   <key>StandardOutPath</key><string>$log_file</string>
   <key>StandardErrorPath</key><string>$log_file</string>
 </dict>
@@ -657,6 +700,7 @@ cmd_install_daemon() {
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>60</integer>
+  <key>ExitTimeOut</key><integer>5400</integer>
   <key>StandardOutPath</key><string>$log_file</string>
   <key>StandardErrorPath</key><string>$log_file</string>
 </dict>

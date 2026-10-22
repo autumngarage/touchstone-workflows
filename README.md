@@ -133,6 +133,15 @@ pull-request job waits, idle queue-only runners that no waiting queue job needs
 are removed and their slots register again with a fresh role. GitHub refuses to
 remove a runner that has a job, so nothing running is cut.
 
+**Stopping drains (AUT-2763).** The first `SIGTERM` or `SIGINT` to the
+supervisor (a `launchctl bootout`, or a restart through `linux-runner-admin
+apply`) stops registering runners, removes the registrations that have no job,
+and lets the jobs that run finish before it exits, so a restart cuts none of
+them. A cancelled merge-queue job evicts its entry and the ones behind it. A
+second signal stops at once, and the daemon's plist gives the drain
+`ExitTimeOut` 5400 s before the service manager kills it. A daemon installed
+before this change still has the default 20 s; its first restart is not graceful.
+
 The token the supervisor uses needs **Actions: read** on every repository in
 the runner group, in addition to the organization's self-hosted-runner
 permission, to see what waits. The supervisor checks at start and says so in
