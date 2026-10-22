@@ -99,13 +99,14 @@ jobs:
       # exactly this shape: `REVIEW_EVIDENCE_WAIT_SECONDS: <integer>`.
       REVIEW_EVIDENCE_WAIT_SECONDS: 600
       # The ceiling is per EVALUATION and is O(pages), independent of how
-      # much review history the pull request carries: 2 fixed reads, up to
-      # MAX_EVIDENCE_PAGES each of timeline and issue-comment pages, and one
-      # resolution per trusted head-prefix result candidate (normally one).
+      # much review history the pull request carries: 1 fixed read, up to
+      # MAX_EVIDENCE_PAGES each of timeline, issue-comment and open-pull-request
+      # pages, and one resolution per trusted head-prefix result candidate
+      # (normally one).
       # A page bound, unlike the historical per-record work it replaces,
       # cannot be exhausted by accumulating review rounds (AUT-1106). A run
       # makes one evaluation, and the fallback opens one budget of its own.
-      REST_REQUEST_LIMIT: 12
+      REST_REQUEST_LIMIT: 16
       MAX_EVIDENCE_PAGES: 4
       # Fallback reviewer. Absent credential = no fallback; the gate then
       # behaves exactly as it did before this step existed.
@@ -328,8 +329,12 @@ jobs:
           api_array "repos/$REPO/issues/$number/comments?per_page=100" "$tmp/issues.json"
           resolve_head_prefix_candidates "$head" "$tmp/issues.json" "$tmp/issues-resolved.json"
 
-          # One head must belong to exactly one open pull request.
-          rest_api "repos/$REPO/commits/$head/pulls?per_page=100" >"$tmp/head-pulls.json"
+          # One head must belong to exactly one open pull request. The open
+          # pull requests are listed and matched on the head below: the
+          # per-commit endpoint answers HTTP 500 with an empty body for some
+          # heads on every attempt, and gh reports that as "unexpected end of
+          # JSON input", so the head could never be merged (AUT-2765).
+          api_array "repos/$REPO/pulls?state=open&per_page=100" "$tmp/head-pulls.json"
 
           # Formal reviews, bound by GitHub to their commit. One page covers
           # the supported scale; more is a distinct budget failure.
