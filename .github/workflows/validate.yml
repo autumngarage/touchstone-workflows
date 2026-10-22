@@ -22,7 +22,7 @@ on:
       timeout_minutes:
         description: Job time limit in minutes. Raise it only for a cache seed that may build cold.
         type: number
-        default: 20
+        default: 30
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -90,7 +90,9 @@ jobs:
     # LINUX_RUNNER-shared, so slots the runner reserves for the queue
     # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
     runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
-    timeout-minutes: ${{ inputs.timeout_minutes || 20 }}
+    # 30, not 20: a hesperus check takes 13-18 minutes, and at 20 a busy
+    # host evicted six healthy merge-queue entries in a day (AUT-2752).
+    timeout-minutes: ${{ inputs.timeout_minutes || 30 }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
