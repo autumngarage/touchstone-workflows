@@ -243,7 +243,7 @@ assert_active_line "$review_gate" \
   'REVIEW_EVIDENCE_WAIT_SECONDS: 600' \
   "review evidence deadline"
 assert_active_line "$review_gate" \
-  'REST_REQUEST_LIMIT: 12' \
+  'REST_REQUEST_LIMIT: 16' \
   "review REST request bound"
 assert_active_line "$review_gate" \
   'MAX_EVIDENCE_PAGES: 4' \
@@ -396,6 +396,14 @@ done
   || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) is inside the band where the reviewer still answers; it would cut off reviews that were going to arrive"
 [ "$production_evidence_wait_seconds" -le 1200 ] \
   || fail "REVIEW_EVIDENCE_WAIT_SECONDS ($production_evidence_wait_seconds) waits past the measured band, buying latency the measurement says does not exist (AUT-1417)"
+# AUT-2765: the per-commit pulls endpoint answers HTTP 500 with an empty body
+# for some heads on every attempt (gh: "unexpected end of JSON input"), which
+# left hesperus #1371's head unmergeable. The head's open pull requests come
+# from the open-pull-request list instead.
+! grep -Eq 'commits/\$head/pulls' "$review_gate" \
+  || fail "review-gate reads the per-commit pulls endpoint, which can answer 500 for a head every time"
+grep -Fq 'api_array "repos/$REPO/pulls?state=open&per_page=100" "$tmp/head-pulls.json"' "$review_gate" \
+  || fail "review-gate must find a head's open pull requests in the open-pull-request list"
 direct_rest_calls="$(grep -nE '^[[:space:]]*gh api ' "$review_gate" | grep -v 'gh api "\$@"' | grep -v 'gh api graphql' || true)"
 [ -z "$direct_rest_calls" ] \
   || fail "review evidence bypasses the enforced REST request boundary: $direct_rest_calls"
