@@ -109,15 +109,36 @@ Every consumer job takes its runner from a variable. `validate` reads
 runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
 ```
 
-Outside the merge queue it also requires the label `LINUX_RUNNER-shared`,
-which `runner/linux-runner.sh` gives every slot except the first
-`LINUX_RUNNER_QUEUE_SLOTS` (0 by default). Those reserved slots take only
-merge-queue jobs, while queue jobs may take any slot. GitHub does not hand a
-freed runner to the job that has waited longest: on 2026-10-20, with three
-slots, a queue validation waited 26 minutes while freed slots went to pull
-requests queued after it (AUT-2704), and a pull request ships only through the
-queue. Give the runners the label before a consumer's validation pin requires
-it, or its pull-request jobs wait for a runner that never matches.
+Outside the merge queue it also requires the label `LINUX_RUNNER-shared`. A
+runner registered without it is queue-only: it takes only merge-queue jobs.
+GitHub does not hand a freed runner to the job that has waited longest: on
+2026-10-20, with three slots, a queue validation waited 26 minutes while freed
+slots went to pull requests queued after it (AUT-2704), and a pull request
+ships only through the queue.
+
+`runner/linux-runner.sh` chooses each new runner's role when it registers,
+from what is waiting for a runner of the fleet (AUT-2757), so the split
+follows the load and no count needs tuning. With `LINUX_RUNNER_QUEUE_SLOTS=N`
+(0, off, by default; every runner is then shared):
+
+1. queue jobs waiting beyond the idle queue-only runners: the new runner is
+   queue-only, so a freed slot goes to the queue first;
+2. otherwise a slot among the first `N` stays queue-only, ready for the queue,
+   while no pull-request job waits, so no slot idles while pull requests wait;
+3. otherwise it is shared and takes anything.
+
+At most `SLOTS-1` runners are queue-only at once, so pull requests always have
+a runner, and queue jobs can use a shared one. Every minute, while a
+pull-request job waits, idle queue-only runners that no waiting queue job needs
+are removed and their slots register again with a fresh role. GitHub refuses to
+remove a runner that has a job, so nothing running is cut.
+
+The token the supervisor uses needs **Actions: read** on every repository in
+the runner group, in addition to the organization's self-hosted-runner
+permission, to see what waits. The supervisor checks at start and says so in
+its log; without it, the first `N` slots are queue-only, fixed. Give the
+runners the label before a consumer's validation pin requires it, or its
+pull-request jobs wait for a runner that never matches.
 
 The two gate jobs, `review-gate` and `delivery-evidence`, read
 `LINUX_GATE_RUNNER`, without the merge-queue split:
