@@ -48,9 +48,16 @@
 #                         queue-only runners make it queue-only; otherwise one of
 #                         the first QUEUE_SLOTS slots stays queue-only, ready
 #                         for the queue, while no pull-request job waits;
-#                         otherwise it is shared and takes anything. 0 turns
-#                         this off: every runner is shared. Must be fewer than
-#                         LINUX_RUNNER_SLOTS
+#                         otherwise it is shared and takes anything. At most
+#                         SLOTS-1 runners are queue-only at once, and every
+#                         minute idle queue-only runners no queue job needs are
+#                         removed while pull-request jobs wait, so a slot never
+#                         idles beside waiting work. 0 turns this off: every
+#                         runner is shared. Must be fewer than
+#                         LINUX_RUNNER_SLOTS. The token then also needs Actions
+#                         read access to every repository in the runner group,
+#                         to see what waits; without it the first QUEUE_SLOTS
+#                         slots are queue-only, fixed
 #   LINUX_RUNNER_MEMORY   memory limit per job container (6g)
 #   LINUX_RUNNER_CPUS     CPU limit per job container (4)
 #   LINUX_RUNNER_PIDS     process limit per job container (4096): a pull
@@ -112,6 +119,8 @@ DAEMON_DIR="${LINUX_RUNNER_DAEMON_DIR:-/Library/LaunchDaemons}"
 # (the default) means forever.
 MAX_JOBS="${LINUX_RUNNER_MAX_JOBS:-}"
 BACKOFF_START=15
+# How often idle queue-only runners are reconsidered, and a test seam.
+JANITOR_INTERVAL="${LINUX_RUNNER_JANITOR_INTERVAL:-60}"
 BACKOFF_MAX=300
 AGENT_ID="com.autumngarage.linux-ephemeral-runner"
 
@@ -280,6 +289,19 @@ idle_queue_runners() {
   printf '%s\n' "$n"
 }
 
+# queue_only_runners: how many runners of this host are queue-only, idle or
+# not. At most SLOTS-1 may be: a queue job can always use a shared runner, but
+# a pull request can use nothing else, so one runner stays shared.
+queue_only_runners() {
+  local file id name role n=0
+  for file in "$state_dir"/slot-*; do
+    [ -f "$file" ] || continue
+    read -r id name role <"$file" || continue
+    if [ "$role" = queue ]; then n=$((n + 1)); fi
+  done
+  printf '%s\n' "$n"
+}
+
 # choose_role SLOT GID: print "queue" or "shared" for the runner SLOT is about
 # to register. Where GitHub cannot say what waits, fall back to a fixed
 # reservation: the first QUEUE_SLOTS slots are queue-only.
@@ -293,13 +315,56 @@ choose_role() {
   queue="${counts% *}"
   pr="${counts#* }"
   idle="$(idle_queue_runners)"
-  if [ "$queue" -gt "$idle" ]; then
+  if [ "$(queue_only_runners)" -ge $((SLOTS - 1)) ]; then
+    echo shared
+  elif [ "$queue" -gt "$idle" ]; then
     echo queue
   elif [ "$slot" -le "$QUEUE_SLOTS" ] && [ "$pr" -eq 0 ]; then
     echo queue
   else
     echo shared
   fi
+}
+
+# can_read_runs GID: warn, once per repository, when the token cannot read a
+# group repository's workflow runs, which choose_role needs to see what waits.
+can_read_runs() {
+  local repo
+  gh api --paginate "orgs/$ORG/actions/runner-groups/$1/repositories" \
+    --jq '.repositories[].full_name' | while read -r repo; do
+    gh api "repos/$repo/actions/runs?per_page=1" >/dev/null 2>&1 \
+      || log "WARNING: the token cannot read the workflow runs of $repo (it needs Actions: read there), so runner roles use the fixed reservation of $QUEUE_SLOTS slot(s)"
+  done
+}
+
+# janitor GID: every JANITOR_INTERVAL seconds, while pull-request jobs wait,
+# remove the idle queue-only runners that no waiting queue job needs; the slot
+# registers again with a fresh role. GitHub refuses to remove a runner that has
+# a job (nothing is cut), and its success is the proof that this one had none.
+janitor() {
+  local gid="$1" counts queue pr file id name role busy keep
+  while :; do
+    sleep "$JANITOR_INTERVAL"
+    counts="$(waiting_jobs "$gid")" || continue
+    queue="${counts% *}"
+    pr="${counts#* }"
+    [ "$pr" -gt 0 ] || continue
+    keep="$queue"
+    for file in "$state_dir"/slot-*; do
+      [ -f "$file" ] || continue
+      read -r id name role <"$file" || continue
+      [ "$role" = queue ] || continue
+      busy="$(gh api "orgs/$ORG/actions/runners/$id" --jq .busy 2>/dev/null)" || continue
+      [ "$busy" = false ] || continue
+      if [ "$keep" -gt 0 ]; then
+        keep=$((keep - 1))
+        continue
+      fi
+      if gh api -X DELETE "orgs/$ORG/actions/runners/$id" >/dev/null 2>&1; then
+        log "recycled idle queue-only runner $name: pull-request jobs wait and no queue job needs it"
+      fi
+    done
+  done
 }
 
 # register_runner SLOT GID NAME: choose the role, register runner NAME with it,
@@ -410,7 +475,7 @@ stop_slots() {
 }
 
 cmd_run() {
-  local gid slot
+  local gid slot pids janitor_pid
   ensure_engine
   need gh "install the GitHub CLI and log in with admin:org"
   need jq "install jq"
@@ -427,12 +492,26 @@ cmd_run() {
   rmdir "$state_dir/keep-cache.lock" "$state_dir/roles.lock" 2>/dev/null || true
   trap stop_slots INT TERM
   log "supervising $SLOTS slot(s), $QUEUE_SLOTS kept ready for the merge queue, for label $LABEL in $ORG runner group $GROUP ($gid)"
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then can_read_runs "$gid"; fi
   slot=1
+  pids=""
   while [ "$slot" -le "$SLOTS" ]; do
     run_slot "$slot" &
+    pids="$pids $!"
     slot=$((slot + 1))
   done
-  wait
+  janitor_pid=""
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then
+    # Its stderr is only the shell's note that its sleep was ended with it.
+    janitor "$gid" 2>/dev/null &
+    janitor_pid=$!
+  fi
+  # shellcheck disable=SC2086
+  wait $pids || true
+  if [ -n "$janitor_pid" ]; then
+    pkill -P "$janitor_pid" 2>/dev/null || true
+    kill "$janitor_pid" 2>/dev/null || true
+  fi
 }
 
 cmd_build() {

@@ -127,7 +127,16 @@ follows the load and no count needs tuning. With `LINUX_RUNNER_QUEUE_SLOTS=N`
    while no pull-request job waits, so no slot idles while pull requests wait;
 3. otherwise it is shared and takes anything.
 
-If GitHub cannot say what waits, the first `N` slots are queue-only. Give the
+At most `SLOTS-1` runners are queue-only at once, so pull requests always have
+a runner, and queue jobs can use a shared one. Every minute, while a
+pull-request job waits, idle queue-only runners that no waiting queue job needs
+are removed and their slots register again with a fresh role. GitHub refuses to
+remove a runner that has a job, so nothing running is cut.
+
+The token the supervisor uses needs **Actions: read** on every repository in
+the runner group, in addition to the organization's self-hosted-runner
+permission, to see what waits. The supervisor checks at start and says so in
+its log; without it, the first `N` slots are queue-only, fixed. Give the
 runners the label before a consumer's validation pin requires it, or its
 pull-request jobs wait for a runner that never matches.
 

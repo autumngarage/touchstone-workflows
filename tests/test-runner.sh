@@ -48,11 +48,15 @@ case "$*" in
     echo '{"runner":{"id":4242},"encoded_jit_config":"SINGLE-USE-CONFIG"}'
     ;;
   # GitHub has already removed a single-use runner that took its job.
-  *"-X DELETE"*) exit 1 ;;
+  *"-X DELETE"*) [ -f "$FAKE_STATE/delete-ok" ] && exit 0; exit 1 ;;
   # What waits for a runner (AUT-2757). runs-fail: GitHub cannot say.
   # queued-run is set with queued-jobs, whose lines are what the real jq would
   # print for each queued job of the fleet: "queue" for a merge-queue job,
   # "pr" for any other. runner-busy is what a runner reports as .busy.
+  *"actions/runs?per_page=1"*)
+    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
+    exit 0
+    ;;
   *"actions/runs?status=queued"*)
     [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
     [ -f "$FAKE_STATE/queued-run" ] && echo 101
@@ -60,6 +64,8 @@ case "$*" in
     ;;
   *"repos/autumngarage/vesper/actions/runs/101/jobs"*)
     cat "$FAKE_STATE/queued-jobs" 2>/dev/null
+    # pr-after-start: a pull request begins to wait once both containers run.
+    [ ! -f "$FAKE_STATE/pr-after-start" ] || [ "$(wc -l <"$FAKE_STATE/started" 2>/dev/null || echo 0)" -lt 2 ] || echo pr
     exit 0
     ;;
   *"orgs/autumngarage/actions/runners/"*"--jq .busy"*)
@@ -103,6 +109,7 @@ case "$1" in
   run)
     # What the container reads on stdin, where the configuration must arrive.
     case " $* " in *" -i "*) printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS" ;; esac
+    echo run >>"$FAKE_STATE/started"
     # A real runner waits for its job; HOLD says for how long.
     /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
     exit "${FAKE_DOCKER_RC:-0}"
@@ -132,6 +139,8 @@ EOF
 cat >"$bin/sleep" <<'EOF'
 #!/usr/bin/env bash
 printf 'sleep %s\n' "$*" >>"$FAKE_CALLS"
+# The janitor's interval is the one wait a test needs to take.
+[ "$1" != "${FAKE_REAL_SLEEP_FOR:-}" ] || exec /bin/sleep "$1"
 EOF
 cat >"$bin/hostname" <<'EOF'
 #!/usr/bin/env bash
@@ -217,6 +226,7 @@ runner() {
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD="${HOLD:-0}" \
+    LINUX_RUNNER_JANITOR_INTERVAL="${JANITOR:-60}" FAKE_REAL_SLEEP_FOR="${JANITOR:-60}" \
     LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" FAKE_SEED_STARTED="${SEED_STARTED:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
@@ -296,9 +306,15 @@ HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='queue\nqueue\npr\n' runner run
 [ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
   || fail "two waiting queue jobs did not get two queue-only runners: $(grep generate-jitconfig "$tmp/calls")"
 ok "queue jobs outrank pull requests for freed slots, up to the number that wait"
+# However many queue jobs wait, one runner stays shared: a pull request can use
+# nothing else, and a queue job can use a shared runner.
+HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='queue\nqueue\nqueue\npr\n' runner run
+[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
+  || fail "queue-only runners were not capped below the slot count: $(grep generate-jitconfig "$tmp/calls")"
+ok "at most SLOTS-1 runners are queue-only, so pull requests always have a runner"
 # A queue-only runner that is busy answers nothing that waits.
-HOLD=4 SLOTS=2 QUEUE_SLOTS=1 BUSY=true QUEUED_JOBS='queue\npr\n' runner run
-[ "$(registered)" -eq 2 ] && [ "$(queue_only)" -eq 2 ] \
+HOLD=4 SLOTS=3 QUEUE_SLOTS=1 BUSY=true QUEUED_JOBS='queue\npr\n' runner run
+[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
   || fail "a busy queue-only runner was counted as waiting for the queue job: $(grep generate-jitconfig "$tmp/calls")"
 ok "only an idle queue-only runner answers a waiting queue job, on GitHub's word"
 # GitHub cannot say what waits: the fixed reservation.
@@ -313,6 +329,28 @@ SLOTS=3 QUEUED_JOBS='queue\n' runner run
 [ "$(queue_only)" -eq 0 ] || fail "a runner was queue-only with QUEUE_SLOTS unset: $(grep generate-jitconfig "$tmp/calls")"
 lacks 'actions/runs\?status=queued' "QUEUE_SLOTS unset"
 ok "with QUEUE_SLOTS unset every runner is shared and nothing waiting is read"
+# A pull request that starts waiting after the queue-only runner registered:
+# the janitor removes that idle runner, so the slot registers again.
+HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start delete-ok' QUEUED_JOBS='\n' runner run
+[ "$rc" -eq 0 ] || fail "a run with a janitor exited $rc: $(cat "$tmp/out")"
+grep -Fq 'recycled idle queue-only runner' "$tmp/out" \
+  || fail "an idle queue-only runner stayed beside a waiting pull request: $(cat "$tmp/out")"
+ok "an idle queue-only runner is removed once a pull request waits and no queue job needs it"
+# Not when a queue job waits for it.
+HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start delete-ok' QUEUED_JOBS='queue\n' runner run
+! grep -Fq 'recycled' "$tmp/out" || fail "a runner a waiting queue job needs was removed: $(cat "$tmp/out")"
+ok "an idle queue-only runner a waiting queue job needs is kept"
+# Not when GitHub refuses (the runner has a job).
+HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start' QUEUED_JOBS='\n' runner run
+! grep -Fq 'recycled' "$tmp/out" || fail "a removal GitHub refused was reported as done: $(cat "$tmp/out")"
+ok "a runner GitHub will not remove is not reported as recycled"
+# The token cannot read workflow runs: said at start, not discovered later.
+FLAGS=runs-fail SLOTS=2 QUEUE_SLOTS=1 runner run
+grep -Fq 'WARNING: the token cannot read the workflow runs of autumngarage/vesper' "$tmp/out" \
+  || fail "a token without Actions read access went unmentioned: $(cat "$tmp/out")"
+SLOTS=2 QUEUE_SLOTS=1 runner run
+! grep -Fq 'WARNING' "$tmp/out" || fail "a token that can read runs was warned about: $(cat "$tmp/out")"
+ok "a token that cannot read workflow runs is named when the supervisor starts"
 for bad in 3 4 x; do
   SLOTS=3 QUEUE_SLOTS=$bad runner run
   [ "$rc" -ne 0 ] || fail "QUEUE_SLOTS=$bad of 3 was accepted"
