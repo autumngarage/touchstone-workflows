@@ -93,10 +93,12 @@ alone is not evidence of a consumer cache hit or reduced build time.
 
 The seed may pass `timeout_minutes` to that call. A seed with no cache to
 restore (a new runner architecture, a changed package graph) builds everything
-from nothing, which on a hosted runner takes longer than the 20 minutes a pull
+from nothing, which on a hosted runner takes longer than the 30 minutes a pull
 request gets; the limit would then cancel the one run that could save the
 cache, and every later run would start just as cold. Pull requests, pushes and
-the merge queue cannot pass an input and keep 20 minutes.
+the merge queue cannot pass an input and keep 30 minutes: 20 until hesperus's
+checks grew to 13-18 minutes, when a busy host pushed six healthy merge-queue
+entries past it in one day (AUT-2752).
 
 ## Runner
 

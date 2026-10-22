@@ -84,16 +84,16 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
   done
 fi
-# AUT-2174: the time limit is 20 minutes for every event that cannot pass an
+# AUT-2174: the time limit is 30 minutes (20 until AUT-2752) for every event that cannot pass an
 # input -- pull requests, pushes, the merge queue -- and a caller seeding a
 # cache may raise it, because a cold seed that hits the pull-request limit
 # never saves the cache that would have made the next run warm.
 # shellcheck disable=SC2016
 assert_active_line "$workflow" \
-  'timeout-minutes: ${{ inputs.timeout_minutes || 20 }}' \
+  'timeout-minutes: ${{ inputs.timeout_minutes || 30 }}' \
   "validate job timeout"
 assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
-[ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 20$')" -eq 1 ] \
+[ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 30$')" -eq 1 ] \
   || fail "$workflow: the timeout input must default to the pull-request limit"
 assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
