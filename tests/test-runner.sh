@@ -45,6 +45,7 @@ case "$*" in
       echo "HTTP 502: Bad Gateway" >&2
       exit 1
     fi
+    [ ! -f "$FAKE_STATE/jit-slow" ] || /bin/sleep 2
     echo '{"runner":{"id":4242},"encoded_jit_config":"SINGLE-USE-CONFIG"}'
     ;;
   # GitHub has already removed a single-use runner that took its job.
@@ -469,8 +470,28 @@ kill -TERM "$sup"; /bin/sleep 0.5; kill -TERM "$sup"
 /bin/sleep 1
 ! kill -0 "$sup" 2>/dev/null || { kill -KILL "$sup" 2>/dev/null; fail "a second stop signal did not stop the supervisor"; }
 wait "$sup" 2>/dev/null || true
-set +m
 ok "a second stop signal stops at once"
+# A stop signal that arrives while a runner is being registered must not leave
+# that runner waiting: the registration finishes, and the drain removes it.
+rm -rf "${tmp:?}/state" "${tmp:?}/fake"
+mkdir -p "$tmp/state" "$tmp/fake"
+: >"$tmp/calls"
+touch "$tmp/fake/delete-ok" "$tmp/fake/jit-slow"
+PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+  LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=1 LINUX_RUNNER_MAX_JOBS=5 \
+  LINUX_RUNNER_ENGINE=docker LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
+  FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD=4 FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=none \
+  LINUX_RUNNER_DRAIN_INTERVAL=1 \
+  bash "$script" run >"$tmp/out" 2>&1 &
+sup=$!
+until grep -q 'generate-jitconfig' "$tmp/calls"; do /bin/sleep 0.1; done
+kill -TERM "$sup"
+rc=0; wait "$sup" || rc=$?
+[ "$rc" -eq 0 ] || fail "a supervisor stopped during a registration exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c -- '-X DELETE' "$tmp/calls")" -ge 2 ] \
+  || fail "the drain did not remove the runner registered as the stop signal arrived: $(cat "$tmp/calls")"
+set +m
+ok "a runner registered as the stop signal arrives is seen by the drain"
 
 echo "==> failures back off instead of spinning"
 FLAGS=jit-fails runner run

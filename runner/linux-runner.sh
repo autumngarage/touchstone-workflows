@@ -372,11 +372,16 @@ janitor() {
 # register_runner SLOT GID NAME: choose the role, register runner NAME with it,
 # and write the slot's state file, all under one lock: two slots that free at
 # once must not both answer the same waiting queue job. Sets role, jit and id in
-# the caller; on failure sets err and returns 1.
+# the caller; on failure sets err and returns 1, and returns 2 when the
+# supervisor is draining, registering nothing.
 register_runner() {
   local slot="$1" gid="$2" name="$3" lock="$state_dir/roles.lock" extra="" response
   role=shared jit="" id="" err=""
   until mkdir "$lock" 2>/dev/null; do sleep 1; done
+  if [ -e "$state_dir/draining" ]; then
+    rmdir "$lock"
+    return 2
+  fi
   if [ "$QUEUE_SLOTS" -gt 0 ]; then role="$(choose_role "$slot" "$gid")"; fi
   if [ "$role" = shared ]; then extra="$LABEL-shared"; fi
   if ! response="$(request_jit "$name" "$gid" "$extra")"; then
@@ -424,7 +429,13 @@ run_slot() {
       fi
     fi
     name="$prefix-$slot-$(date +%s)"
-    if ! register_runner "$slot" "$gid" "$name"; then
+    rc=0
+    register_runner "$slot" "$gid" "$name" || rc=$?
+    if [ "$rc" -eq 2 ]; then
+      log "slot $slot: draining; registering nothing more"
+      return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
       log "slot $slot: $err; retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
@@ -472,18 +483,23 @@ run_slot() {
 # the service manager's kill once its exit timeout has passed.
 drain_slots() {
   trap stop_slots INT TERM
+  # Under the lock registration holds: a slot either registered before the
+  # marker, and drain_idle sees its runner, or sees the marker and registers
+  # nothing.
+  until mkdir "$state_dir/roles.lock" 2>/dev/null; do sleep 1; done
   : >"$state_dir/draining"
+  rmdir "$state_dir/roles.lock"
   log "stop requested: draining; running jobs finish first (signal again to stop at once)"
   drain_idle &
   drain_pid=$!
 }
 
-# drain_idle: while any runner of this host is registered, remove the ones
-# that have no job. GitHub refuses to remove a runner that has one, and that
+# drain_idle: until the supervisor is done, remove the registered runners that
+# have no job. GitHub refuses to remove a runner that has one, and that
 # refusal is what leaves it alone.
 drain_idle() {
   local file id name busy
-  while ls "$state_dir"/slot-* >/dev/null 2>&1; do
+  while [ -e "$state_dir/draining" ]; do
     for file in "$state_dir"/slot-*; do
       [ -f "$file" ] || continue
       read -r id name _ <"$file" || continue
