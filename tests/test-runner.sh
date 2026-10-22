@@ -49,6 +49,23 @@ case "$*" in
     ;;
   # GitHub has already removed a single-use runner that took its job.
   *"-X DELETE"*) exit 1 ;;
+  # What waits for a runner (AUT-2757). runs-fail: GitHub cannot say.
+  # queued-run is set with queued-jobs, whose lines are what the real jq would
+  # print for each queued job of the fleet: "queue" for a merge-queue job,
+  # "pr" for any other. runner-busy is what a runner reports as .busy.
+  *"actions/runs?status=queued"*)
+    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
+    [ -f "$FAKE_STATE/queued-run" ] && echo 101
+    exit 0
+    ;;
+  *"repos/autumngarage/vesper/actions/runs/101/jobs"*)
+    cat "$FAKE_STATE/queued-jobs" 2>/dev/null
+    exit 0
+    ;;
+  *"orgs/autumngarage/actions/runners/"*"--jq .busy"*)
+    cat "$FAKE_STATE/runner-busy" 2>/dev/null || echo false
+    exit 0
+    ;;
   # The cache seed's record (AUT-2672): seed-run is a recent push run of the
   # seed workflow; seed-job-ok says that run has a successful job on the
   # runner the query names. The real jq does the selecting; this answers as
@@ -86,6 +103,8 @@ case "$1" in
   run)
     # What the container reads on stdin, where the configuration must arrive.
     case " $* " in *" -i "*) printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS" ;; esac
+    # A real runner waits for its job; HOLD says for how long.
+    /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
     exit "${FAKE_DOCKER_RC:-0}"
     ;;
   # Only the seed's validation writes the key file.
@@ -186,13 +205,18 @@ runner() {
   mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
   : >"$tmp/calls"
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
+  if [ -n "${QUEUED_JOBS:-}" ]; then
+    touch "$tmp/fake/queued-run"
+    printf '%b' "$QUEUED_JOBS" >"$tmp/fake/queued-jobs"
+  fi
+  [ -z "${BUSY:-}" ] || printf '%s\n' "$BUSY" >"$tmp/fake/runner-busy"
   set +e
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
     LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
     LINUX_RUNNER_QUEUE_SLOTS="${QUEUE_SLOTS:-}" \
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
-    LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
+    LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD="${HOLD:-0}" \
     LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" FAKE_SEED_STARTED="${SEED_STARTED:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
@@ -236,7 +260,7 @@ lacks 'docker cp|docker commit|actions/workflows' "with no cache seed configured
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"
 
-echo "==> slots reserved for the merge queue take only its jobs (AUT-2704)"
+echo "==> a slot kept ready for the merge queue takes only its jobs (AUT-2704)"
 SLOTS=3 QUEUE_SLOTS=1 runner run
 [ "$rc" -eq 0 ] || fail "a run with a reserved slot exited $rc: $(cat "$tmp/out")"
 registrations() { grep 'generate-jitconfig' "$tmp/calls" | grep -F -- "name=linux-ephemeral-testhost-$1-" || true; }
@@ -248,8 +272,47 @@ registrations 1 | grep -Fq 'linux-ephemeral-shared' && fail "the reserved slot c
 for slot in 2 3; do
   registrations "$slot" | grep -Fq 'labels[]=linux-ephemeral-shared' || fail "unreserved slot $slot lacks the shared label: $(registrations "$slot")"
 done
-grep -Fq 'supervising 3 slot(s), 1 for the merge queue only' "$tmp/out" || fail "the reservation is not logged: $(cat "$tmp/out")"
-ok "the first QUEUE_SLOTS slots lack the shared label; the others carry it"
+grep -Fq 'supervising 3 slot(s), 1 kept ready for the merge queue' "$tmp/out" || fail "the reservation is not logged: $(cat "$tmp/out")"
+ok "with nothing waiting, the first QUEUE_SLOTS slots lack the shared label; the others carry it"
+
+echo "==> a runner's role follows what is waiting for a runner (AUT-2757)"
+# queue_only: how many registrations lack the shared label (queue-only).
+registered() { grep -c 'generate-jitconfig' "$tmp/calls" || true; }
+queue_only() { grep 'generate-jitconfig' "$tmp/calls" | grep -vc 'linux-ephemeral-shared' || true; }
+# Which slot registers first varies, so each case holds for any order.
+# A pull request waits and the queue is idle: no slot sits ready for the queue.
+HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='pr\n' runner run
+[ "$rc" -eq 0 ] || fail "a run with a pull request waiting exited $rc: $(cat "$tmp/out")"
+[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 0 ] \
+  || fail "a waiting pull request left a slot idle for the queue: $(grep generate-jitconfig "$tmp/calls")"
+ok "while a pull request waits and no queue job does, the reserved slot takes pull requests too"
+# One queue job and one pull request wait: exactly one runner answers the queue.
+HOLD=4 SLOTS=2 QUEUE_SLOTS=1 QUEUED_JOBS='queue\npr\n' runner run
+[ "$(registered)" -eq 2 ] && [ "$(queue_only)" -eq 1 ] \
+  || fail "one waiting queue job did not get exactly one queue-only runner: $(grep generate-jitconfig "$tmp/calls")"
+ok "one waiting queue job gets one queue-only runner, however the slots race"
+# Two queue jobs and a pull request wait: two runners answer the queue.
+HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='queue\nqueue\npr\n' runner run
+[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
+  || fail "two waiting queue jobs did not get two queue-only runners: $(grep generate-jitconfig "$tmp/calls")"
+ok "queue jobs outrank pull requests for freed slots, up to the number that wait"
+# A queue-only runner that is busy answers nothing that waits.
+HOLD=4 SLOTS=2 QUEUE_SLOTS=1 BUSY=true QUEUED_JOBS='queue\npr\n' runner run
+[ "$(registered)" -eq 2 ] && [ "$(queue_only)" -eq 2 ] \
+  || fail "a busy queue-only runner was counted as waiting for the queue job: $(grep generate-jitconfig "$tmp/calls")"
+ok "only an idle queue-only runner answers a waiting queue job, on GitHub's word"
+# GitHub cannot say what waits: the fixed reservation.
+SLOTS=3 QUEUE_SLOTS=1 FLAGS=runs-fail runner run
+[ "$rc" -eq 0 ] || fail "a run that could not read the waiting jobs exited $rc: $(cat "$tmp/out")"
+grep -Fq 'using the fixed reservation' "$tmp/out" || fail "the fallback is not logged: $(cat "$tmp/out")"
+[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 1 ] \
+  || fail "the fixed reservation was not used: $(grep generate-jitconfig "$tmp/calls")"
+ok "without GitHub's answer, the first QUEUE_SLOTS slots are queue-only"
+# Off: no reservation and no look at what waits.
+SLOTS=3 QUEUED_JOBS='queue\n' runner run
+[ "$(queue_only)" -eq 0 ] || fail "a runner was queue-only with QUEUE_SLOTS unset: $(grep generate-jitconfig "$tmp/calls")"
+lacks 'actions/runs\?status=queued' "QUEUE_SLOTS unset"
+ok "with QUEUE_SLOTS unset every runner is shared and nothing waiting is read"
 for bad in 3 4 x; do
   SLOTS=3 QUEUE_SLOTS=$bad runner run
   [ "$rc" -ne 0 ] || fail "QUEUE_SLOTS=$bad of 3 was accepted"
