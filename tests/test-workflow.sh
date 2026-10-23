@@ -1489,6 +1489,8 @@ fi
 if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-run-block-scope.sh" \
     || fail "cross-step shell scope check failed"
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-queue.sh" \
+    || fail "runner queue demand check failed"
   # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
     || fail "runner supervisor check failed"

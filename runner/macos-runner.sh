@@ -44,6 +44,10 @@
 #   MACOS_RUNNER_GROUP      runner group, restricted to the private consumers (macos)
 #   MACOS_RUNNER_LABEL      the label pool jobs select (ci-studio-pool)
 #   MACOS_RUNNER_SLOTS      pool jobs run at once, beside the first runner (2)
+#   MACOS_RUNNER_QUEUE_SLOTS  queue reservation using the Linux fleet's shared
+#                           demand policy (0: disabled). Before enabling, every
+#                           non-merge-group consumer must also select LABEL-shared.
+#                           Must be fewer than SLOTS; needs Actions read access.
 #   MACOS_RUNNER_USER       the CI account whose session runs the jobs (ci)
 #   MACOS_RUNNER_STATE_DIR  root's directory for the token, the installed copy,
 #                           and slot state (/Library/Application Support/$AGENT_ID)
@@ -82,6 +86,8 @@ ORG="${MACOS_RUNNER_ORG:-autumngarage}"
 GROUP="${MACOS_RUNNER_GROUP:-macos}"
 LABEL="${MACOS_RUNNER_LABEL:-ci-studio-pool}"
 SLOTS="${MACOS_RUNNER_SLOTS:-2}"
+QUEUE_SLOTS="${MACOS_RUNNER_QUEUE_SLOTS:-0}"
+JANITOR_INTERVAL="${MACOS_RUNNER_JANITOR_INTERVAL:-60}"
 RUN_USER="${MACOS_RUNNER_USER:-ci}"
 AGENT_ID="com.autumngarage.macos-pool-runner"
 state_dir="${MACOS_RUNNER_STATE_DIR:-/Library/Application Support/$AGENT_ID}"
@@ -120,8 +126,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # registration, shared with runner/linux-runner.sh.
 # shellcheck source=runner/jit.sh
 . "$here/jit.sh"
+# shellcheck source=runner/queue.sh
+. "$here/queue.sh"
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "MACOS_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
+case "$QUEUE_SLOTS" in '' | *[!0-9]*) die "MACOS_RUNNER_QUEUE_SLOTS must be a non-negative integer, not '$QUEUE_SLOTS'" ;; esac
+[ "$QUEUE_SLOTS" -lt "$SLOTS" ] || die "MACOS_RUNNER_QUEUE_SLOTS must be fewer than MACOS_RUNNER_SLOTS, or no pull request could run"
 case "$MAX_JOBS" in *[!0-9]*) die "MACOS_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$RUN_USER" in '' | *[!A-Za-z0-9._-]*) die "MACOS_RUNNER_USER must be an account name, not '$RUN_USER'" ;; esac
 case "$RESTART_AFTER" in '' | *[!0-9]*) die "MACOS_RUNNER_RESTART_AFTER must be a number of seconds, not '$RESTART_AFTER'" ;; esac
@@ -424,7 +434,7 @@ EOF
 
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
-  local label plist gid name response jit id started rc
+  local label plist gid name jit id role err started rc
   label="$(slot_label "$slot")"
   plist="$state_dir/slot-$slot.plist"
   while :; do
@@ -462,25 +472,23 @@ run_slot() {
       continue
     fi
     name="$LABEL-$slot-$(date +%s)"
-    if ! response="$(request_jit "$name" "$gid")"; then
-      log "slot $slot: could not register a runner ($response); retrying in ${backoff}s"
+    if ! register_runner "$slot" "$gid" "$name"; then
+      log "slot $slot: $err; retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
-    jit="$(printf '%s' "$response" | jq -r '.encoded_jit_config // empty' 2>/dev/null || true)"
-    id="$(printf '%s' "$response" | jq -r '.runner.id // empty' 2>/dev/null || true)"
     # The configuration is base64 and goes into a plist as text; anything
     # else is not a configuration.
     case "$jit" in '' | *[!A-Za-z0-9+/=]*) jit="" ;; esac
     if [ -z "$jit" ] || [ -z "$id" ]; then
       forget_runner "$id"
+      rm -f "$state_dir/slot-$slot"
       log "slot $slot: GitHub returned no runner configuration; retrying in ${backoff}s"
       sleep "$backoff"
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
-    printf '%s %s\n' "$id" "$name" >"$state_dir/slot-$slot"
     write_job "$plist" "$label" "$(slot_dir "$slot")" "$jit"
     started="$(date +%s)"
     rc=0
@@ -495,7 +503,7 @@ run_slot() {
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
-    log "slot $slot: runner $name ($id) is waiting for a job"
+    log "slot $slot: runner $name ($id) is waiting for a job ($role)"
     wait_for_job "$slot"
     rc="$(exit_code "$slot")"
     launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
@@ -533,7 +541,7 @@ stop_slots() {
 }
 
 cmd_run() {
-  local gid slot
+  local gid slot pid pids="" janitor_pid=""
   require_root "run"
   need launchctl "the pool needs macOS launchd"
   need rsync "install rsync"
@@ -552,14 +560,26 @@ cmd_run() {
   fi
   session_back
   gid="$(group_id)"
+  rmdir "$state_dir/roles.lock" 2>/dev/null || true
   trap stop_slots INT TERM
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then can_read_runs "$gid"; fi
   log "supervising $SLOTS slot(s) for label $LABEL in $ORG runner group $GROUP ($gid) as $RUN_USER"
   slot=1
   while [ "$slot" -le "$SLOTS" ]; do
     run_slot "$slot" &
+    pids="$pids $!"
     slot=$((slot + 1))
   done
-  wait
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then
+    janitor "$gid" &
+    janitor_pid=$!
+  fi
+  for pid in $pids; do wait "$pid"; done
+  if [ -n "$janitor_pid" ]; then
+    pkill -P "$janitor_pid" 2>/dev/null || true
+    kill "$janitor_pid" 2>/dev/null || true
+    wait "$janitor_pid" 2>/dev/null || true
+  fi
 }
 
 daemon_plist_path() { printf '%s/%s.plist\n' "$DAEMON_DIR" "$AGENT_ID"; }
@@ -589,7 +609,7 @@ cmd_install_daemon() {
     die "MACOS_RUNNER_RESTART_AFTER needs auto-login set to $RUN_USER (it is '$(autologin_user)'): a restart would not bring $RUN_USER's session back"
   fi
   # A copy, so a checkout that later switches branches cannot change what runs.
-  cp "$here/macos-runner.sh" "$here/jit.sh" "$state_dir/"
+  cp "$here/macos-runner.sh" "$here/jit.sh" "$here/queue.sh" "$state_dir/"
   plist="$(daemon_plist_path)"
   mkdir -p "$DAEMON_DIR" "$(dirname "$LOG_FILE")"
   cat >"$plist" <<EOF
@@ -611,6 +631,7 @@ cmd_install_daemon() {
     <key>MACOS_RUNNER_GROUP</key><string>$GROUP</string>
     <key>MACOS_RUNNER_LABEL</key><string>$LABEL</string>
     <key>MACOS_RUNNER_SLOTS</key><string>$SLOTS</string>
+    <key>MACOS_RUNNER_QUEUE_SLOTS</key><string>$QUEUE_SLOTS</string>
     <key>MACOS_RUNNER_USER</key><string>$RUN_USER</string>
     <key>MACOS_RUNNER_STATE_DIR</key><string>$state_dir</string>
     <key>MACOS_RUNNER_TOKEN_FILE</key><string>$TOKEN_FILE</string>

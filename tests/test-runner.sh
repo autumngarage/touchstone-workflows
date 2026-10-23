@@ -546,6 +546,7 @@ grep -Fq "<string>$tmp/state/linux-runner.sh</string>" "$plist" || fail "the age
 [ -f "$tmp/state/linux-runner.sh" ] || fail "install did not copy the supervisor"
 # The copy sources jit.sh from its own directory, so it must travel with it.
 cmp -s "$tmp/state/jit.sh" "$root/runner/jit.sh" || fail "install did not copy runner/jit.sh beside the supervisor"
+cmp -s "$tmp/state/queue.sh" "$root/runner/queue.sh" || fail "install did not copy runner/queue.sh beside the supervisor"
 grep -Fq '<key>LINUX_RUNNER_LABEL</key><string>linux-ephemeral</string>' "$plist" || fail "the agent lost its label"
 grep -Fq '<key>LINUX_RUNNER_QUEUE_SLOTS</key><string>0</string>' "$plist" || fail "the agent lost its merge-queue reservation"
 has 'launchctl bootstrap' "install"
@@ -602,6 +603,7 @@ grep -Fq "<key>HOME</key><string>$tmp/home</string>" "$dplist" || fail "the daem
 grep -Fq 'ghp_DAEMON' "$dplist" && fail "the token was written into the plist"
 [ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
 cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
+cmp -s "$user_state/queue.sh" "$root/runner/queue.sh" || fail "install-daemon did not copy runner/queue.sh beside the supervisor"
 grep -Fq '<key>ExitTimeOut</key><integer>5400</integer>' "$dplist" || fail "the daemon is not given time to drain before the service manager kills it"
 has 'launchctl bootstrap system' "install-daemon"
 has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
