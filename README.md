@@ -282,6 +282,27 @@ that must not overlap itself in the account selects it: cleanup that stops the
 account's processes (hesperus), and the smoke, whose macOS grants belong to
 that runner.
 
+**Queue priority (AUT-2813).** `MACOS_RUNNER_QUEUE_SLOTS` opts the Mac pool
+into the same demand-based registration policy as the Linux fleet. It defaults
+to `0`. Shared registrations also advertise `ci-studio-pool-shared`; consumers
+can require that extra label outside `merge_group`, leaving queue jobs able to
+use either role. At least one slot stays shared. Idle queue-only registrations
+are recycled when PRs wait and no queue job needs them. Demand includes queued
+jobs in partially started workflows, including Nyx's multiple test shards.
+The token needs Actions read access to every repository admitted by the group;
+unreadable demand logs a warning and uses the configured fixed reservation.
+
+Roll out in order: install the new supervisor with the reservation disabled;
+verify shared registrations advertise the extra label; deploy the consumer
+selectors behind their opt-in settings; then enable a reservation smaller than
+`MACOS_RUNNER_SLOTS`. Keep the existing slot count, user and restart settings.
+Install only after active pool jobs finish: replacing the current Mac service
+stops its slots. Existing queued jobs retain their original selectors, so the
+priority guarantee applies after legacy selectors drain. Old base-label
+consumers remain routable but can consume a queue-only slot; update every
+consumer in the group before treating the reservation as enforced. Rollback:
+set the reservation to `0`; the shared-label selectors remain routable.
+
 **The account never holds an organization credential.** Its jobs can rewrite
 anything in its home, so the supervisor runs as root with a token only root
 can read, and GitHub fixes each runner's name, labels, and group: the account

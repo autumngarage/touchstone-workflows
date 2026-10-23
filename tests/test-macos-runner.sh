@@ -50,6 +50,24 @@ case "\$*" in
     if once jit-garbage; then echo '{"runner":{"id":4141},"encoded_jit_config":"not a <config>"}'; exit 0; fi
     echo '{"runner":{"id":4242},"encoded_jit_config":"$CONFIG"}'
     ;;
+  *"actions/runs?per_page=1"*)
+    [ ! -f "\$FAKE_STATE/runs-fail" ] || exit 1
+    exit 0
+    ;;
+  *"actions/runs?status=queued"*)
+    [ ! -f "\$FAKE_STATE/runs-fail" ] || exit 1
+    [ ! -s "\$FAKE_STATE/queued-jobs" ] || [ -f "\$FAKE_STATE/in-progress-run" ] || echo 101
+    exit 0
+    ;;
+  *"actions/runs?status=in_progress"*)
+    [ ! -f "\$FAKE_STATE/in-progress-run" ] || echo 102
+    exit 0
+    ;;
+  *"actions/runs/101/jobs"* | *"actions/runs/102/jobs"*)
+    cat "\$FAKE_STATE/queued-jobs" 2>/dev/null
+    exit 0
+    ;;
+  *"actions/runners/"*"--jq .busy"*) echo false; exit 0 ;;
   # GitHub has already removed a single-use runner that took its job.
   *"-X DELETE"*) exit 1 ;;
 esac
@@ -67,6 +85,7 @@ case "$1" in
         f="$(job "$2")"
         [ -f "$f" ] || exit 113
         n="$(cat "$f")"
+        if [ -f "$FAKE_STATE/hold-registration" ] && [ "$(grep -c generate-jitconfig "$FAKE_CALLS" || true)" -lt "$FAKE_SLOTS" ]; then n=1; fi
         if [ "$n" -gt 0 ]; then
           echo $((n - 1)) >"$f"
           printf '\tstate = running\n\tpid = 99\n\tlast exit code = (never exited)\n\tendpoints = {\n\t\tstate = active\n\t}\n'
@@ -277,11 +296,13 @@ runner() {
   : >"$tmp/calls"
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
   [ -z "${BEFORE:-}" ] || "$BEFORE"
+  printf '%b' "${QUEUED_JOBS:-}" >"$tmp/fake/queued-jobs"
   set +e
   env -u GH_TOKEN PATH="$bin:$PATH" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" FAKE_HOME="$home" \
-    FAKE_RUNNING_POLLS="${POLLS:-1}" FAKE_JOB_RC="${JOB_RC:-0}" \
+    FAKE_RUNNING_POLLS="${POLLS:-1}" FAKE_JOB_RC="${JOB_RC:-0}" FAKE_SLOTS="${SLOTS:-1}" \
     MACOS_RUNNER_STATE_DIR="$tmp/state" MACOS_RUNNER_TOKEN_FILE="${TOKEN_FILE:-$tmp/tok/token}" \
     MACOS_RUNNER_SLOTS="${SLOTS:-1}" MACOS_RUNNER_MAX_JOBS="${JOBS:-1}" \
+    MACOS_RUNNER_QUEUE_SLOTS="${QUEUE_SLOTS:-0}" \
     MACOS_RUNNER_DAEMON_DIR="$tmp/daemons" MACOS_RUNNER_LOG="$tmp/logs/pool.log" \
     MACOS_RUNNER_KILL_CMD="$bin/fake-kill" \
     MACOS_RUNNER_RESTART_AFTER="${RESTART_AFTER:-}" MACOS_RUNNER_RESTART_CMD="$bin/fake-restart now" \
@@ -358,6 +379,31 @@ has 'name=ci-studio-pool-2-' "slot 2's runner"
 [ -x "$home/actions-runner-pool-2/run.sh" ] || fail "slot 2 has no runner files"
 lacks "rsync .*actions-runner-pool-1/" "a slot that has its files"
 ok "each slot has its own directory and job, and a prepared slot is not copied again"
+
+echo "==> Mac slots reuse the Linux queue policy (AUT-2813)"
+# A disabled reservation remains compatible with existing base-label consumers.
+lacks 'actions/runs\?status=' "disabled queue reservation does not inspect demand"
+has 'labels[]=ci-studio-pool-shared' "default runners advertise shared routing for staged consumer rollout"
+queue_only() { grep generate-jitconfig "$tmp/calls" | grep -vc ci-studio-pool-shared || true; }
+SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\npr\n' runner run
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "one waiting queue job did not receive one Mac slot: $(cat "$tmp/out") $(cat "$tmp/calls")"
+ok "waiting merge validation receives a slot while other slots accept PRs"
+SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\nqueue\nqueue\npr\n' runner run
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 2 ] || fail "Mac queue reservation did not preserve a shared slot"
+ok "sustained queue demand leaves at least one shared runner"
+SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='pr\n' runner run
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 0 ] || fail "an empty queue withheld a Mac slot from PRs"
+ok "without queue demand all Mac slots can serve PRs"
+SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration in-progress-run' QUEUED_JOBS='queue\npr\n' runner run
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "an in-progress workflow hid its waiting Mac job"
+ok "waiting jobs in a partially started Mac workflow contribute demand"
+SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration runs-fail' runner run
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "unreadable demand did not keep the bounded fallback reservation"
+ok "unreadable demand uses the configured reservation"
+SLOTS=2 QUEUE_SLOTS=2 runner run
+refused 'must be fewer than MACOS_RUNNER_SLOTS' "a reservation consuming every slot"
+QUEUE_SLOTS=bad runner run
+refused 'must be a non-negative integer' "a malformed reservation"
 
 echo "==> a runner left running by an earlier supervisor finishes first"
 leftover() { echo 2 >"$tmp/fake/job-$POOL_LABEL-1"; echo 0 >"$tmp/fake/job-$POOL_LABEL-1.rc"; }
@@ -564,6 +610,7 @@ dplist="$tmp/daemons/com.autumngarage.macos-pool-runner.plist"
 [ -f "$dplist" ] || fail "install-daemon wrote no LaunchDaemon"
 grep -Fq "<string>$tmp/state/macos-runner.sh</string>" "$dplist" || fail "the daemon does not run the installed copy"
 cmp -s "$tmp/state/macos-runner.sh" "$script" || fail "install-daemon did not copy the supervisor"
+cmp -s "$tmp/state/queue.sh" "$root/runner/queue.sh" || fail "install-daemon did not copy the shared queue policy"
 cmp -s "$tmp/state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
 grep -q '<key>UserName</key>' "$dplist" && fail "the daemon must run as root to start jobs in the account's session"
 grep -Fq '<key>MACOS_RUNNER_USER</key><string>ci</string>' "$dplist" || fail "the daemon does not name the account"
