@@ -1491,6 +1491,8 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
     || fail "cross-step shell scope check failed"
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-queue.sh" \
     || fail "runner queue demand check failed"
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-linux-overflow.sh" \
+    || fail "Linux overflow guard check failed"
   # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
     || fail "runner supervisor check failed"
