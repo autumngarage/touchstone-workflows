@@ -107,14 +107,18 @@ The protected workflow pin, consumer producer and repository opt-in must all be
 deployed before measuring cold/warm improvements. Passing the source contract
 alone is not evidence of a consumer cache hit or reduced build time.
 
-The seed may pass `timeout_minutes` to that call. A seed with no cache to
-restore (a new runner architecture, a changed package graph) builds everything
-from nothing, which on a hosted runner takes longer than the 30 minutes a pull
-request gets; the limit would then cancel the one run that could save the
-cache, and every later run would start just as cold. Pull requests, pushes and
-the merge queue cannot pass an input and keep 30 minutes: 20 until hesperus's
-checks grew to 13-18 minutes, when a busy host pushed six healthy merge-queue
-entries past it in one day (AUT-2752).
+Validation keeps a 30-minute limit on local runners and for consumers without
+`SWIFT_BUILD_CACHE=true`. Hosted Swift-cache consumers get 60 minutes: the
+measured two-CPU cold build took 20 minutes before tests, so a 30-minute limit
+cancelled useful work and forced the next attempt to rebuild it. This is a
+ceiling, not a target; backend/concurrency fixes and compatible caches still
+reduce the work. Every validation command and spending guard remains in force.
+
+A reusable-workflow caller may explicitly pass `timeout_minutes`, which takes
+precedence; its existing default remains 30. Cache producers already passing
+60 retain that limit. Required PR, push and merge-queue workflows have no
+caller input and select the limit from their runner and Swift-cache settings.
+Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 

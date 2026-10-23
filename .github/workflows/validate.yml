@@ -90,9 +90,9 @@ jobs:
     # LINUX_RUNNER-shared, so slots the runner reserves for the queue
     # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
     runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
-    # 30, not 20: a hesperus check takes 13-18 minutes, and at 20 a busy
-    # host evicted six healthy merge-queue entries in a day (AUT-2752).
-    timeout-minutes: ${{ inputs.timeout_minutes || 30 }}
+    # Two-CPU hosted Swift builds can spend 20 minutes compiling before tests.
+    # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
+    timeout-minutes: ${{ inputs.timeout_minutes || (vars.LINUX_RUNNER == '' && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
