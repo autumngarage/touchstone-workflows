@@ -10,6 +10,8 @@ CALLS="$STATE_DIR/calls"; QUEUED=""; MAIN=aaa
 iso() { python3 -c 'import datetime,sys; print(datetime.datetime.fromtimestamp(int(sys.argv[1]),datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"; }
 epoch_of() { python3 -c 'import datetime,sys; print(int(datetime.datetime.strptime(sys.argv[1],"%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc).timestamp()))' "$1"; }
 FIXTURE="$root/tests/fixtures/overflow-current-checks.json"
+RUNNER_FIXTURE="$root/tests/fixtures/overflow-runners.json"
+RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0
 CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0
 note() { :; }
 add_event() { events+=("$*"); }
@@ -17,6 +19,7 @@ LINUX_HOME_REPOS=hesperus; ORG=autumngarage
 ago() { iso $(( $(date -u +%s) - $1 )); }
 gh() {
   case "$*" in
+    *actions/runners*) [ "$FAIL_RUNNERS" = 0 ] || return 1; cat "$RUNNERS" ;;
     *status=queued*) [ "$FAIL_QUEUE" = 0 ] || return 1; printf '%s' "$QUEUED" ;;
     *graphql*) [ "$FAIL_API" = 0 ] || return 1; cat "$CHECK_FIXTURE" ;;
     *commits/main*) printf '%s' "$MAIN" ;;
@@ -32,7 +35,7 @@ expect() { # label expected-calls expected-state(on|off)
   if [ "$got" = "$2" ] && [ "$state" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: calls [$got] state $state, expected [$2] $3"; failed=1; fi
   : >"$CALLS"
 }
-fresh() { MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; }
+fresh() { MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0; CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; }
 
 fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"$'\n'"$(ago 60)"
 check_linux_overflow; expect "off until enabled" "" off
@@ -83,6 +86,27 @@ check_linux_overflow; expect "nor while the usage guard holds everything on the 
 
 fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"
 CI_WATCH_OVERFLOW_DRY_RUN=1 check_linux_overflow | grep -q "dry run: would send" && expect "a dry run moves nothing" "" off
+
+
+# Projected from the live organization runner inventory on 2026-10-23.
+# Three busy Linux slots plus an unrelated idle Mac must still permit overflow.
+for patch in '.runners[4].busy=false' \
+  '.runners |= map(select(any(.labels[]; .name == "linux-ephemeral") | not)) | .total_count=(.runners|length)' \
+  '(.runners[] | select(any(.labels[]; .name == "linux-ephemeral"))).status="offline"' \
+  '.total_count += 1' 'del(.runners[4].busy)' 'del(.runners[4].labels)' \
+  '.runners[4].status="unknown"' 'del(.total_count)' 'empty'; do
+  fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"
+  jq "$patch" "$RUNNER_FIXTURE" >"$STATE_DIR/runners.json"; RUNNERS="$STATE_DIR/runners.json"
+  check_linux_overflow
+  expect "local without proven saturation: $patch" "" off
+  echo "$(( $(date -u +%s) - 100 )) aaa" >"$STATE_DIR/linux-overflow"
+  check_linux_overflow
+  expect "active overflow returns local: $patch" "repos=[hesperus]" off
+done
+fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"; FAIL_RUNNERS=1
+check_linux_overflow; expect 'runner API failure keeps local' '' off
+echo "$(( $(date -u +%s) - 100 )) aaa" >"$STATE_DIR/linux-overflow"
+check_linux_overflow; expect 'runner API failure restores local' 'repos=[hesperus]' off
 
 
 # Reruns retain their old workflow creation time, but check timestamps describe
