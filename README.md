@@ -52,6 +52,22 @@ Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
 workflow to an immutable commit from this repository.
 
+## Linux overflow
+
+`runner/linux-overflow.sh` owns the Linux overflow functions used by
+ci-studio's existing `ci-watch.sh`. The watcher supplies routing, usage state
+and logging; this module does not start another controller. After review and
+merge, install the module alongside the watcher and replace its inline block
+from `OVERFLOW_WAIT` through `check_linux_overflow` with a source of that file.
+Back up the watcher, validate its shell syntax and restart only the watcher
+while it is sleeping. Existing state files retain their meaning; rollback
+restores the backup. Installation does not enable overflow.
+
+The timeout guard reads current PR, main and merge-queue Linux checks, so a
+rerun is not excluded by its original workflow creation time. Unreadable or
+truncated evidence returns routing to local runners. The captured API-shape
+fixture and guard tests live in `tests/test-linux-overflow.sh`.
+
 ## Swift build caches
 
 Consumers can opt into the validation workflow's SwiftPM cache with the

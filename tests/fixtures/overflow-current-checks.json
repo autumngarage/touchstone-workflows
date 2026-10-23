@@ -1,0 +1,91 @@
+{
+  "data": {
+    "repository": {
+      "pullRequests": {
+        "pageInfo": {
+          "hasNextPage": false
+        },
+        "nodes": [
+          {
+            "commits": {
+              "nodes": [
+                {
+                  "commit": {
+                    "statusCheckRollup": {
+                      "contexts": {
+                        "pageInfo": {
+                          "hasNextPage": false
+                        },
+                        "nodes": [
+                          {
+                            "__typename": "CheckRun",
+                            "databaseId": 120585567064,
+                            "name": "validate (ubuntu-latest)",
+                            "conclusion": null,
+                            "startedAt": "2026-10-23T18:28:21Z",
+                            "completedAt": null
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "mergeQueue": {
+        "entries": {
+          "pageInfo": {
+            "hasNextPage": false
+          },
+          "nodes": [
+            {
+              "headCommit": {
+                "statusCheckRollup": {
+                  "contexts": {
+                    "pageInfo": {
+                      "hasNextPage": false
+                    },
+                    "nodes": [
+                      {
+                        "__typename": "CheckRun",
+                        "databaseId": 120589186556,
+                        "name": "validate (ubuntu-latest)",
+                        "conclusion": null,
+                        "startedAt": "2026-10-23T18:35:58Z",
+                        "completedAt": null
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "defaultBranchRef": {
+        "target": {
+          "statusCheckRollup": {
+            "contexts": {
+              "pageInfo": {
+                "hasNextPage": false
+              },
+              "nodes": [
+                {
+                  "__typename": "CheckRun",
+                  "databaseId": 120531083908,
+                  "name": "validate (ubuntu-latest)",
+                  "conclusion": "SUCCESS",
+                  "startedAt": "2026-10-23T16:33:10Z",
+                  "completedAt": "2026-10-23T16:55:02Z"
+                }
+              ]
+            }
+          }
+        }
+      }
+    }
+  }
+}
