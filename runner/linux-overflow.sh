@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Sourced by ci-watch: existing routing/usage state remains owned by the watcher.
 # The caller provides STATE_DIR, ORG, LINUX_HOME_REPOS, set_linux_repos,
-# note and add_event. Install alongside ci-watch.sh after source review.
+# note, add_event, USAGE_EVERY and POLL. Install alongside ci-watch.sh after source review.
 OVERFLOW_WAIT=600
 OVERFLOW_HOLD=900
 OVERFLOW_USAGE_CAP=60
@@ -13,6 +13,20 @@ HOSTED_VALIDATE_LIMIT=1740
 epoch_of() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null; }
 
 main_sha() { gh api "repos/$ORG/hesperus/commits/main" --jq .sha 2>/dev/null; }
+
+overflow_usage_percent() { # current epoch
+  [[ "${USAGE_EVERY:-}" =~ ^[1-9][0-9]*$ && "${POLL:-}" =~ ^[1-9][0-9]*$ ]] || return 1
+  local sample
+  sample="$(tail -n 1 "$STATE_DIR/usage" 2>/dev/null)" || return 1
+  jq -ner --arg sample "$sample" --argjson now "$1" \
+    --argjson refresh "$USAGE_EVERY" --argjson poll "$POLL" '
+    $sample | capture("^(?<epoch>[0-9]+) month=(?<month>[0-9]{4}-[0-9]{2}) .* pct=(?<pct>[0-9]+) ")
+    | (.epoch | tonumber) as $stamp
+    | if $stamp > $now or $now - $stamp > $refresh + $poll
+        or .month != ($now | strftime("%Y-%m"))
+      then error("stale or inconsistent hosted usage sample")
+      else [(.pct | tonumber), 100] | min end'
+}
 
 local_linux_saturated() {
   local response
@@ -109,10 +123,14 @@ check_linux_overflow() {
   [ -e "$STATE_DIR/linux-failover" ] && return 0
   [ -s "$STATE_DIR/usage-fallback" ] && return 0
   now="$(date -u +%s)"
-  pct="$(tail -n 1 "$STATE_DIR/usage" 2>/dev/null | sed -n 's/.* pct=\([0-9][0-9]*\).*/\1/p')"
+  pct="$(overflow_usage_percent "$now")" || {
+    note "overflow: hosted usage evidence is missing, invalid or stale"
+    [ ! -e "$state" ] || end_linux_overflow "hosted usage could not be verified within its refresh interval"
+    return 0
+  }
   if [ -e "$state" ]; then
     began="$(cut -d ' ' -f 1 "$state")"
-    if [ "${pct:-0}" -ge "$OVERFLOW_USAGE_CAP" ]; then
+    if [ "$pct" -ge "$OVERFLOW_USAGE_CAP" ]; then
       end_linux_overflow "hosted usage is at ${pct}% of what the plan covers, past the overflow's ${OVERFLOW_USAGE_CAP}%"
       return 0
     fi
@@ -155,7 +173,7 @@ check_linux_overflow() {
   fi
 
   [ "$now" -lt "$(cat "$quiet" 2>/dev/null || echo 0)" ] && return 0
-  [ "${pct:-0}" -ge "$OVERFLOW_USAGE_CAP" ] && return 0
+  [ "$pct" -ge "$OVERFLOW_USAGE_CAP" ] && return 0
   while IFS= read -r at; do
     [ -n "$at" ] || continue
     at="$(epoch_of "$at")" || continue
