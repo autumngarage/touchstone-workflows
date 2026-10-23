@@ -1,0 +1,107 @@
+{
+  "runners": [
+    {
+      "busy": false,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "macOS"
+        },
+        {
+          "name": "ARM64"
+        },
+        {
+          "name": "ci-studio"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "ci-studio-pool"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "ci-studio-pool"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "ci-studio-pool"
+        },
+        {
+          "name": "ci-studio-pool-shared"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "linux-ephemeral"
+        },
+        {
+          "name": "linux-ephemeral-shared"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "linux-ephemeral"
+        },
+        {
+          "name": "linux-ephemeral-shared"
+        }
+      ],
+      "status": "online"
+    },
+    {
+      "busy": true,
+      "labels": [
+        {
+          "name": "self-hosted"
+        },
+        {
+          "name": "linux-ephemeral"
+        },
+        {
+          "name": "linux-ephemeral-shared"
+        }
+      ],
+      "status": "online"
+    }
+  ],
+  "total_count": 7
+}

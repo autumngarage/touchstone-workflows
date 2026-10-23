@@ -14,6 +14,24 @@ epoch_of() { date -u -j -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null; }
 
 main_sha() { gh api "repos/$ORG/hesperus/commits/main" --jq .sha 2>/dev/null; }
 
+local_linux_saturated() {
+  local response
+  response="$(gh api "orgs/$ORG/actions/runners?per_page=100" 2>/dev/null)" || return 1
+  printf '%s\n' "$response" | jq -sr '
+    if length != 1 then error("missing runner inventory") else .[0] end
+    | if (.runners | type) != "array" or (.total_count | type) != "number"
+        or .total_count != (.runners | length)
+      then error("incomplete runner inventory") else . end
+    | if any(.runners[]; (.labels | type) != "array"
+        or any(.labels[]; (.name | type) != "string")
+        or (.busy | type) != "boolean"
+        or (.status != "online" and .status != "offline"))
+      then error("invalid runner inventory") else . end
+    | [.runners[] | select(.status == "online"
+        and any(.labels[]; .name == "linux-ephemeral"))]
+    | length > 0 and all(.[]; .busy)'
+}
+
 recent_validation_timeout() { # overflow start epoch
   local response
   # Current heads bound the read without excluding reruns of older workflows.
@@ -86,7 +104,7 @@ end_linux_overflow() { # why
 }
 
 check_linux_overflow() {
-  local state="$STATE_DIR/linux-overflow" quiet="$STATE_DIR/overflow-quiet" now pct created at waiting=0 oldest=0 began late
+  local state="$STATE_DIR/linux-overflow" quiet="$STATE_DIR/overflow-quiet" now pct created at waiting=0 oldest=0 began late saturated
   [ -e "$STATE_DIR/overflow-enabled" ] || return 0
   [ -e "$STATE_DIR/linux-failover" ] && return 0
   [ -s "$STATE_DIR/usage-fallback" ] && return 0
@@ -108,6 +126,18 @@ check_linux_overflow() {
       end_linux_overflow "a Linux validation exhausted its time allowance (check $late), so the overflow is off for $(( OVERFLOW_QUIET / 3600 )) h"
       return 0
     fi
+  fi
+  # Backlog alone does not prove the local fleet is full. Check current
+  # capacity before admitting hosted work, and return as soon as a slot frees.
+  # A missing/offline fleet belongs to the existing outage failover owner.
+  saturated="$(local_linux_saturated)" || {
+    note "overflow: could not verify local Linux runner capacity"
+    [ ! -e "$state" ] || end_linux_overflow "could not verify local Linux runner capacity"
+    return 0
+  }
+  if [ "$saturated" != true ]; then
+    [ ! -e "$state" ] || end_linux_overflow "local Linux runner saturation is no longer established"
+    return 0
   fi
   created="$(gh api "repos/$ORG/hesperus/actions/runs?status=queued&per_page=50" \
     --jq '.workflow_runs[] | select(.name == "validate") | .created_at' 2>/dev/null)" || {
