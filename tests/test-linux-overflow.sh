@@ -15,7 +15,7 @@ RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0
 CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0
 note() { :; }
 add_event() { events+=("$*"); }
-LINUX_HOME_REPOS=hesperus; ORG=autumngarage
+LINUX_HOME_REPOS=hesperus; ORG=autumngarage; USAGE_EVERY=21600; POLL=180
 ago() { iso $(( $(date -u +%s) - $1 )); }
 gh() {
   case "$*" in
@@ -35,7 +35,8 @@ expect() { # label expected-calls expected-state(on|off)
   if [ "$got" = "$2" ] && [ "$state" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: calls [$got] state $state, expected [$2] $3"; failed=1; fi
   : >"$CALLS"
 }
-fresh() { MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0; CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; }
+usage_sample() { printf '%s month=%s gross_usd=1 pct=%s projected_usd=1 allowance_usd=341\n' "$1" "$(date -u +%Y-%m)" "$2" >"$STATE_DIR/usage"; }
+fresh() { MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0; CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; usage_sample "$(date -u +%s)" 15; }
 
 fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"$'\n'"$(ago 60)"
 check_linux_overflow; expect "off until enabled" "" off
@@ -74,7 +75,7 @@ check_linux_overflow; expect "and keeps it off while quiet" "" off
 echo $(( $(date -u +%s) - 1 )) >"$STATE_DIR/overflow-quiet"
 check_linux_overflow; expect "until the quiet time has passed" "repos=[]" on
 
-fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"; echo "1 month=2026-10 gross_usd=210 pct=61 projected_usd=600 allowance_usd=341" >"$STATE_DIR/usage"
+fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"; usage_sample "$(date -u +%s)" 61
 check_linux_overflow; expect "not past the usage cap" "" off
 echo $(( $(date -u +%s) - 100 )) >"$STATE_DIR/linux-overflow"
 check_linux_overflow; expect "and one that is on ends at the cap" "repos=[hesperus]" off
@@ -86,6 +87,29 @@ check_linux_overflow; expect "nor while the usage guard holds everything on the 
 
 fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"
 CI_WATCH_OVERFLOW_DRY_RUN=1 check_linux_overflow | grep -q "dry run: would send" && expect "a dry run moves nothing" "" off
+
+
+for invalid in missing malformed stale future wrong-month negative-percent exhausted huge-percent unknown-cadence; do
+  fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"
+  case "$invalid" in
+    missing) rm "$STATE_DIR/usage" ;;
+    malformed) echo 'bad billing sample' >"$STATE_DIR/usage" ;;
+    stale) usage_sample "$(( $(date -u +%s) - USAGE_EVERY - POLL - 5 ))" 15 ;;
+    future) usage_sample "$(( $(date -u +%s) + 300 ))" 15 ;;
+    wrong-month) sed 's/month=[0-9-]*/month=2000-01/' "$STATE_DIR/usage" >"$STATE_DIR/stale"; mv "$STATE_DIR/stale" "$STATE_DIR/usage" ;;
+    negative-percent) usage_sample "$(date -u +%s)" -1 ;;
+    exhausted) usage_sample "$(date -u +%s)" 60 ;;
+    huge-percent) usage_sample "$(date -u +%s)" 9999999999999999999999999999 ;;
+    unknown-cadence) USAGE_EVERY='' ;;
+  esac
+  check_linux_overflow; expect "unverified usage keeps local: $invalid" '' off
+  echo "$(( $(date -u +%s) - 100 )) aaa" >"$STATE_DIR/linux-overflow"
+  check_linux_overflow; expect "unverified usage restores local: $invalid" 'repos=[hesperus]' off
+  USAGE_EVERY=21600
+done
+fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"
+usage_sample "$(( $(date -u +%s) - USAGE_EVERY - POLL + 30 ))" 15
+check_linux_overflow; expect 'usage remains valid through refresh cadence and one poll' 'repos=[]' on
 
 
 # Projected from the live organization runner inventory on 2026-10-23.
