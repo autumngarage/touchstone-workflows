@@ -122,17 +122,19 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-Set the repository variable `BLACKSMITH_LINUX=true` to run Linux validation
-on Blacksmith's managed ephemeral 4-vCPU Ubuntu 24.04 runners, including PR and
-merge-queue validation. This takes precedence over `LINUX_RUNNER`. Reusable
-callers can also opt in with `blacksmith: true`; that input defaults to false.
+Set the repository variable `BLACKSMITH_LINUX=true` to use Blacksmith's managed
+ephemeral 4-vCPU Ubuntu 24.04 runners when `LINUX_RUNNER` does not select a local
+pool, including PR and merge-queue validation. Reusable callers can explicitly
+select Blacksmith with `blacksmith: true`; that input takes precedence over
+the local pool and defaults to false.
 Review/delivery gates and macOS jobs keep their existing routing.
 
 Blacksmith must be installed for the consumer repository and is billed
 separately from GitHub; the GitHub usage guard does not govern that bill.
-Adopt the reviewed workflow pin before enabling the variable. Disable the old
-local/GitHub overflow automation for migrated consumers. Removing the variable
-restores the existing local/GitHub selector without changing validation rules.
+Adopt the reviewed workflow pin before enabling the variable. Existing overflow
+routing can retain the local pool as the default and remove its selection when
+full; Blacksmith then supplies hosted capacity. Removing the variable restores
+GitHub Ubuntu as that fallback without changing validation rules.
 
 Without Blacksmith opt-in, validation reads `LINUX_RUNNER`:
 
