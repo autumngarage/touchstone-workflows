@@ -48,7 +48,7 @@ assert_count 1 'name: validate \(ubuntu-latest\)'
 # queue. The queue's selector must stay a subset of the others', so a queue
 # job may take any slot.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ (inputs.blacksmith || vars.BLACKSMITH_LINUX == '\''true'\'') && '\''blacksmith-4vcpu-ubuntu-2404'\'' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '\''merge_group'\'' && '\''["self-hosted","{0}"]'\'' || '\''["self-hosted","{0}","{0}-shared"]'\'', vars.LINUX_RUNNER))) || '\''ubuntu-latest'\'' }}'
+runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '"'"'merge_group'"'"' && '"'"'["self-hosted","{0}"]'"'"' || '"'"'["self-hosted","{0}","{0}-shared"]'"'"', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
 # The shape before AUT-2704, which would let any job take a reserved slot.
 # shellcheck disable=SC2016
 plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
@@ -84,8 +84,8 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
   done
 fi
-# AUT-2828: the reusable input remains false by default; repository opt-in
-# is explicit in the selector so existing local consumers stay unchanged.
+# AUT-2851: explicit caller opt-in wins; repository opt-in only supplies the
+# hosted fallback after the local selector. The input stays false by default.
 assert_active_line "$workflow" 'blacksmith:' "Blacksmith trial input"
 blacksmith_input="$(sed -n '/^      blacksmith:/,/^  pull_request:/p' "$workflow")"
 printf '%s\n' "$blacksmith_input" | grep -Fxq '        type: boolean' \
@@ -96,7 +96,7 @@ printf '%s\n' "$blacksmith_input" | grep -Fxq '        default: false' \
 # Local and non-Swift validation retain 30 minutes; explicit seed input wins.
 # shellcheck disable=SC2016
 assert_active_line "$workflow" \
-  "timeout-minutes: \${{ inputs.timeout_minutes || ((vars.BLACKSMITH_LINUX == 'true' || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
+  "timeout-minutes: \${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
   "validate job timeout"
 assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 [ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 30$')" -eq 1 ] \
