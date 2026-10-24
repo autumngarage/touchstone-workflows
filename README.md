@@ -122,14 +122,19 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-Reusable-workflow callers can opt into a Linux Blacksmith trial with
-`blacksmith: true`. The input defaults to false and selects a managed ephemeral
-4-vCPU Ubuntu 24.04 runner. It does not alter required PR or merge-queue routing,
-which has no caller input, or the review and delivery gates. Blacksmith must be
-installed for the caller repository and is billed separately from GitHub;
-the existing GitHub usage guard does not govern that bill.
+Set the repository variable `BLACKSMITH_LINUX=true` to run Linux validation
+on Blacksmith's managed ephemeral 4-vCPU Ubuntu 24.04 runners, including PR and
+merge-queue validation. This takes precedence over `LINUX_RUNNER`. Reusable
+callers can also opt in with `blacksmith: true`; that input defaults to false.
+Review/delivery gates and macOS jobs keep their existing routing.
 
-Default validation routing reads `LINUX_RUNNER`:
+Blacksmith must be installed for the consumer repository and is billed
+separately from GitHub; the GitHub usage guard does not govern that bill.
+Adopt the reviewed workflow pin before enabling the variable. Disable the old
+local/GitHub overflow automation for migrated consumers. Removing the variable
+restores the existing local/GitHub selector without changing validation rules.
+
+Without Blacksmith opt-in, validation reads `LINUX_RUNNER`:
 
 ```yaml
 runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
