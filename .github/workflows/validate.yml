@@ -23,6 +23,10 @@ on:
         description: Job time limit in minutes. Raise it only for a cache seed that may build cold.
         type: number
         default: 30
+      blacksmith:
+        description: Run an explicit Linux trial on Blacksmith instead of the default runner.
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -89,7 +93,8 @@ jobs:
     # README.md. Every event but the merge queue also requires
     # LINUX_RUNNER-shared, so slots the runner reserves for the queue
     # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
-    runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
+    # Only a reusable-workflow caller can opt into this managed-runner trial.
+    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || 'ubuntu-latest' }}
     # Two-CPU hosted Swift builds can spend 20 minutes compiling before tests.
     # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.LINUX_RUNNER == '' && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}

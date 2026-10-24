@@ -48,7 +48,7 @@ assert_count 1 'name: validate \(ubuntu-latest\)'
 # queue. The queue's selector must stay a subset of the others', so a queue
 # job may take any slot.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == '\''merge_group'\'' && '\''["self-hosted","{0}"]'\'' || '\''["self-hosted","{0}","{0}-shared"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
+runner_selector='runs-on: ${{ inputs.blacksmith && '\''blacksmith-4vcpu-ubuntu-2404'\'' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '\''merge_group'\'' && '\''["self-hosted","{0}"]'\'' || '\''["self-hosted","{0}","{0}-shared"]'\'', vars.LINUX_RUNNER))) || '\''ubuntu-latest'\'' }}'
 # The shape before AUT-2704, which would let any job take a reserved slot.
 # shellcheck disable=SC2016
 plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
@@ -84,6 +84,14 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
   done
 fi
+# AUT-2828: only an explicit reusable caller can select the managed trial.
+# The boolean default keeps PR/queue/local routing unchanged.
+assert_active_line "$workflow" 'blacksmith:' "Blacksmith trial input"
+blacksmith_input="$(sed -n '/^      blacksmith:/,/^  pull_request:/p' "$workflow")"
+printf '%s\n' "$blacksmith_input" | grep -Fxq '        type: boolean' \
+  || fail "Blacksmith trial must be a boolean input"
+printf '%s\n' "$blacksmith_input" | grep -Fxq '        default: false' \
+  || fail "Blacksmith trial must remain opt-in"
 # AUT-2821: only hosted Swift-cache consumers get a cold-build allowance.
 # Local and non-Swift validation retain 30 minutes; explicit seed input wins.
 # shellcheck disable=SC2016
