@@ -93,11 +93,11 @@ jobs:
     # README.md. Every event but the merge queue also requires
     # LINUX_RUNNER-shared, so slots the runner reserves for the queue
     # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
-    # Only a reusable-workflow caller can opt into this managed-runner trial.
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || 'ubuntu-latest' }}
+    # Repository opt-in selects Blacksmith for required PR and merge-queue validation too.
+    runs-on: ${{ (inputs.blacksmith || vars.BLACKSMITH_LINUX == 'true') && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || 'ubuntu-latest' }}
     # Two-CPU hosted Swift builds can spend 20 minutes compiling before tests.
     # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
-    timeout-minutes: ${{ inputs.timeout_minutes || (vars.LINUX_RUNNER == '' && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
+    timeout-minutes: ${{ inputs.timeout_minutes || ((vars.BLACKSMITH_LINUX == 'true' || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
