@@ -41,7 +41,8 @@ assert_count 1 'name: validate \(ubuntu-latest\)'
 # that lets validate, which runs candidate code, use it at all. Touchstone's
 # shared hosted-runner check (AUT-1592) accepts this shape.
 #
-# AUT-2452: validate reads LINUX_RUNNER and the two gate jobs read
+# AUT-2452/AUT-2992: candidate execution reads LINUX_RUNNER; planning,
+# aggregation, and the review/delivery gates read
 # LINUX_GATE_RUNNER. A gate job runs for seconds; on one setting it waited in
 # line behind eight-minute validations on a repository's two runners (23
 # minutes on average on 2026-10-11). Neither may read the other's setting: a
@@ -62,12 +63,20 @@ gate_runner_selector='runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('\'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
-[ "$(active_count "$workflow" "$runner_selector")" -eq 3 ] \
-  || fail "$workflow: its consumer jobs must take their runners from the LINUX_RUNNER selector"
-[ "$(active_count "$workflow" "$gate_runner_selector")" -eq 0 ] \
-  || fail "$workflow: validate must not take its runner from the gate jobs' setting"
+[ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
+  || fail "$workflow: only candidate execution takes the LINUX_RUNNER selector"
+[ "$(active_count "$workflow" "$gate_runner_selector")" -eq 2 ] \
+  || fail "$workflow: planning and aggregation take the LINUX_GATE_RUNNER selector"
 [ "$(active_count "$workflow" "$plain_runner_selector")" -eq 0 ] \
   || fail "$workflow: validate must keep the merge queue's reserved slots for the queue"
+# Counts alone cannot catch a plan/shard selector swap.
+for job in plan validate-groups validate; do
+  job_body="$(sed -n "/^  $job:/,/^  [a-z][a-z-]*:/p" "$workflow" | sed '$d')"
+  expected_selector="$gate_runner_selector"
+  [ "$job" != validate-groups ] || expected_selector="$runner_selector"
+  [ "$(printf '%s\n' "$job_body" | sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' | grep -Fxc -- "$expected_selector" || true)" -eq 1 ] \
+    || fail "$workflow: $job must use its own runner selector"
+done
 for gate in "$review_gate" "$delivery_evidence"; do
   [ "$(active_count "$gate" "$gate_runner_selector")" -eq 1 ] \
     || fail "$gate: its consumer job must take its runner from the LINUX_GATE_RUNNER selector"

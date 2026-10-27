@@ -87,7 +87,8 @@ jobs:
     # required workflows from their source repository; mirror that here.
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: validate plan
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    # Trusted declaration parsing uses the lightweight gate pool, not build slots.
+    runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -155,7 +156,7 @@ jobs:
       # Every shard runs to completion: the aggregator needs each group's
       # own verdict, and one failing group must not cancel the evidence
       # from the others. Two shards at a time keeps a self-hosted pool's
-      # remaining slots free for the plan and aggregator jobs.
+      # remaining slots available to other candidates.
       fail-fast: false
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
@@ -305,7 +306,8 @@ jobs:
     if: ${{ always() && github.repository != 'autumngarage/touchstone-workflows' }}
     needs: [plan, validate-groups]
     name: validate (ubuntu-latest)
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    # Reporting completed shard verdicts must not queue behind new builds.
+    runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require every validation group
