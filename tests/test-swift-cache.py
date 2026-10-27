@@ -12,7 +12,7 @@ workflow = json.loads(subprocess.check_output([
     str(root / ".github/workflows/validate.yml"),
 ], text=True))
 assert "workflow_call" in workflow.get("on", workflow.get("true", {}))
-steps = workflow["jobs"]["validate"]["steps"]
+steps = workflow["jobs"]["validate-groups"]["steps"]
 key = next(s for s in steps if s.get("id") == "swift-cache")
 cache = next(s for s in steps if s.get("name") == "Restore Swift build cache")
 save = next(s for s in steps if s.get("name") == "Save default-branch Swift build cache")
@@ -28,7 +28,7 @@ assert key["env"]["CACHE_REVISION"] == "${{ github.sha }}"
 assert cache["uses"] == "actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830"
 assert cache["id"] == "restore-swift-cache"
 assert save["uses"] == "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"
-assert save["if"] == "success() && steps.swift-cache.outputs.save == 'true' && steps.restore-swift-cache.outputs.cache-hit != 'true'"
+assert save["if"] == "success() && matrix.group == '' && steps.swift-cache.outputs.save == 'true' && steps.restore-swift-cache.outputs.cache-hit != 'true'"
 assert save["with"] == {"path": ".build", "key": "${{ steps.swift-cache.outputs.key }}"}
 assert key["env"]["CACHE_EVENT"] == "${{ github.event_name }}"
 assert key["env"]["CACHE_REF"] == "${{ github.ref }}"
@@ -36,7 +36,7 @@ assert key["env"]["CACHE_DEFAULT_BRANCH"] == "${{ github.event.repository.defaul
 assert local["if"] == check["if"] == "steps.swift-cache.outputs.enabled == 'true'"
 assert cache["if"] == "steps.swift-cache.outputs.enabled == 'true' && steps.runner-swift-cache.outputs.hit != 'true'"
 assert local["env"] == {"CACHE_PREFIX": "${{ steps.swift-cache.outputs.prefix }}", "RUNNER_CACHE_ROOT": "/home/runner/swift-build-cache"}
-assert record["if"] == "success() && steps.swift-cache.outputs.save == 'true'"
+assert record["if"] == "success() && matrix.group == '' && steps.swift-cache.outputs.save == 'true'"
 assert record["env"] == {"CACHE_KEY": "${{ steps.swift-cache.outputs.key }}", "CACHE_KEY_FILE": "/home/runner/.touchstone-swift-cache-key"}
 # The supervisor that fills the image reads and writes the same two paths.
 supervisor = (root / "runner/linux-runner.sh").read_text()
