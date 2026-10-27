@@ -127,7 +127,8 @@ ephemeral 4-vCPU Ubuntu 24.04 runners when `LINUX_RUNNER` does not select a loca
 pool, including PR and merge-queue validation. Reusable callers can explicitly
 select Blacksmith with `blacksmith: true`; that input takes precedence over
 the local pool and defaults to false.
-Review/delivery gates and macOS jobs keep their existing routing.
+Validation planning, final summaries, and review/delivery gates use the gate
+selector below; macOS jobs keep their existing routing.
 
 Blacksmith must be installed for the consumer repository and is billed
 separately from GitHub; the GitHub usage guard does not govern that bill.
@@ -182,8 +183,8 @@ its log; without it, the first `N` slots are queue-only, fixed. Give the
 runners the label before a consumer's validation pin requires it, or its
 pull-request jobs wait for a runner that never matches.
 
-The two gate jobs, `review-gate` and `delivery-evidence`, read
-`LINUX_GATE_RUNNER`, without the merge-queue split:
+Validation planning (`plan`), its final summary (`validate`), `review-gate`,
+and `delivery-evidence` read `LINUX_GATE_RUNNER`, without the merge-queue split:
 `fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER))`. They run for seconds, and on one
 variable they waited in line behind validations: on a repository with two
 runners of its own, 23 minutes on average on 2026-10-11, long enough for
@@ -199,7 +200,7 @@ as before. Set, they run on a self-hosted runner with that label, and the
 image (AUT-1595). The `source contract` job runs only in
 this public repository and stays on `ubuntu-latest` by name.
 
-**Both variables name only single-use runners.** `validate` runs the
+**Both variables name only single-use runners.** `validate-groups` runs the
 candidate's declared commands. On a persistent self-hosted runner, a pull
 request could modify the host and reach every later job there, including
 `review-gate`, which receives the fallback reviewer's credential
