@@ -81,11 +81,64 @@ jobs:
       - name: Test workflow contract
         run: bash tests/test-workflow.sh
 
-  validate:
+  plan:
+    # Reads the candidate's declaration through the pinned engine to learn
+    # its execution groups. Executes no candidate code. GitHub excludes
+    # required workflows from their source repository; mirror that here.
+    if: github.repository != 'autumngarage/touchstone-workflows'
+    name: validate plan
+    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Fetch pinned Touchstone validator
+        run: |
+          set -euo pipefail
+          touchstone_revision="d2031284cff02a088a04987e0327f71e058c79ba"
+          touchstone_sha256="9de43e0c028ad6e4771b47338cbd88b0aab3d17600ab401ca17f17dfd4f9d5ef"
+          validator="$RUNNER_TEMP/touchstone-run.sh"
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
+            --output "$validator"
+          printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
+
+      - name: Plan validation groups
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          contract="$(bash "$RUNNER_TEMP/touchstone-run.sh" validate \
+            --project "$GITHUB_WORKSPACE" \
+            --check-contract \
+            --json)"
+          # Cache seeds stay one serial run: the saved build products must
+          # come from a single complete validation. An engine whose
+          # contract carries no groups inventory also runs serially, so
+          # this workflow keeps working against older pinned engines.
+          if [ "$EVENT_NAME" = workflow_call ] || [ "$EVENT_NAME" = push ]; then
+            matrix='{"include":[{"name":"all","group":""}]}'
+          else
+            matrix="$(printf '%s' "$contract" | jq -c '
+              if (.groups // [] | length) == 0
+              then {"include":[{"name":"all","group":""}]}
+              else {"include":[.groups[] | {"name":.name,"group":.name}]}
+              end')"
+          fi
+          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
+
+  validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
     if: github.repository != 'autumngarage/touchstone-workflows'
-    name: validate (ubuntu-latest)
+    needs: plan
+    # No display name: a templated one would breach the source contract's
+    # literal job-name guard, and GitHub already appends each shard's
+    # matrix values (its group name) to the job ID in the check list.
     # Executes the candidate's own declared commands, so it may leave
     # GitHub-hosted runners only for single-use ones: LINUX_RUNNER names the
     # runners runner/linux-runner.sh registers for exactly one job in a
@@ -98,6 +151,14 @@ jobs:
     # Two-CPU hosted Swift builds can spend 20 minutes compiling before tests.
     # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
+    strategy:
+      # Every shard runs to completion: the aggregator needs each group's
+      # own verdict, and one failing group must not cancel the evidence
+      # from the others. Two shards at a time keeps a self-hosted pool's
+      # remaining slots free for the plan and aggregator jobs.
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -178,8 +239,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="ef2934d6baff508464d565d557f7ddf487e012e2"
-          touchstone_sha256="51daa8d4e543260c258613e7f14faa77c7d54eb310c22fb83c505e2c33376e1e"
+          touchstone_revision="d2031284cff02a088a04987e0327f71e058c79ba"
+          touchstone_sha256="9de43e0c028ad6e4771b47338cbd88b0aab3d17600ab401ca17f17dfd4f9d5ef"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -187,10 +248,19 @@ jobs:
           printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
 
       - name: Run declared validation
+        env:
+          # Empty for the serial run (cache seeds, engines without a groups
+          # inventory); otherwise this shard's declared group name.
+          VALIDATION_GROUP: ${{ matrix.group }}
         run: |
           set -euo pipefail
+          group_args=()
+          if [ -n "$VALIDATION_GROUP" ]; then
+            group_args=(--group "$VALIDATION_GROUP")
+          fi
           bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
+            "${group_args[@]}" \
             --json
 
       - name: Verify cached toolchain stayed in force
@@ -208,7 +278,7 @@ jobs:
       # Tells runner/linux-runner.sh which cache this seed's .build is. Outside
       # .build, so GitHub's copy never carries it into other runs.
       - name: Record the Swift build cache key
-        if: success() && steps.swift-cache.outputs.save == 'true'
+        if: success() && matrix.group == '' && steps.swift-cache.outputs.save == 'true'
         env:
           CACHE_KEY: ${{ steps.swift-cache.outputs.key }}
           CACHE_KEY_FILE: /home/runner/.touchstone-swift-cache-key
@@ -220,8 +290,36 @@ jobs:
           fi
 
       - name: Save default-branch Swift build cache
-        if: success() && steps.swift-cache.outputs.save == 'true' && steps.restore-swift-cache.outputs.cache-hit != 'true'
+        if: success() && matrix.group == '' && steps.swift-cache.outputs.save == 'true' && steps.restore-swift-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .build
           key: ${{ steps.swift-cache.outputs.key }}
+
+  validate:
+    # The required check. Reports success only when the plan and every
+    # shard succeeded; a failed plan, a failed or skipped shard matrix,
+    # and a cancelled run all land as failure here, never as a silent
+    # pass. Runs even when a shard failed, so the required context always
+    # reports a terminal verdict for the head.
+    if: ${{ always() && github.repository != 'autumngarage/touchstone-workflows' }}
+    needs: [plan, validate-groups]
+    name: validate (ubuntu-latest)
+    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Require every validation group
+        env:
+          PLAN_RESULT: ${{ needs.plan.result }}
+          GROUPS_RESULT: ${{ needs.validate-groups.result }}
+        run: |
+          set -euo pipefail
+          if [ "$PLAN_RESULT" != success ]; then
+            echo "Validation planning did not succeed: $PLAN_RESULT" >&2
+            exit 1
+          fi
+          if [ "$GROUPS_RESULT" != success ]; then
+            echo "Declared validation did not succeed in every group: $GROUPS_RESULT" >&2
+            exit 1
+          fi
+          echo "Declared validation succeeded in every group."

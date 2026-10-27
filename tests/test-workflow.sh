@@ -19,12 +19,17 @@ assert_count() {
   [ "$actual" -eq "$expected" ] || fail "expected $expected match(es) for $pattern, found $actual"
 }
 
-assert_active_line() {
+assert_active_line_count() {
   file="$1"
-  expected="$2"
-  label="$3"
+  expected_count="$2"
+  expected="$3"
+  label="$4"
   actual="$(sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$file" | grep -Fxc -- "$expected" || true)"
-  [ "$actual" -eq 1 ] || fail "$file: $label must be one active command"
+  [ "$actual" -eq "$expected_count" ] || fail "$file: $label must be $expected_count active command(s), found $actual"
+}
+
+assert_active_line() {
+  assert_active_line_count "$1" 1 "$2" "$3"
 }
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
@@ -57,8 +62,8 @@ gate_runner_selector='runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('\'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
-[ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
-  || fail "$workflow: its consumer job must take its runner from the LINUX_RUNNER selector"
+[ "$(active_count "$workflow" "$runner_selector")" -eq 3 ] \
+  || fail "$workflow: its consumer jobs must take their runners from the LINUX_RUNNER selector"
 [ "$(active_count "$workflow" "$gate_runner_selector")" -eq 0 ] \
   || fail "$workflow: validate must not take its runner from the gate jobs' setting"
 [ "$(active_count "$workflow" "$plain_runner_selector")" -eq 0 ] \
@@ -77,7 +82,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   # runners, so it stays GitHub-hosted by name.
   [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 1 ] \
     || fail "$workflow: the source contract job must run on GitHub-hosted ubuntu-latest"
-  [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 2 ] \
+  [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 4 ] \
     || fail "$workflow: a job takes its runner from somewhere other than the selector or ubuntu-latest"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
@@ -101,16 +106,19 @@ assert_active_line "$workflow" \
 assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 [ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 30$')" -eq 1 ] \
   || fail "$workflow: the timeout input must default to the pull-request limit"
-assert_count 2 'uses: actions/checkout@[0-9a-f]{40}'
-assert_count 1 'touchstone_revision="[0-9a-f]{40}"'
-assert_count 1 'touchstone_sha256="[0-9a-f]{64}"'
-assert_count 2 'raw\.githubusercontent\.com/autumngarage/touchstone/'
-assert_count 2 'sha256sum --check --strict'
-assert_count 1 'touchstone-run\.sh" validate'
+# The plan job and the shard job each fetch the pinned engine and invoke
+# it against the candidate: the plan to read its groups, each shard to run
+# one group. The source-contract job fetches its own copy by contract.
+assert_count 3 'uses: actions/checkout@[0-9a-f]{40}'
+assert_count 2 'touchstone_revision="[0-9a-f]{40}"'
+assert_count 2 'touchstone_sha256="[0-9a-f]{64}"'
+assert_count 3 'raw\.githubusercontent\.com/autumngarage/touchstone/'
+assert_count 3 'sha256sum --check --strict'
+assert_count 2 'touchstone-run\.sh" validate'
 # The workflow must pass the runner-provided variable literally.
 # shellcheck disable=SC2016
-assert_count 1 '--project "\$GITHUB_WORKSPACE"'
-assert_count 1 '--json'
+assert_count 2 '--project "\$GITHUB_WORKSPACE"'
+assert_count 2 '--json'
 # The merge queue tests a temporary merge commit; a required check that does
 # not report there ejects every queue entry.
 assert_count 1 '^  merge_group:'
@@ -146,10 +154,11 @@ for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate
 # executed checksum command. Retaining those strings in comments or unused
 # assignments is not evidence that the workflow enforces them.
 # shellcheck disable=SC1003,SC2016
-assert_active_line "$workflow" \
+# The plan job and the shard job each fetch and verify the pinned engine.
+assert_active_line_count "$workflow" 2 \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \' \
   "validator fetch"
-assert_active_line "$workflow" \
+assert_active_line_count "$workflow" 2 \
   "printf '%s  %s\\n' \"\$touchstone_sha256\" \"\$validator\" | sha256sum --check --strict" \
   "validator checksum"
 # The source manifest owns engine compatibility. The consumer workflow keeps
@@ -162,12 +171,14 @@ jq -e '
   and .validationEngine.path == "scripts/touchstone-run.sh"
   and (.validationEngine.revision | test("^[0-9a-f]{40}$"))
   and (.validationEngine.sha256 | test("^[0-9a-f]{64}$"))
-  and .validationEngine.supportedProjectSchemas == [1, 2]
+  and .validationEngine.supportedProjectSchemas == [1, 2, 3]
 ' "$source_contract" >/dev/null || fail "$source_contract: invalid validation-engine contract"
 manifest_engine_revision="$(jq -r '.validationEngine.revision' "$source_contract")"
 manifest_engine_sha256="$(jq -r '.validationEngine.sha256' "$source_contract")"
-workflow_engine_revision="$(sed -n 's/^[[:space:]]*touchstone_revision="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow")"
-workflow_engine_sha256="$(sed -n 's/^[[:space:]]*touchstone_sha256="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow")"
+# Both fetch sites pin the same engine; collapse identical pins so any
+# drift between them still differs from the manifest and stays fatal.
+workflow_engine_revision="$(sed -n 's/^[[:space:]]*touchstone_revision="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow" | sort -u)"
+workflow_engine_sha256="$(sed -n 's/^[[:space:]]*touchstone_sha256="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow" | sort -u)"
 [ "$workflow_engine_revision" = "$manifest_engine_revision" ] \
   || fail "$workflow: validator revision differs from $source_contract"
 [ "$workflow_engine_sha256" = "$manifest_engine_sha256" ] \
@@ -194,7 +205,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
     || fail "declared validation engine checksum differs from $source_contract"
 
   engine_fixture="$(mktemp -d)"
-  for schema in 1 2; do
+  for schema in 1 2 3; do
     project="$engine_fixture/schema-$schema"
     mkdir -p "$project"
     printf '%s\n' \
