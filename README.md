@@ -52,6 +52,13 @@ Pull requests land through the repository's merge queue only after the source
 contract check passes. Touchstone separately pins each consumer-required
 workflow to an immutable commit from this repository.
 
+Queue validation uses GitHub's native matrix fail-fast: a failed shard cancels
+the same candidate's remaining Linux shards so a known-invalid generation does
+not keep build slots. The required aggregate still fails for failed, cancelled
+or skipped validation; a successful candidate must pass every declared group.
+Author and maintenance runs retain all shard results. This does not supersede
+healthy queue runs, change runner routing, or adopt a new consumer policy pin.
+
 ## Linux overflow
 
 `runner/linux-overflow.sh` owns the Linux overflow functions used by
