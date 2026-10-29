@@ -12,6 +12,8 @@ workflow = json.loads(subprocess.check_output([
     str(root / ".github/workflows/validate.yml"),
 ], text=True))
 assert "workflow_call" in workflow.get("on", workflow.get("true", {}))
+plan = next(s for s in workflow["jobs"]["plan"]["steps"] if s.get("id") == "plan")
+assert plan["env"]["EVENT_NAME"] == "${{ github.event_name }}"
 steps = workflow["jobs"]["validate-groups"]["steps"]
 key = next(s for s in steps if s.get("id") == "swift-cache")
 cache = next(s for s in steps if s.get("name") == "Restore Swift build cache")
@@ -55,6 +57,32 @@ with tempfile.TemporaryDirectory() as temporary:
     swift.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_SWIFT_VERSION"\n')
     swift.chmod(0o755)
     env = dict(os.environ, PATH=f"{binary}:{os.environ['PATH']}", CACHE_OS="Linux", CACHE_ARCH="ARM64", CACHE_GRAPH="graph-a", CACHE_REVISION="head-a", TEST_SWIFT_VERSION="Swift 6.3.3", CACHE_EVENT="push", CACHE_REF="refs/heads/main", CACHE_DEFAULT_BRANCH="main")
+
+    # Group inventory captured from the pinned engine's schema-3 contract
+    # for checks/swift-a/swift-b tasks; exercise the actual workflow shell.
+    groups = [{"name": name, "tasks": [name]} for name in ("checks", "swift-a", "swift-b")]
+    validator = directory / "touchstone-run.sh"
+    validator.write_text('#!/bin/sh\ncat "$PLAN_CONTRACT_FILE"\n')
+
+    def plan_groups(event, contract):
+        captured = directory / "contract.json"
+        captured.write_text(json.dumps(contract))
+        output = directory / "plan-output"
+        output.write_text("")
+        subprocess.run(["bash", "-c", plan["run"]], env=dict(
+            os.environ, EVENT_NAME=event, RUNNER_TEMP=str(directory),
+            GITHUB_WORKSPACE=str(directory), GITHUB_OUTPUT=str(output),
+            PLAN_CONTRACT_FILE=str(captured)), check=True)
+        return json.loads(dict(line.split("=", 1) for line in output.read_text().splitlines())["matrix"])
+
+    serial = {"include": [{"name": "all", "group": ""}]}
+    for event in ("push", "workflow_call", "workflow_dispatch"):
+        assert plan_groups(event, {"schema": 3, "groups": groups}) == serial, event
+    sharded = {"include": [{"name": group["name"], "group": group["name"]} for group in groups]}
+    for event in ("pull_request", "merge_group"):
+        assert plan_groups(event, {"schema": 3, "groups": groups}) == sharded, event
+        for legacy in ({}, {"groups": []}):
+            assert plan_groups(event, legacy) == serial, (event, legacy)
 
     def identify(**changes):
         output = directory / "output"

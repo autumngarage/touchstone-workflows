@@ -121,7 +121,8 @@ jobs:
           # come from a single complete validation. An engine whose
           # contract carries no groups inventory also runs serially, so
           # this workflow keeps working against older pinned engines.
-          if [ "$EVENT_NAME" = workflow_call ] || [ "$EVENT_NAME" = push ]; then
+          # Reusable workflows keep the caller's event, including manual seeds.
+          if [ "$EVENT_NAME" = workflow_call ] || [ "$EVENT_NAME" = push ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             matrix='{"include":[{"name":"all","group":""}]}'
           else
             matrix="$(printf '%s' "$contract" | jq -c '
