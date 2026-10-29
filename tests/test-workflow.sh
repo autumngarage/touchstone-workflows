@@ -34,6 +34,32 @@ assert_active_line() {
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
 
+# A known-invalid queue candidate must not retain running/queued build slots.
+# Author and maintenance runs still collect every shard's evidence. GitHub owns
+# the matrix cancellation; the required aggregate must reject every non-success.
+# shellcheck disable=SC2016
+assert_active_line "$workflow" \
+  'fail-fast: ${{ github.event_name == '\''merge_group'\'' }}' \
+  "merge-queue fail-fast"
+aggregate_script="$(awk '
+  /^      - name: Require every validation group$/ { step = 1 }
+  step && /^        run: \|$/ { body = 1; next }
+  body && /^          / { sub(/^          /, ""); print; next }
+  body && /[^[:space:]]/ { exit }
+' "$workflow")"
+[ -n "$aggregate_script" ] || fail "required aggregate script is missing"
+for plan in success failure cancelled skipped; do
+  for groups in success failure cancelled skipped; do
+    result=0
+    PLAN_RESULT="$plan" GROUPS_RESULT="$groups" bash -c "$aggregate_script" >/dev/null 2>&1 || result=$?
+    if [ "$plan" = success ] && [ "$groups" = success ]; then
+      [ "$result" -eq 0 ] || fail "required aggregate rejected successful validation"
+    else
+      [ "$result" -ne 0 ] || fail "required aggregate passed plan=$plan groups=$groups"
+    fi
+  done
+done
+
 # AUT-1595/AUT-1596: every consumer job takes its runner from a setting.
 # Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted is
 # always required, so the setting can never name a hosted image, and it names

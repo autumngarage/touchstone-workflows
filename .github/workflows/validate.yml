@@ -154,11 +154,11 @@ jobs:
     # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
     strategy:
-      # Every shard runs to completion: the aggregator needs each group's
-      # own verdict, and one failing group must not cancel the evidence
-      # from the others. Two shards at a time keeps a self-hosted pool's
-      # remaining slots available to other candidates.
-      fail-fast: false
+      # Once a queue candidate fails, its other shards cannot make it valid.
+      # Release those slots; the always-running aggregate still fails closed.
+      # Author/maintenance runs retain every shard's diagnostic evidence.
+      # Two shards at a time leaves pool slots for other candidates.
+      fail-fast: ${{ github.event_name == 'merge_group' }}
       max-parallel: 2
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
