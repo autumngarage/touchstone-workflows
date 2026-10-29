@@ -59,6 +59,17 @@ or skipped validation; a successful candidate must pass every declared group.
 Author and maintenance runs retain all shard results. This does not supersede
 healthy queue runs, change runner routing, or adopt a new consumer policy pin.
 
+The optional repository variable `VALIDATION_MAX_PARALLEL` is the consumer's
+administrator-selected matrix budget. Unset or empty keeps the default of two;
+a positive decimal integer permits at most that many declared groups at once.
+The planner caps the value to the actual matrix size, including the single
+serial cache-seed/older-engine fallback. Malformed or nonpositive settings fail
+planning before publishing matrix outputs. Every group and the required
+aggregate still run under the existing rules. This does not select runners or
+increase their resources. Changing a consumer's setting or adopting a new
+required-workflow pin requires that consumer's normal approval and rollout;
+source delivery alone does not change its live scheduling.
+
 ## Linux overflow
 
 `runner/linux-overflow.sh` owns the Linux overflow functions used by

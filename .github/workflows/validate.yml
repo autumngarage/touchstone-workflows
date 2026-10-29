@@ -92,6 +92,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -111,6 +112,7 @@ jobs:
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
+          VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
         run: |
           set -euo pipefail
           contract="$(bash "$RUNNER_TEMP/touchstone-run.sh" validate \
@@ -131,7 +133,19 @@ jobs:
               else {"include":[.groups[] | {"name":.name,"group":.name}]}
               end')"
           fi
+          requested_parallelism="${VALIDATION_MAX_PARALLEL:-2}"
+          if ! [[ "$requested_parallelism" =~ ^[1-9][0-9]*$ ]]; then
+            echo 'VALIDATION_MAX_PARALLEL must be a positive integer' >&2
+            exit 1
+          fi
+          group_count="$(printf '%s' "$matrix" | jq '.include | length')"
+          # Compare lengths first so even an oversized decimal cannot overflow
+          # shell arithmetic. The declared matrix is the actual upper bound.
+          if [ "${#requested_parallelism}" -gt "${#group_count}" ] || [ "$requested_parallelism" -gt "$group_count" ]; then
+            requested_parallelism="$group_count"
+          fi
           printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
+          printf 'max_parallel=%s\n' "$requested_parallelism" >>"$GITHUB_OUTPUT"
 
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
@@ -157,9 +171,10 @@ jobs:
       # Once a queue candidate fails, its other shards cannot make it valid.
       # Release those slots; the always-running aggregate still fails closed.
       # Author/maintenance runs retain every shard's diagnostic evidence.
-      # Two shards at a time leaves pool slots for other candidates.
+      # Default two leaves slots for other candidates. An administrator can
+      # opt into another budget; the planner caps it to the actual groups.
       fail-fast: ${{ github.event_name == 'merge_group' }}
-      max-parallel: 2
+      max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Checkout target repository

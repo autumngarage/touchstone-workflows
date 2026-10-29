@@ -60,6 +60,58 @@ for plan in success failure cancelled skipped; do
   done
 done
 
+# Execute the existing planner against its engine contract boundary. Defaults,
+# opt-in, serial fallback and invalid configuration keep the same group set.
+# Structural mutation fixtures re-enter this script; behavior needs one run,
+# while the output-binding assertion below still applies to every fixture.
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+(
+  plan_fixture="$(mktemp -d)"
+  trap 'rm -rf "$plan_fixture"' EXIT HUP INT TERM
+  # shellcheck disable=SC2016
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PLANNED_CONTRACT"\n' >"$plan_fixture/touchstone-run.sh"
+  plan_script="$(awk '
+    /^      - name: Plan validation groups$/ { step = 1 }
+    step && /^        run: \|$/ { body = 1; next }
+    body && /^          / { sub(/^          /, ""); print; next }
+    body && /[^[:space:]]/ { exit }
+  ' "$workflow")"
+  [ -n "$plan_script" ] || fail "validation planner script is missing"
+  grouped_contract='{"groups":[{"name":"checks"},{"name":"swift-a"},{"name":"swift-b"}]}'
+  check_plan() {
+    event="$1" budget="$2" contract="$3" expected="$4" groups="$5"
+    : >"$plan_fixture/outputs"
+    EVENT_NAME="$event" VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$contract" \
+      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      bash -c "$plan_script" || fail "planner rejected event=$event budget=$budget"
+    grep -Fxq "max_parallel=$expected" "$plan_fixture/outputs" || fail "incorrect parallel budget for $event/$budget"
+    matrix="$(sed -n 's/^matrix=//p' "$plan_fixture/outputs")"
+    [ "$(printf '%s' "$matrix" | jq '.include | length')" = "$groups" ] || fail "planner changed the declared groups"
+    if [ "$groups" = 3 ]; then
+      printf '%s' "$matrix" | jq -e '[.include[].group] == ["checks","swift-a","swift-b"]' >/dev/null || fail "planner lost a declared group"
+    else
+      printf '%s' "$matrix" | jq -e '. == {include:[{name:"all",group:""}]}' >/dev/null || fail "planner lost its serial fallback"
+    fi
+  }
+  check_plan pull_request '' "$grouped_contract" 2 3
+  check_plan pull_request 1 "$grouped_contract" 1 3
+  check_plan merge_group 3 "$grouped_contract" 3 3
+  check_plan merge_group 999999999999999999999999 "$grouped_contract" 3 3
+  check_plan pull_request 3 '{}' 1 1
+  for event in workflow_call workflow_dispatch push; do check_plan "$event" 3 "$grouped_contract" 1 1; done
+  for budget in 0 -1 1.5 invalid; do
+    : >"$plan_fixture/outputs"
+    if EVENT_NAME=merge_group VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$grouped_contract" \
+      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      bash -c "$plan_script" >"$plan_fixture/diagnostic" 2>&1; then fail "planner accepted invalid budget $budget"; fi
+    [ ! -s "$plan_fixture/outputs" ] || fail "invalid budget published runnable matrix outputs"
+    grep -q 'VALIDATION_MAX_PARALLEL' "$plan_fixture/diagnostic" || fail "invalid budget has no diagnostic"
+  done
+)
+fi
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
+
 # AUT-1595/AUT-1596: every consumer job takes its runner from a setting.
 # Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted is
 # always required, so the setting can never name a hosted image, and it names
