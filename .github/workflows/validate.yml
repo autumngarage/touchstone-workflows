@@ -233,6 +233,9 @@ jobs:
           cache="$RUNNER_CACHE_ROOT/$GITHUB_REPOSITORY"
           key="$(cat "$cache/.touchstone-swift-cache-key" 2>/dev/null || true)"
           case "$key" in
+            *$'\n'*|*$'\r'*) echo "The runner's cache key is not a single line."; exit 0 ;;
+          esac
+          case "$key" in
             "$CACHE_PREFIX"?*) ;;
             *)
               echo "This runner holds no build cache for this toolchain and package graph."
@@ -242,7 +245,7 @@ jobs:
           [ -d "$cache/.build" ] && [ ! -e .build ] || exit 0
           cp -a "$cache/.build" .build
           echo "Build cache from this runner's image: $key"
-          echo 'hit=true' >>"$GITHUB_OUTPUT"
+          printf 'hit=true\nkey=%s\n' "$key" >>"$GITHUB_OUTPUT"
 
       - name: Restore Swift build cache
         id: restore-swift-cache
@@ -269,6 +272,8 @@ jobs:
           # Empty for the serial run (cache seeds, engines without a groups
           # inventory); otherwise this shard's declared group name.
           VALIDATION_GROUP: ${{ matrix.group }}
+          TOUCHSTONE_SWIFT_CACHE_KEY: ${{ steps.swift-cache.outputs.key }}
+          TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY: ${{ steps.runner-swift-cache.outputs.key || steps.restore-swift-cache.outputs.cache-matched-key }}
         run: |
           set -euo pipefail
           group_args=()

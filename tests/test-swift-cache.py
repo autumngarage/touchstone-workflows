@@ -48,6 +48,8 @@ assert cache["with"] == {"path": ".build", "key": "${{ steps.swift-cache.outputs
 assert check["env"] == {"EXPECTED_TOOLCHAIN": "${{ steps.swift-cache.outputs.toolchain }}"}
 assert steps.index(key) < steps.index(local) < steps.index(cache) < steps.index(validate) < steps.index(check) < steps.index(record) < steps.index(save)
 assert "if" not in validate, "a cache hit must never skip validation"
+assert validate["env"]["TOUCHSTONE_SWIFT_CACHE_KEY"] == "${{ steps.swift-cache.outputs.key }}"
+assert validate["env"]["TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY"] == "${{ steps.runner-swift-cache.outputs.key || steps.restore-swift-cache.outputs.cache-matched-key }}"
 
 with tempfile.TemporaryDirectory() as temporary:
     directory = Path(temporary)
@@ -141,7 +143,9 @@ with tempfile.TemporaryDirectory() as temporary:
         subprocess.run(["/bin/bash", "-c", local["run"]], cwd=workspace, check=True, env=dict(env,
             GITHUB_OUTPUT=str(output), GITHUB_REPOSITORY="autumngarage/hesperus",
             CACHE_PREFIX=baseline["prefix"], RUNNER_CACHE_ROOT=str(runner_root)))
-        hit = output.read_text() == "hit=true\n"
+        outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        hit = outputs.get("hit") == "true"
+        assert outputs.get("key", "") == (stored_key if hit else ""), "only an actual copied cache identifies a restored key"
         copied = (workspace / ".build/debug/product").is_file()
         assert hit == copied, (stored_key, hit, copied)
         return hit
@@ -149,6 +153,8 @@ with tempfile.TemporaryDirectory() as temporary:
     assert not take(identify(CACHE_GRAPH="graph-b")["key"]), "another package graph"
     assert not take(identify(TEST_SWIFT_VERSION="Swift 6.4")["key"]), "another toolchain"
     assert not take(baseline["prefix"]), "a key with no revision"
+    assert not take(baseline["prefix"] + "head\ninjected=value"), "a multiline marker cannot inject workflow outputs"
+    assert not take(baseline["prefix"] + "head\rinjected=value"), "a carriage return cannot enter key transport"
     assert not take(None), "no recorded key"
     assert not take(baseline["key"], products=False), "a key without products"
     assert not take(baseline["key"], workspace_has_build=True), "a workspace that already has a .build"
