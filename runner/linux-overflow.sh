@@ -117,6 +117,53 @@ end_linux_overflow() { # why
   fi
 }
 
+# One timestamp per validation still waiting for this local fleet. A workflow
+# can be in progress while its other jobs wait; workflow status is not demand.
+waiting_linux_validations() {
+  local status pages runs="[]" current run at jobs created=""
+  for status in queued in_progress; do
+    pages="$(gh api --paginate --slurp "repos/$ORG/hesperus/actions/runs?status=$status&per_page=100")" || return 1
+    current="$(printf '%s\n' "$pages" | jq -ce '
+      if type != "array" or length == 0 then error("missing run pages") else . end
+      | .[0].total_count as $count
+      | if ($count | type) != "number" or $count < 0 or $count >= 1000
+          or ($count | floor) != $count
+          or any(.[]; .total_count != $count or (.workflow_runs | type) != "array")
+        then error("incomplete workflow census (filtered API limit: 1000)") else . end
+      | [.[].workflow_runs[]]
+      | if length != $count or (unique_by(.id) | length) != $count
+          or any(.[]; (.id | type) != "number" or .id <= 0 or (.id | floor) != .id
+            or (.name | type) != "string" or (.created_at | type) != "string")
+        then error("invalid workflow census") else . end
+      | map(select(.name == "validate"))
+      | if any(.[]; (.created_at | fromdateiso8601) < 0)
+        then error("invalid workflow timestamp") else . end')" || return 1
+    runs="$(printf '%s\n%s\n' "$runs" "$current" | jq -sc 'add | unique_by(.id)')" || return 1
+  done
+  while read -r run at; do
+    [ -n "$run" ] || continue
+    pages="$(gh api --paginate --slurp "repos/$ORG/hesperus/actions/runs/$run/jobs?filter=latest&per_page=100")" || return 1
+    jobs="$(printf '%s\n' "$pages" | jq -ce '
+      if type != "array" or length == 0 then error("missing job pages") else . end
+      | .[0].total_count as $count
+      | if ($count | type) != "number" or $count < 0 or ($count | floor) != $count
+          or any(.[]; .total_count != $count or (.jobs | type) != "array")
+        then error("incomplete job census") else . end
+      | [.[].jobs[]]
+      | if length != $count or (unique_by(.id) | length) != $count
+          or any(.[]; (.id | type) != "number" or .id <= 0 or (.id | floor) != .id
+            or (.status | type) != "string" or (.labels | type) != "array"
+            or any(.labels[]; type != "string"))
+        then error("invalid job census") else . end
+      | any(.[]; .status == "queued" and any(.labels[]; . == "linux-ephemeral"))')" || return 1
+    [ "$jobs" != true ] || created="$created$at
+"
+  done <<EOF
+$(printf '%s\n' "$runs" | jq -r '.[] | "\(.id) \(.created_at)"')
+EOF
+  printf '%s' "$created"
+}
+
 check_linux_overflow() {
   local state="$STATE_DIR/linux-overflow" quiet="$STATE_DIR/overflow-quiet" now pct created at waiting=0 oldest=0 began late saturated
   [ -e "$STATE_DIR/overflow-enabled" ] || return 0
@@ -157,8 +204,7 @@ check_linux_overflow() {
     [ ! -e "$state" ] || end_linux_overflow "local Linux runner saturation is no longer established"
     return 0
   fi
-  created="$(gh api "repos/$ORG/hesperus/actions/runs?status=queued&per_page=50" \
-    --jq '.workflow_runs[] | select(.name == "validate") | .created_at' 2>/dev/null)" || {
+  created="$(waiting_linux_validations)" || {
     [ ! -e "$state" ] || end_linux_overflow "could not read waiting Linux validations"
     return 0
   }
