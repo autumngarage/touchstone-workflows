@@ -143,7 +143,7 @@ waiting_linux_validations() {
   while read -r run at; do
     [ -n "$run" ] || continue
     pages="$(gh api --paginate --slurp "repos/$ORG/hesperus/actions/runs/$run/jobs?filter=latest&per_page=100")" || return 1
-    jobs="$(printf '%s\n' "$pages" | jq -ce '
+    jobs="$(printf '%s\n' "$pages" | jq -c '
       if type != "array" or length == 0 then error("missing job pages") else . end
       | .[0].total_count as $count
       | if ($count | type) != "number" or $count < 0 or ($count | floor) != $count
