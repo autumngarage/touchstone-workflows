@@ -1406,7 +1406,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
         [ -n "$out" ] && printf '%s' "$CASE_BODY" >"$out"; printf '200'; }
       # shellcheck source=/dev/null
       . "$fallback_fixture/fallback.sh"
-      fallback_review abc123 def456 >/dev/null 2>&1
+      fallback_review abc123 def456 >"$fallback_fixture/dismissal.out" 2>&1
     )
   }
 
@@ -1504,6 +1504,52 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     fail "a dismissal naming a different finding opened the gate"
   fi
   echo "  OK: a dismissal naming a different finding does not apply"
+
+  # AUT-3297: prose that references a different finding is not its dismissal.
+  # Run the actual extracted fallback block with two distinct blocking findings.
+  other_id="$(printf '%s|%s' b u | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  other_legacy_id="$(printf '%s|%s|%s' b 2 u | { command -v sha256sum >/dev/null 2>&1 && sha256sum || shasum -a 256; } | cut -c1-16)"
+  two_findings="$(printf '%s' "$reuse_p1" | jq '.findings += [{severity:"P0",file:"b",line:2,title:"u",body:"second finding"}]')"
+  two_response="$(jq -cn --arg content "$two_findings" '{choices:[{message:{content:$content}}]}')"
+  for reference_id in "$other_id" "$other_legacy_id"; do
+    misleading="<!-- touchstone:review-dismiss id=$p1_id reason=Compare id=$reference_id -->"
+    if run_dismissal_case "$misleading" "$two_response"; then
+      fail "an ID in explanation text dismissed an unrelated blocking finding ($reference_id)"
+    fi
+    grep -qF "finding $p1_id (P1 a:1) dismissed by the pull request body: $misleading" "$fallback_fixture/dismissal.out" \
+      || fail "the legitimate first dismissal was not applied and logged"
+  done
+  echo "  OK: canonical and legacy ID references in prose leave the unrelated P0 blocking"
+
+  if run_dismissal_case "<!-- touchstone:review-dismiss id=${p1_id}0 reason=longer field -->" "$p1_only"; then
+    fail "a longer marker ID matched a finding's digest prefix"
+  fi
+  echo "  OK: marker IDs must end at the field boundary"
+
+  misleading="<!-- touchstone:review-dismiss id=$p1_id reason=Compare id=$other_id -->"
+  genuine="<!-- touchstone:review-dismiss id=$other_id reason=the second finding is refuted -->"
+  legacy="<!-- touchstone:review-dismiss id=$other_legacy_id reason=legacy second dismissal -->"
+  if ! run_dismissal_case "$(printf '%s\n' "$misleading" "$legacy" "$genuine")" "$two_response"; then
+    fail "two legitimate dismissals did not open the gate"
+  fi
+  grep -qxF "Fallback reviewer: finding $other_id (P0 b:2) dismissed by the pull request body: $genuine" "$fallback_fixture/dismissal.out" \
+    || fail "the audit used explanation text or the legacy record instead of the canonical authorizing marker"
+  echo "  OK: the audit names the exact canonical marker, even after misleading prose and a legacy marker"
+
+  for compatible_marker in "$(printf '<!--\ttouchstone:review-dismiss\tid=%s\treason=tabbed -->' "$p1_id")" "<!-- touchstone:review-dismiss id=$p1_id-->"; do
+    run_dismissal_case "inline: $compatible_marker" "$p1_only" \
+      || fail "supported marker whitespace or an adjacent terminator stopped matching"
+  done
+  echo "  OK: inline markers, accepted whitespace and an adjacent terminator remain compatible"
+
+  rm -f "$fallback_fixture/curl-called"
+  if run_reuse_case "$misleading" "$two_findings"; then
+    fail "a reused verdict let explanation text dismiss another finding"
+  fi
+  [ ! -e "$fallback_fixture/curl-called" ] || fail "the dismissal check requested another provider verdict"
+  grep -qF "finding $p1_id (P1 a:1) dismissed by the pull request body: $misleading" "$fallback_fixture/reuse.out" \
+    || fail "the reused verdict did not preserve the legitimate dismissal"
+  echo "  OK: the reused verdict keeps the unrelated finding blocking without another provider request"
 
   # A 404 is "no provider satisfied the constraints", so it retries once at the
   # relaxed ceiling and can then succeed. A second 404 is refused.
