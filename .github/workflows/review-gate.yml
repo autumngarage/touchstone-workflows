@@ -476,6 +476,11 @@ jobs:
               || true
           }
 
+          # Only the leading ID field authorizes a dismissal; prose may mention others.
+          matching_dismissal() {
+            grep -m1 -E "^<!--[[:space:]]*touchstone:review-dismiss[[:space:]]+id=$1([[:space:]]|-->)"
+          }
+
           # A review happens once per head. The model is not deterministic, so
           # asking it again on every gate run for the same head re-rolls the
           # findings and their ids, and a refutation the driver recorded can
@@ -664,7 +669,7 @@ jobs:
           # run re-reviewed the group head afresh and could evict an admitted
           # pull request on a finding its own gate never saw.
           fallback_review() {
-            local head="$1" base="$2" reviewed_head="${3:-}" work status http body findings
+            local head="$1" base="$2" reviewed_head="${3:-}" work status http body findings matched_dismissal
 
             [ -n "${OPENROUTER_API:-}" ] || {
               echo "Fallback reviewer: no credential configured; not attempting." >&2
@@ -832,15 +837,15 @@ jobs:
                 # Only the durable id is emitted, so the legacy form ages out.
                 legacy_id="$(printf '%s|%s|%s' "$file" "$line" "$title" | sha16)"
                 matched_id=""
-                if printf '%s' "$dismissals" | grep -qF "id=$id"; then
+                if matched_dismissal="$(matching_dismissal "$id" <<<"$dismissals")"; then
                   matched_id="$id"
-                elif printf '%s' "$dismissals" | grep -qF "id=$legacy_id"; then
+                elif matched_dismissal="$(matching_dismissal "$legacy_id" <<<"$dismissals")"; then
                   matched_id="$legacy_id"
                 fi
                 if [ -n "$matched_id" ]; then
                   printf 'Fallback reviewer: finding %s (%s %s:%s) dismissed by the pull request body: %s\n' \
                     "$matched_id" "$sev" "$file" "$line" \
-                    "$(printf '%s' "$dismissals" | grep -F "id=$matched_id" | head -1)"
+                    "$matched_dismissal"
                 elif [ "$sev" = P0 ] || [ "$sev" = P1 ]; then
                   blocking=$((blocking + 1))
                 fi
