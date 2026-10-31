@@ -13,7 +13,7 @@ FIXTURE="$root/tests/fixtures/overflow-current-checks.json"
 RUNNER_FIXTURE="$root/tests/fixtures/overflow-runners.json"
 RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0
 CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0
-RUN_PAGES=""; PROGRESS_PAGES=""; JOB_PAGES=""; FAIL_JOBS=0; API_CALLS="$STATE_DIR/api-calls"
+RUN_PAGES=""; PROGRESS_PAGES=""; JOB_PAGES=""; FAIL_JOBS=0; NONMATCH_RUN_ID=""; API_CALLS="$STATE_DIR/api-calls"
 note() { :; }
 add_event() { events+=("$*"); }
 LINUX_HOME_REPOS=hesperus; ORG=autumngarage; USAGE_EVERY=21600; POLL=180
@@ -34,7 +34,7 @@ gh() {
           if [ -n "$JOB_PAGES" ]; then cat "$JOB_PAGES"; else
             local run
             run="$(printf '%s' "$*" | sed -E 's@.*/runs/([0-9]+)/jobs.*@\1@')"
-            jq -n --argjson run "$run" '[{total_count:1,jobs:[{id:$run,run_id:$run,status:"queued",labels:["self-hosted","linux-ephemeral"]}]}]'
+            jq -n --argjson run "$run" --arg nonmatch "$NONMATCH_RUN_ID" '[{total_count:1,jobs:[{id:$run,run_id:$run,status:(if ($run|tostring)==$nonmatch then "in_progress" else "queued" end),labels:["self-hosted","linux-ephemeral"]}]}]'
           fi ;;
         *status=in_progress*)
           if [ -n "$PROGRESS_PAGES" ]; then cat "$PROGRESS_PAGES"; else echo '[{"total_count":0,"workflow_runs":[]}]'; fi ;;
@@ -59,7 +59,7 @@ expect() { # label expected-calls expected-state(on|off)
   : >"$CALLS"
 }
 usage_sample() { printf '%s month=%s gross_usd=1 pct=%s projected_usd=1 allowance_usd=341\n' "$1" "$(date -u +%Y-%m)" "$2" >"$STATE_DIR/usage"; }
-fresh() { RUN_PAGES=""; PROGRESS_PAGES=""; JOB_PAGES=""; FAIL_JOBS=0; : >"$API_CALLS"; MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0; CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; usage_sample "$(date -u +%s)" 15; }
+fresh() { RUN_PAGES=""; PROGRESS_PAGES=""; JOB_PAGES=""; FAIL_JOBS=0; NONMATCH_RUN_ID=""; : >"$API_CALLS"; MAIN=aaa; rm -f "$STATE_DIR"/linux-overflow "$STATE_DIR"/overflow-quiet "$STATE_DIR"/linux-failover "$STATE_DIR"/usage-fallback "$STATE_DIR"/usage; : >"$CALLS"; events=(); RUNNERS="$RUNNER_FIXTURE"; FAIL_RUNNERS=0; CHECK_FIXTURE="$FIXTURE"; FAIL_API=0; FAIL_QUEUE=0; date -u +%s >"$STATE_DIR/hosted-seed-last"; usage_sample "$(date -u +%s)" 15; }
 
 fresh; QUEUED="$(ago 1500)"$'\n'"$(ago 900)"$'\n'"$(ago 60)"
 check_linux_overflow; expect "off until enabled" "" off
@@ -249,6 +249,14 @@ for invalid in missing malformed truncated duplicate cap bad-date bad-labels job
   check_linux_overflow; expect "invalid census keeps local: $invalid" '' off
   echo "$(( $(date -u +%s) - 1000 )) aaa" >"$STATE_DIR/linux-overflow"
   check_linux_overflow; expect "invalid census restores local: $invalid" 'repos=[hesperus]' off
+done
+
+# A valid non-match must not erase another validation's local demand.
+for nonmatch in 1 3; do
+  fresh; QUEUED="$(ago 1200)"$'\n'"$(ago 1100)"$'\n'"$(ago 1050)"; NONMATCH_RUN_ID="$nonmatch"
+  check_linux_overflow; expect "mixed census admits with non-match at $nonmatch" 'repos=[]' on
+  echo "$(( $(date -u +%s) - 1000 )) aaa" >"$STATE_DIR/linux-overflow"
+  check_linux_overflow; expect "mixed pre-move census holds with non-match at $nonmatch" '' on
 done
 
 [ "$failed" = 0 ] || exit 1
