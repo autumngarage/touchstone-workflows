@@ -226,8 +226,6 @@ fi
 # Required gates: pinned evaluator fetches with checksums, both PR and queue
 # events, read-only tokens, no checkout of target code, no publication.
 for gate in "$review_gate" "$delivery_evidence"; do
-  grep -Eq 'touchstone_revision="[0-9a-f]{40}"' "$gate" || fail "$gate: evaluator revision is not pinned"
-  grep -Eq 'evaluator_sha256="[0-9a-f]{64}"' "$gate" || fail "$gate: evaluator checksum is not pinned"
   grep -q 'sha256sum --check --strict' "$gate" || fail "$gate: checksum is not enforced"
   grep -q '^  merge_group:' "$gate" || fail "$gate: does not run on merge_group"
   grep -q '^  pull_request:' "$gate" || fail "$gate: does not run on pull_request"
@@ -235,6 +233,9 @@ for gate in "$review_gate" "$delivery_evidence"; do
   if grep -Eq 'checks: write|statuses: write|contents: write' "$gate"; then fail "$gate: a required gate must not hold write permissions"; fi
   if grep -Eq 'uses: actions/checkout' "$gate" && ! grep -q "github.repository == 'autumngarage/touchstone-workflows'" "$gate"; then fail "$gate: checks out target code"; fi
 done
+grep -Eq 'touchstone_revision="[0-9a-f]{40}"' "$review_gate" || fail "$review_gate: evaluator revision is not pinned"
+grep -Eq 'evaluator_sha256="[0-9a-f]{64}"' "$review_gate" || fail "$review_gate: evaluator checksum is not pinned"
+bash "$(dirname "${BASH_SOURCE[0]}")/test-evidence-pin.sh"
 for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate" && fail "$gate: evaluator pins are placeholders"; done
 
 # Behavior v1 binds each immutable fetch to the variable it pins and to an

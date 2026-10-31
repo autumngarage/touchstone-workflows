@@ -21,6 +21,15 @@ required-check name. Its `validationEngine` declaration binds the consumer
 workflow's Touchstone repository, path, revision, checksum, and supported
 project schemas; the source-contract job executes schema-1 and schema-2
 fixtures with those exact bytes before an engine-pin change can land. Its
+`evidenceChecker` declaration publishes the delivery-evidence checker's repository,
+path, revision and SHA-256 digest. The evidence workflow reads that manifest at
+its defining job's immutable workflow revision (`job.workflow_*`), validates the
+coordinates and verifies the fetched checker before execution. It never reads
+the consumer's manifest or a moving default branch. Missing source metadata
+fails explicitly; GitHub Enterprise Server is unsupported for this loader.
+Consumers that vendor the checker can compare their bytes with the manifest
+at their effective workflow pin; this source change does not update that pin.
+The existing
 `gateBehaviorContractVersion` declares the behavior
 contract implemented by the pinned workflows. Version 4 means that
 validation, review evidence, and delivery evidence are checksum-pinned,
