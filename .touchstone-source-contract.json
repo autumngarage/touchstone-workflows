@@ -1,6 +1,12 @@
 {
   "contractVersion": 1,
   "gateBehaviorContractVersion": 4,
+  "evidenceChecker": {
+    "repository": "autumngarage/touchstone",
+    "path": "scripts/check-delivery-evidence.sh",
+    "revision": "b598f4f5d2017158c51e775cbc4ae5af528671d6",
+    "sha256": "5146679f7190ba16ab34baff6d74274a4c6dd6bb87d724f9c0ee2a1bdfd4a792"
+  },
   "validationEngine": {
     "contractVersion": 1,
     "repository": "autumngarage/touchstone",

@@ -47,13 +47,37 @@ jobs:
       REPO: ${{ github.repository }}
     steps:
       - name: Fetch pinned evaluator
+        env:
+          SOURCE_REPOSITORY: ${{ job.workflow_repository }}
+          SOURCE_WORKFLOW_PATH: ${{ job.workflow_file_path }}
+          SOURCE_REVISION: ${{ job.workflow_sha }}
         run: |
           set -euo pipefail
-          touchstone_revision="b598f4f5d2017158c51e775cbc4ae5af528671d6"
-          evaluator_sha256="5146679f7190ba16ab34baff6d74274a4c6dd6bb87d724f9c0ee2a1bdfd4a792"
+          # Required workflows run against a consumer. Read our manifest from
+          # the defining job's immutable source, never that consumer's checkout.
+          if [ "${SOURCE_REPOSITORY:-}" != autumngarage/touchstone-workflows ] \
+            || [ "${SOURCE_WORKFLOW_PATH:-}" != .github/workflows/delivery-evidence.yml ] \
+            || ! [[ "${SOURCE_REVISION:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo 'ERROR: delivery-evidence requires its defining workflow repository, path and full commit SHA (job.workflow_*).' >&2
+            exit 1
+          fi
+          manifest="$RUNNER_TEMP/touchstone-source-contract.json"
+          curl -fsSL --retry 3 --retry-delay 2 \
+            "https://raw.githubusercontent.com/${SOURCE_REPOSITORY}/${SOURCE_REVISION}/.touchstone-source-contract.json" \
+            -o "$manifest" || { echo 'ERROR: cannot fetch delivery-evidence workflow source manifest.' >&2; exit 1; }
+          jq -e '
+            .contractVersion == 1
+            and (.evidenceChecker | keys == ["path", "repository", "revision", "sha256"])
+            and .evidenceChecker.repository == "autumngarage/touchstone"
+            and .evidenceChecker.path == "scripts/check-delivery-evidence.sh"
+            and (.evidenceChecker.revision | type == "string" and test("^[0-9a-f]{40}\\z"))
+            and (.evidenceChecker.sha256 | type == "string" and test("^[0-9a-f]{64}\\z"))
+          ' "$manifest" >/dev/null || { echo 'ERROR: invalid evidenceChecker in workflow source manifest.' >&2; exit 1; }
+          touchstone_revision="$(jq -r '.evidenceChecker.revision' "$manifest")"
+          evaluator_sha256="$(jq -r '.evidenceChecker.sha256' "$manifest")"
           curl -fsSL --retry 3 --retry-delay 2 \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/check-delivery-evidence.sh" \
-            -o "$RUNNER_TEMP/check-delivery-evidence.sh"
+            -o "$RUNNER_TEMP/check-delivery-evidence.sh" || { echo 'ERROR: cannot fetch declared delivery-evidence checker.' >&2; exit 1; }
           echo "${evaluator_sha256}  $RUNNER_TEMP/check-delivery-evidence.sh" | sha256sum --check --strict
           # The next step is a separate shell, so the revision has to cross the
           # step boundary through the environment file rather than a shell
