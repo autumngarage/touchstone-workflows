@@ -112,75 +112,53 @@ fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
 
-# AUT-1595/AUT-1596: every consumer job takes its runner from a setting.
-# Unset, it is GitHub-hosted Linux exactly as before; set, self-hosted is
-# always required, so the setting can never name a hosted image, and it names
-# only the single-use runners runner/linux-runner.sh registers -- the boundary
-# that lets validate, which runs candidate code, use it at all. Touchstone's
-# shared hosted-runner check (AUT-1592) accepts this shape.
-#
-# AUT-2452/AUT-2992: candidate execution reads LINUX_RUNNER; planning,
-# aggregation, and the review/delivery gates read
-# LINUX_GATE_RUNNER. A gate job runs for seconds; on one setting it waited in
-# line behind eight-minute validations on a repository's two runners (23
-# minutes on average on 2026-10-11). Neither may read the other's setting: a
-# gate on LINUX_RUNNER is that wait again, and validate on LINUX_GATE_RUNNER
-# would leave the runners a repository set up for it.
-#
-# AUT-2704: every event but merge_group also requires LINUX_RUNNER-shared, the
-# label runner/linux-runner.sh gives every slot not reserved for the merge
-# queue. The queue's selector must stay a subset of the others', so a queue
-# job may take any slot.
+# AUT-3412: no Linux job runs on a self-hosted runner. The Mac's single-use
+# Linux fleet (LINUX_RUNNER, LINUX_GATE_RUNNER) is retired, and candidate code
+# never runs where a persistent host could keep what it leaves. Candidate
+# execution picks a cloud; every other job runs on GitHub-hosted Linux.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == '"'"'blacksmith'"'"') && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_VALIDATION_RUNNER == '"'"'github'"'"' && '"'"'ubuntu-latest'"'"') || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '"'"'merge_group'"'"' && '"'"'["self-hosted","{0}"]'"'"' || '"'"'["self-hosted","{0}","{0}-shared"]'"'"', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
-# The shape before AUT-2704, which would let any job take a reserved slot.
+runner_selector='runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == '"'"'blacksmith'"'"') && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_VALIDATION_RUNNER == '"'"'github'"'"' && '"'"'ubuntu-latest'"'"') || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
 # shellcheck disable=SC2016
-plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
-# shellcheck disable=SC2016
-gate_runner_selector='runs-on: ${{ vars.LINUX_VALIDATION_RUNNER == '\'''\'' && vars.LINUX_GATE_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_GATE_RUNNER)) || '\''ubuntu-latest'\'' }}'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
-[ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
-  || fail "$workflow: only candidate execution takes the LINUX_RUNNER selector"
-[ "$(active_count "$workflow" "$gate_runner_selector")" -eq 2 ] \
-  || fail "$workflow: planning and aggregation take the LINUX_GATE_RUNNER selector"
-[ "$(active_count "$workflow" "$plain_runner_selector")" -eq 0 ] \
-  || fail "$workflow: validate must keep the merge queue's reserved slots for the queue"
+for file in "$workflow" "$review_gate" "$delivery_evidence"; do
+  for retired in self-hosted LINUX_RUNNER LINUX_GATE_RUNNER; do
+    if sed '/^[[:space:]]*#/d' "$file" | grep -q -- "$retired"; then
+      fail "$file: no job may name '$retired'; the self-hosted Linux fleet is retired (AUT-3412)"
+    fi
+  done
+done
 # Counts alone cannot catch a plan/shard selector swap.
 for job in plan validate-groups validate; do
   job_body="$(sed -n "/^  $job:/,/^  [a-z][a-z-]*:/p" "$workflow" | sed '$d')"
-  expected_selector="$gate_runner_selector"
+  expected_selector='runs-on: ubuntu-latest'
   [ "$job" != validate-groups ] || expected_selector="$runner_selector"
   [ "$(printf '%s\n' "$job_body" | sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' | grep -Fxc -- "$expected_selector" || true)" -eq 1 ] \
     || fail "$workflow: $job must use its own runner selector"
 done
 for gate in "$review_gate" "$delivery_evidence"; do
-  [ "$(active_count "$gate" "$gate_runner_selector")" -eq 1 ] \
-    || fail "$gate: its consumer job must take its runner from the LINUX_GATE_RUNNER selector"
-  [ "$(active_count "$gate" "$runner_selector")" -eq 0 ] \
-    && [ "$(active_count "$gate" "$plain_runner_selector")" -eq 0 ] \
-    || fail "$gate: a gate job must not take its runner from validate's setting"
+  [ "$(active_count "$gate" 'runs-on: ubuntu-latest')" -eq 1 ] \
+    || fail "$gate: its consumer job must run on GitHub-hosted ubuntu-latest"
 done
 # Self-test fixtures append jobs of their own; only production is exhaustive.
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
-  # The source contract job runs this public repository's candidate tests. A
-  # public repository never resolves the setting, and never reaches these
-  # runners, so it stays GitHub-hosted by name.
-  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 1 ] \
-    || fail "$workflow: the source contract job must run on GitHub-hosted ubuntu-latest"
+  [ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
+    || fail "$workflow: only candidate execution picks a cloud"
+  # The source contract, plan, and aggregation jobs.
+  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 3 ] \
+    || fail "$workflow: the source contract, plan, and aggregation jobs must run on GitHub-hosted ubuntu-latest"
   [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 4 ] \
-    || fail "$workflow: a job takes its runner from somewhere other than the selector or ubuntu-latest"
+    || fail "$workflow: a job takes its runner from somewhere other than the cloud selector or ubuntu-latest"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
-      || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
+      || fail "$gate: a job runs somewhere other than GitHub-hosted ubuntu-latest"
   done
 fi
-# AUT-2851: explicit caller opt-in wins; BLACKSMITH_LINUX only supplies the
-# hosted fallback after the local selector. The input stays false by default.
-# AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over the local
-# selector, and planning refuses any value but blacksmith or github, so a
-# misspelling cannot fall through to a local pool.
+# AUT-2851: explicit caller opt-in wins. The input stays false by default.
+# AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over
+# BLACKSMITH_LINUX, and planning refuses any value but blacksmith or github, so
+# a misspelling cannot fall through to the other cloud unnoticed.
 plan_body="$(sed -n '/^  plan:/,/^  validate-groups:/p' "$workflow")"
 printf '%s\n' "$plan_body" | grep -Fxq '          LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}' \
   || fail "planning must read LINUX_VALIDATION_RUNNER to check it"
@@ -201,11 +179,11 @@ printf '%s\n' "$blacksmith_input" | grep -Fxq '        type: boolean' \
   || fail "Blacksmith trial must be a boolean input"
 printf '%s\n' "$blacksmith_input" | grep -Fxq '        default: false' \
   || fail "Blacksmith trial must remain opt-in"
-# AUT-2821: only hosted Swift-cache consumers get a cold-build allowance.
-# Local and non-Swift validation retain 30 minutes; explicit seed input wins.
+# AUT-2821: only Swift-cache consumers get a cold-build allowance. Non-Swift
+# validation retains 30 minutes; explicit seed input wins.
 # shellcheck disable=SC2016
 assert_active_line "$workflow" \
-  "timeout-minutes: \${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER != '' || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
+  "timeout-minutes: \${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
   "validate job timeout"
 assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 [ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 30$')" -eq 1 ] \
@@ -1659,11 +1637,6 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
     || fail "cross-step shell scope check failed"
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-queue.sh" \
     || fail "runner queue demand check failed"
-  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-linux-overflow.sh" \
-    || fail "Linux overflow guard check failed"
-  # The single-use runner supervisor is validate's boundary on LINUX_RUNNER.
-  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
-    || fail "runner supervisor check failed"
   # The macOS pool keeps the org credential and root's file work out of the
   # CI account whose jobs share its host.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-macos-runner.sh" \

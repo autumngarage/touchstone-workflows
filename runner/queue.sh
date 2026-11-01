@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Queue/shared registration policy for the Linux and Mac supervisors.
+# Queue/shared registration policy for the Mac pool supervisor.
 # shellcheck disable=SC2034,SC2154
 # Callers provide ORG, LABEL, SLOTS, QUEUE_SLOTS, state_dir, JANITOR_INTERVAL
 # and the credential/group/JIT helpers from jit.sh. Bash 3.2 compatible.
