@@ -88,7 +88,7 @@ jobs:
     if: github.repository != 'autumngarage/touchstone-workflows'
     name: validate plan
     # Trusted declaration parsing uses the lightweight gate pool, not build slots.
-    runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LINUX_VALIDATION_RUNNER == '' && vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -342,7 +342,7 @@ jobs:
     needs: [plan, validate-groups]
     name: validate (ubuntu-latest)
     # Reporting completed shard verdicts must not queue behind new builds.
-    runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
+    runs-on: ${{ vars.LINUX_VALIDATION_RUNNER == '' && vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
       - name: Require every validation group

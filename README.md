@@ -154,7 +154,8 @@ To choose the cloud outright, set the repository variable
 runner) or `github` (GitHub-hosted `ubuntu-latest`). Set, it decides where
 `validate-groups` runs for pull requests and the merge queue, and it wins over
 `LINUX_RUNNER` and `BLACKSMITH_LINUX`: an organization variable's selected
-repositories cannot send the repository back to a local pool. Switching between
+repositories cannot send the repository back to a local pool. Its gate jobs
+then ignore `LINUX_GATE_RUNNER` and run on GitHub-hosted `ubuntu-latest`. Switching between
 the two values is the fallback when one cloud is down. Planning fails on any
 other value, so a misspelling cannot route to a local pool unnoticed. A
 repository that sets it gets the hosted 60-minute limit when it also sets
@@ -230,7 +231,10 @@ runners of its own, 23 minutes on average on 2026-10-11, long enough for
 only `LINUX_RUNNER` validates on its own runners and runs its gates on
 GitHub-hosted ones, where they start at once and bill a minute each. Set
 `LINUX_GATE_RUNNER` as well only when GitHub-hosted jobs cannot start, for
-example when the plan's included minutes are used up.
+example when the plan's included minutes are used up. A repository that sets
+`LINUX_VALIDATION_RUNNER` runs these jobs on GitHub-hosted `ubuntu-latest`
+whatever `LINUX_GATE_RUNNER` says, so an organization variable cannot pull its
+gates back to a local pool either.
 
 With a variable unset, its jobs run on GitHub-hosted `ubuntu-latest`, exactly
 as before. Set, they run on a self-hosted runner with that label, and the
