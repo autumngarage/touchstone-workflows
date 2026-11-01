@@ -149,6 +149,17 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
+To choose the cloud outright, set the repository variable
+`LINUX_VALIDATION_RUNNER` to `blacksmith` (Blacksmith's 4-vCPU Ubuntu 24.04
+runner) or `github` (GitHub-hosted `ubuntu-latest`). Set, it decides where
+`validate-groups` runs for pull requests and the merge queue, and it wins over
+`LINUX_RUNNER` and `BLACKSMITH_LINUX`: an organization variable's selected
+repositories cannot send the repository back to a local pool. Switching between
+the two values is the fallback when one cloud is down. Planning fails on any
+other value, so a misspelling cannot route to a local pool unnoticed. A
+repository that sets it gets the hosted 60-minute limit when it also sets
+`SWIFT_BUILD_CACHE=true`. Unset, the rules below apply unchanged.
+
 Set the repository variable `BLACKSMITH_LINUX=true` to use Blacksmith's managed
 ephemeral 4-vCPU Ubuntu 24.04 runners when `LINUX_RUNNER` does not select a local
 pool, including PR and merge-queue validation. Reusable callers can explicitly
