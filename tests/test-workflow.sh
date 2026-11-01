@@ -137,7 +137,7 @@ runner_selector='runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER
 # shellcheck disable=SC2016
 plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
 # shellcheck disable=SC2016
-gate_runner_selector='runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_GATE_RUNNER)) || '\''ubuntu-latest'\'' }}'
+gate_runner_selector='runs-on: ${{ vars.LINUX_VALIDATION_RUNNER == '\'''\'' && vars.LINUX_GATE_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_GATE_RUNNER)) || '\''ubuntu-latest'\'' }}'
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }

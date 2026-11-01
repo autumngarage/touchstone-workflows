@@ -60,7 +60,10 @@ jobs:
     # LINUX_GATE_RUNNER unset: GitHub-hosted Linux, whatever LINUX_RUNNER says.
     # Set: a self-hosted runner with that label, and self-hosted is always
     # required, so the setting can never name a hosted image (AUT-1595).
-    runs-on: ${{ vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
+    # A repository that names its validation cloud (LINUX_VALIDATION_RUNNER)
+    # keeps its gates on GitHub-hosted Linux too, whatever LINUX_GATE_RUNNER
+    # says (AUT-3412).
+    runs-on: ${{ vars.LINUX_VALIDATION_RUNNER == '' && vars.LINUX_GATE_RUNNER && fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER)) || 'ubuntu-latest' }}
     timeout-minutes: 20
     env:
       GH_TOKEN: ${{ github.token }}
