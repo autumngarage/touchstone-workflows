@@ -132,7 +132,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # queue. The queue's selector must stay a subset of the others', so a queue
 # job may take any slot.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '"'"'merge_group'"'"' && '"'"'["self-hosted","{0}"]'"'"' || '"'"'["self-hosted","{0}","{0}-shared"]'"'"', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
+runner_selector='runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == '"'"'blacksmith'"'"') && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_VALIDATION_RUNNER == '"'"'github'"'"' && '"'"'ubuntu-latest'"'"') || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == '"'"'merge_group'"'"' && '"'"'["self-hosted","{0}"]'"'"' || '"'"'["self-hosted","{0}","{0}-shared"]'"'"', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
 # The shape before AUT-2704, which would let any job take a reserved slot.
 # shellcheck disable=SC2016
 plain_runner_selector='runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format('\''["self-hosted","{0}"]'\'', vars.LINUX_RUNNER)) || '\''ubuntu-latest'\'' }}'
@@ -176,8 +176,25 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "$gate: a job takes its runner from somewhere other than the LINUX_GATE_RUNNER selector"
   done
 fi
-# AUT-2851: explicit caller opt-in wins; repository opt-in only supplies the
+# AUT-2851: explicit caller opt-in wins; BLACKSMITH_LINUX only supplies the
 # hosted fallback after the local selector. The input stays false by default.
+# AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over the local
+# selector, and planning refuses any value but blacksmith or github, so a
+# misspelling cannot fall through to a local pool.
+plan_body="$(sed -n '/^  plan:/,/^  validate-groups:/p' "$workflow")"
+printf '%s\n' "$plan_body" | grep -Fxq '          LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}' \
+  || fail "planning must read LINUX_VALIDATION_RUNNER to check it"
+guard="$(printf '%s\n' "$plan_body" | sed -n '/A misspelt cloud/,/esac/p' | sed 's/^          //')"
+[ -n "$guard" ] || fail "planning must carry the LINUX_VALIDATION_RUNNER guard"
+for value in '' blacksmith github; do
+  LINUX_VALIDATION_RUNNER="$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1 \
+    || fail "planning refuses LINUX_VALIDATION_RUNNER='$value'"
+done
+for value in Blacksmith local linux-ephemeral ' github'; do
+  if LINUX_VALIDATION_RUNNER="$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1; then
+    fail "planning accepts LINUX_VALIDATION_RUNNER='$value'"
+  fi
+done
 assert_active_line "$workflow" 'blacksmith:' "Blacksmith trial input"
 blacksmith_input="$(sed -n '/^      blacksmith:/,/^  pull_request:/p' "$workflow")"
 printf '%s\n' "$blacksmith_input" | grep -Fxq '        type: boolean' \
@@ -188,7 +205,7 @@ printf '%s\n' "$blacksmith_input" | grep -Fxq '        default: false' \
 # Local and non-Swift validation retain 30 minutes; explicit seed input wins.
 # shellcheck disable=SC2016
 assert_active_line "$workflow" \
-  "timeout-minutes: \${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
+  "timeout-minutes: \${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER != '' || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}" \
   "validate job timeout"
 assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 [ "$(sed -n '/^  workflow_call:/,/^  pull_request:/p' "$workflow" | grep -c '^        default: 30$')" -eq 1 ] \

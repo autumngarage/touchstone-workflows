@@ -113,8 +113,17 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
+          LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
         run: |
           set -euo pipefail
+          # A misspelt cloud would fall through to a local pool unnoticed.
+          case "${LINUX_VALIDATION_RUNNER:-}" in
+            ''|blacksmith|github) ;;
+            *)
+              echo "LINUX_VALIDATION_RUNNER must be blacksmith, github, or unset; it is '${LINUX_VALIDATION_RUNNER:-}'" >&2
+              exit 1
+              ;;
+          esac
           contract="$(bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
             --check-contract \
@@ -162,11 +171,16 @@ jobs:
     # README.md. Every event but the merge queue also requires
     # LINUX_RUNNER-shared, so slots the runner reserves for the queue
     # (LINUX_RUNNER_QUEUE_SLOTS) take only its jobs (AUT-2704).
-    # Repository opt-in chooses the hosted fallback; selected local pools still win.
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    # LINUX_VALIDATION_RUNNER, a repository setting, names the cloud outright
+    # (AUT-3412): `blacksmith` or `github`. Set, it wins over LINUX_RUNNER, so
+    # an organization variable's selected repositories cannot send the
+    # repository back to a local pool. Unset, a selected local pool wins and
+    # BLACKSMITH_LINUX=true only supplies the hosted fallback. The plan job
+    # refuses any other value.
+    runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == 'blacksmith') && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_VALIDATION_RUNNER == 'github' && 'ubuntu-latest') || (vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER))) || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
     # Two-CPU hosted Swift builds can spend 20 minutes compiling before tests.
     # Allow a bounded cold run; local and non-Swift jobs retain 30 minutes.
-    timeout-minutes: ${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
+    timeout-minutes: ${{ inputs.timeout_minutes || ((inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER != '' || vars.LINUX_RUNNER == '') && vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
     strategy:
       # Once a queue candidate fails, its other shards cannot make it valid.
       # Release those slots; the always-running aggregate still fails closed.
