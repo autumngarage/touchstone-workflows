@@ -120,27 +120,36 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-No job in these workflows runs on a self-hosted runner (AUT-3412). The Mac's
-single-use Linux fleet (`LINUX_RUNNER`, `LINUX_GATE_RUNNER`,
-`runner/linux-runner.sh`) is retired: portable work runs in the cloud and the
-Mac serves only macOS work. `tests/test-workflow.sh` fails if a job names
-`self-hosted`, `LINUX_RUNNER` or `LINUX_GATE_RUNNER` again.
+Static repository settings route `validate-groups`, the job that runs the
+candidate's declared commands. Nothing rewrites them at run time: no watcher,
+no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
+`LINUX_GATE_RUNNER` routing is retired, AUT-3412).
 
-`validate-groups`, which runs the candidate's declared commands, picks a cloud:
+| Setting | Applies to | Values |
+|---|---|---|
+| `LINUX_PR_RUNNER` | pull requests from the repository itself | `local`, `blacksmith`, `github` |
+| `LINUX_QUEUE_RUNNER` | the merge queue | `local`, `blacksmith`, `github` |
+| `LINUX_VALIDATION_RUNNER` | the default for both, and pushes and reusable callers | `blacksmith`, `github` |
 
-1. a reusable caller's `blacksmith: true` input (default false), or the
-   repository variable `LINUX_VALIDATION_RUNNER=blacksmith`: Blacksmith's
-   4-vCPU Ubuntu 24.04 runner;
-2. `LINUX_VALIDATION_RUNNER=github`: GitHub-hosted `ubuntu-latest`;
-3. unset, `BLACKSMITH_LINUX=true`: Blacksmith;
-4. otherwise GitHub-hosted `ubuntu-latest`.
+- `local` is the single-use `linux-ephemeral` fleet: each runner takes one job
+  in a fresh container with no mounts or credentials, then exits. A fork's
+  pull request never runs there; it takes the default.
+- `blacksmith` is Blacksmith's 4-vCPU Ubuntu 24.04 runner, and `github` is
+  GitHub-hosted `ubuntu-latest`.
+- Unset settings fall through: the per-event setting, then
+  `LINUX_VALIDATION_RUNNER`, then `BLACKSMITH_LINUX=true` (Blacksmith), then
+  GitHub-hosted. A reusable caller's `blacksmith: true` input wins outright.
+- Planning fails on any other value, so a misspelling cannot fall through to
+  another runner unnoticed.
 
-Switching `LINUX_VALIDATION_RUNNER` between its two values is the fallback when
-one cloud is down. Planning fails on any other value, so a misspelling cannot
-fall through to the other cloud unnoticed. Blacksmith must be installed for the
-consumer repository and is billed separately from GitHub; the GitHub usage
-guard does not govern that bill. Adopt the reviewed workflow pin before
-setting either variable.
+Moving traffic is one command, for example
+`gh variable set LINUX_QUEUE_RUNNER --body github -R <owner>/<repo>`, or
+`gh variable delete LINUX_PR_RUNNER -R <owner>/<repo>` to return pull requests
+to the default. A job keeps the runner it was given when it was created, so a
+change applies to jobs created after it; queued `local` jobs wait for the fleet.
+Blacksmith must be installed for the consumer repository and is billed
+separately from GitHub. Adopt the reviewed workflow pin before setting a value
+it does not know.
 
 Validation planning (`plan`), its final summary (`validate`), `review-gate`,
 `delivery-evidence` and the `source contract` job run for seconds and always
