@@ -138,7 +138,10 @@ no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
   GitHub-hosted `ubuntu-latest`.
 - Unset settings fall through: the per-event setting, then
   `LINUX_VALIDATION_RUNNER`, then `BLACKSMITH_LINUX=true` (Blacksmith), then
-  GitHub-hosted. A reusable caller's `blacksmith: true` input wins outright.
+  GitHub-hosted. A reusable caller's `blacksmith: true` input wins outright,
+  then its `runner` input (`local`, `blacksmith` or `github`): a cache seed
+  for the local fleet passes `runner: local`, because only a run on the
+  fleet's architecture can save a cache the fleet restores.
 - Planning fails on any other value, so a misspelling cannot fall through to
   another runner unnoticed.
 

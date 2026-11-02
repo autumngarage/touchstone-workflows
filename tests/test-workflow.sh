@@ -118,7 +118,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[(github.event_name == '"'"'merge_group'"'"' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == '"'"'pull_request'"'"' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith'"'"') || '"'"'github'"'"'] }}'
+runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[inputs.runner || (github.event_name == '"'"'merge_group'"'"' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == '"'"'pull_request'"'"' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith'"'"') || '"'"'github'"'"'] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -174,8 +174,10 @@ printf '%s\n' "$plan_body" | grep -Fxq '          LINUX_VALIDATION_RUNNER: ${{ v
   || fail "planning must read LINUX_VALIDATION_RUNNER to check it"
 guard="$(printf '%s\n' "$plan_body" | sed -n '/A misspelt runner/,/^          done$/p' | sed 's/^          //')"
 [ -n "$guard" ] || fail "planning must carry the runner switch guard"
-for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER; do
-  printf '%s\n' "$plan_body" | grep -Fxq "          $switch: \${{ vars.$switch }}" \
+printf '%s\n' "$plan_body" | grep -Fxq '          INPUT_RUNNER: ${{ inputs.runner }}' \
+  || fail "planning must read the runner input to check it"
+for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER INPUT_RUNNER; do
+  [ "$switch" = INPUT_RUNNER ] || printf '%s\n' "$plan_body" | grep -Fxq "          $switch: \${{ vars.$switch }}" \
     || fail "planning must read $switch to check it"
   for value in '' local blacksmith github; do
     env "$switch=$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1 \

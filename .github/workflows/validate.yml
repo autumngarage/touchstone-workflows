@@ -27,6 +27,13 @@ on:
         description: Run an explicit Linux trial on Blacksmith instead of the default runner.
         type: boolean
         default: false
+      # Names the runner outright for a caller that needs a particular one:
+      # a cache seed for the local fleet's architecture runs there, because
+      # only a run on that architecture can save a cache it restores.
+      runner:
+        description: Run on this runner instead of the routed one (local, blacksmith or github).
+        type: string
+        default: ''
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -115,6 +122,7 @@ jobs:
           LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
           LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
           LINUX_QUEUE_RUNNER: ${{ vars.LINUX_QUEUE_RUNNER }}
+          INPUT_RUNNER: ${{ inputs.runner }}
         run: |
           set -euo pipefail
           # A misspelt runner would fall through to another one unnoticed.
@@ -125,7 +133,7 @@ jobs:
               exit 1
               ;;
           esac
-          for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER; do
+          for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER INPUT_RUNNER; do
             case "${!switch:-}" in
               ''|local|blacksmith|github) ;;
               *)
@@ -182,8 +190,9 @@ jobs:
     #   each `local` (the single-use linux-ephemeral fleet), `blacksmith` or
     #   `github`; unset falls back to LINUX_VALIDATION_RUNNER (`blacksmith`
     #   or `github`), then BLACKSMITH_LINUX=true, then GitHub-hosted. A fork's
-    #   pull request never runs local. The plan job refuses any other value.
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[(github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github'] }}
+    #   pull request never runs local. A reusable caller's `runner` input
+    #   names the runner outright. The plan job refuses any other value.
+    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github'] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
