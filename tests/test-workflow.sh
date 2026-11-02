@@ -112,23 +112,32 @@ fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
 
-# AUT-3412: no Linux job runs on a self-hosted runner. The Mac's single-use
-# Linux fleet (LINUX_RUNNER, LINUX_GATE_RUNNER) is retired, and candidate code
-# never runs where a persistent host could keep what it leaves. Candidate
-# execution picks a cloud; every other job runs on GitHub-hosted Linux.
+# AUT-3412: candidate code never runs where a persistent host could keep what
+# it leaves. The one self-hosted target is the linux-ephemeral fleet, whose
+# runners take one job each in a fresh container, and only candidate
+# execution may select it, through static per-event switches; every other job
+# runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == '"'"'blacksmith'"'"') && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || (vars.LINUX_VALIDATION_RUNNER == '"'"'github'"'"' && '"'"'ubuntu-latest'"'"') || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"') || '"'"'ubuntu-latest'"'"' }}'
+runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[(github.event_name == '"'"'merge_group'"'"' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == '"'"'pull_request'"'"' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith'"'"') || '"'"'github'"'"'] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
 }
 for file in "$workflow" "$review_gate" "$delivery_evidence"; do
-  for retired in self-hosted LINUX_RUNNER LINUX_GATE_RUNNER; do
+  for retired in LINUX_RUNNER LINUX_GATE_RUNNER; do
     if sed '/^[[:space:]]*#/d' "$file" | grep -q -- "$retired"; then
-      fail "$file: no job may name '$retired'; the self-hosted Linux fleet is retired (AUT-3412)"
+      fail "$file: no job may name '$retired'; dynamic Linux routing is retired (AUT-3412)"
     fi
   done
 done
+for gate in "$review_gate" "$delivery_evidence"; do
+  if sed '/^[[:space:]]*#/d' "$gate" | grep -q -- self-hosted; then
+    fail "$gate: no gate job runs on a self-hosted runner"
+  fi
+done
+[ "$(sed '/^[[:space:]]*#/d' "$workflow" | grep -c -- self-hosted || true)" -eq 1 ] \
+  && sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$workflow" | grep -- self-hosted | grep -Fxq -- "$runner_selector" \
+  || fail "$workflow: only the candidate runner selector may name self-hosted, and only the linux-ephemeral fleet"
 # Counts alone cannot catch a plan/shard selector swap.
 for job in plan validate-groups validate; do
   job_body="$(sed -n "/^  $job:/,/^  [a-z][a-z-]*:/p" "$workflow" | sed '$d')"
@@ -157,13 +166,27 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
 fi
 # AUT-2851: explicit caller opt-in wins. The input stays false by default.
 # AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over
-# BLACKSMITH_LINUX, and planning refuses any value but blacksmith or github, so
-# a misspelling cannot fall through to the other cloud unnoticed.
+# BLACKSMITH_LINUX; LINUX_PR_RUNNER and LINUX_QUEUE_RUNNER override it per
+# event and may also name the local fleet. Planning refuses any other value, so
+# a misspelling cannot fall through to another runner unnoticed.
 plan_body="$(sed -n '/^  plan:/,/^  validate-groups:/p' "$workflow")"
 printf '%s\n' "$plan_body" | grep -Fxq '          LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}' \
   || fail "planning must read LINUX_VALIDATION_RUNNER to check it"
-guard="$(printf '%s\n' "$plan_body" | sed -n '/A misspelt cloud/,/esac/p' | sed 's/^          //')"
-[ -n "$guard" ] || fail "planning must carry the LINUX_VALIDATION_RUNNER guard"
+guard="$(printf '%s\n' "$plan_body" | sed -n '/A misspelt runner/,/^          done$/p' | sed 's/^          //')"
+[ -n "$guard" ] || fail "planning must carry the runner switch guard"
+for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER; do
+  printf '%s\n' "$plan_body" | grep -Fxq "          $switch: \${{ vars.$switch }}" \
+    || fail "planning must read $switch to check it"
+  for value in '' local blacksmith github; do
+    env "$switch=$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1 \
+      || fail "planning refuses $switch='$value'"
+  done
+  for value in Local linux-ephemeral self-hosted ' local'; do
+    if env "$switch=$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1; then
+      fail "planning accepts $switch='$value'"
+    fi
+  done
+done
 for value in '' blacksmith github; do
   LINUX_VALIDATION_RUNNER="$value" bash -c "set -euo pipefail; $guard" >/dev/null 2>&1 \
     || fail "planning refuses LINUX_VALIDATION_RUNNER='$value'"

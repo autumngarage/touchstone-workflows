@@ -113,9 +113,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
           LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
+          LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
+          LINUX_QUEUE_RUNNER: ${{ vars.LINUX_QUEUE_RUNNER }}
         run: |
           set -euo pipefail
-          # A misspelt cloud would fall through to another one unnoticed.
+          # A misspelt runner would fall through to another one unnoticed.
           case "${LINUX_VALIDATION_RUNNER:-}" in
             ''|blacksmith|github) ;;
             *)
@@ -123,6 +125,15 @@ jobs:
               exit 1
               ;;
           esac
+          for switch in LINUX_PR_RUNNER LINUX_QUEUE_RUNNER; do
+            case "${!switch:-}" in
+              ''|local|blacksmith|github) ;;
+              *)
+                echo "$switch must be local, blacksmith, github, or unset; it is '${!switch:-}'" >&2
+                exit 1
+                ;;
+            esac
+          done
           contract="$(bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
             --check-contract \
@@ -163,13 +174,16 @@ jobs:
     # No display name: a templated one would breach the source contract's
     # literal job-name guard, and GitHub already appends each shard's
     # matrix values (its group name) to the job ID in the check list.
-    # Executes the candidate's own declared commands, always on a cloud
-    # runner: no Linux job runs on a self-hosted runner (AUT-3412; the Mac's
-    # Linux fleet is retired). See "Runner" in README.md.
-    # LINUX_VALIDATION_RUNNER, a repository setting, names the cloud outright:
-    # `blacksmith` or `github`. Unset, BLACKSMITH_LINUX=true picks Blacksmith
-    # and anything else GitHub-hosted. The plan job refuses any other value.
-    runs-on: ${{ (inputs.blacksmith || vars.LINUX_VALIDATION_RUNNER == 'blacksmith') && 'blacksmith-4vcpu-ubuntu-2404' || (vars.LINUX_VALIDATION_RUNNER == 'github' && 'ubuntu-latest') || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith-4vcpu-ubuntu-2404') || 'ubuntu-latest' }}
+    # Executes the candidate's own declared commands. Static switches, all
+    # repository settings, pick the runner; nothing rewrites them at run time.
+    # See "Runner" in README.md.
+    #   LINUX_PR_RUNNER    pull requests from this repository
+    #   LINUX_QUEUE_RUNNER the merge queue
+    #   each `local` (the single-use linux-ephemeral fleet), `blacksmith` or
+    #   `github`; unset falls back to LINUX_VALIDATION_RUNNER (`blacksmith`
+    #   or `github`), then BLACKSMITH_LINUX=true, then GitHub-hosted. A fork's
+    #   pull request never runs local. The plan job refuses any other value.
+    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[(github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github'] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
