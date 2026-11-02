@@ -1662,6 +1662,9 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
     || fail "cross-step shell scope check failed"
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-queue.sh" \
     || fail "runner queue demand check failed"
+  # The single-use runner supervisor is validate's boundary for `local`.
+  bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
+    || fail "runner supervisor check failed"
   # The macOS pool keeps the org credential and root's file work out of the
   # CI account whose jobs share its host.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-macos-runner.sh" \

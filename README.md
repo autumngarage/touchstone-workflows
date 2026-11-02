@@ -133,7 +133,11 @@ no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
 
 - `local` is the single-use `linux-ephemeral` fleet: each runner takes one job
   in a fresh container with no mounts or credentials, then exits. A fork's
-  pull request never runs there; it takes the default.
+  pull request never runs there; it takes the default. Its supervisor is
+  `runner/linux-runner.sh`, run at boot by
+  `sudo bash runner/linux-runner.sh install-daemon <user>`: N identical
+  single-use slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled
+  `linux-ephemeral` for one job, with no slot roles or cache images.
 - `blacksmith` is Blacksmith's 4-vCPU Ubuntu 24.04 runner, and `github` is
   GitHub-hosted `ubuntu-latest`.
 - Unset settings fall through: the per-event setting, then
