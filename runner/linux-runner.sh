@@ -51,6 +51,9 @@
 #                         GH_TOKEN is unset; it must be readable by its owner
 #                         only. A daemon has no login keychain, so this is its
 #                         credential (unset: gh's own login)
+#   LINUX_RUNNER_LOG_FILE  the file run appends its output to, reopened for
+#                         every line so newsyslog can rotate it (unset:
+#                         stdout). install-daemon sets it
 #
 # Retired, still accepted because an installed wrapper may pass them:
 #   LINUX_RUNNER_QUEUE_SLOTS  merge-queue slot roles. 0 or unset is accepted;
@@ -87,6 +90,7 @@ VM_DISK="${LINUX_RUNNER_VM_DISK:-60}"
 TOKEN_FILE="${LINUX_RUNNER_TOKEN_FILE:-}"
 DAEMON_DIR="${LINUX_RUNNER_DAEMON_DIR:-/Library/LaunchDaemons}"
 NEWSYSLOG_DIR="${LINUX_RUNNER_NEWSYSLOG_DIR:-/etc/newsyslog.d}"
+LOG_FILE="${LINUX_RUNNER_LOG_FILE:-}"
 # A test seam and a one-shot probe: stop each slot after this many jobs. Unset
 # (the default) means forever.
 MAX_JOBS="${LINUX_RUNNER_MAX_JOBS:-}"
@@ -292,6 +296,19 @@ forget_stale_runners() {
 
 cmd_run() {
   local gid slot pid pids drain_pid=""
+  if [ -n "$LOG_FILE" ]; then
+    # Reopen the log for every line. newsyslog rotates it by renaming and
+    # compressing it, and a descriptor held open across that would keep
+    # writing into the renamed, then deleted, file until the next restart.
+    # The writer ignores stop signals and ends when the supervisor does, so a
+    # drain's own messages still arrive.
+    exec > >(
+      trap '' INT TERM
+      while IFS= read -r line || [ -n "$line" ]; do
+        printf '%s\n' "$line" >>"$LOG_FILE"
+      done
+    ) 2>&1
+  fi
   if [ -n "${LINUX_RUNNER_CACHE_SEED:-}" ]; then
     log "LINUX_RUNNER_CACHE_SEED is retired and ignored; every job starts from $IMAGE"
   fi
@@ -343,7 +360,7 @@ newsyslog_path() { printf '%s/linux-ephemeral-runner.conf\n' "$NEWSYSLOG_DIR"; }
 # an account that runs nothing else, so the token that registers runners is
 # readable by no CI job on the Mac. Build the image as USER first.
 cmd_install_daemon() {
-  local user="${1:-}" home group user_state token installed plist rotation log_dir log_file path_value
+  local user="${1:-}" home group user_state token installed plist rotation log_dir log_file launchd_log path_value
   [ -n "$user" ] || die "usage: sudo bash runner/linux-runner.sh install-daemon USER"
   need launchctl "install-daemon needs macOS launchd"
   [ "$(id -u)" -eq 0 ] || die "install-daemon writes $DAEMON_DIR; run it with sudo"
@@ -368,6 +385,8 @@ cmd_install_daemon() {
   mkdir -p "$log_dir"
   chown "$user:$group" "$log_dir"
   log_file="$log_dir/linux-ephemeral-runner.log"
+  # launchd holds this one open; only what precedes run's own log lands here.
+  launchd_log="$log_dir/linux-ephemeral-runner.launchd.log"
   # Homebrew's two prefixes first, so colima, docker, gh and jq resolve without
   # a login shell.
   path_value="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -404,13 +423,14 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
+    <key>LINUX_RUNNER_LOG_FILE</key><string>$log_file</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>60</integer>
   <key>ExitTimeOut</key><integer>5400</integer>
-  <key>StandardOutPath</key><string>$log_file</string>
-  <key>StandardErrorPath</key><string>$log_file</string>
+  <key>StandardOutPath</key><string>$launchd_log</string>
+  <key>StandardErrorPath</key><string>$launchd_log</string>
 </dict>
 </plist>
 EOF

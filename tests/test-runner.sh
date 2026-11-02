@@ -72,6 +72,10 @@ case "$1" in
     echo run >>"$FAKE_STATE/started"
     # A real runner waits for its job; HOLD says for how long.
     /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
+    # newsyslog rotating the supervisor's log while a job runs.
+    if [ -f "$FAKE_STATE/rotate-log" ] && [ -n "${LINUX_RUNNER_LOG_FILE:-}" ]; then
+      mv "$LINUX_RUNNER_LOG_FILE" "$LINUX_RUNNER_LOG_FILE.0"
+    fi
     exit "${FAKE_DOCKER_RC:-0}"
     ;;
   ps) cat "$FAKE_STATE/leftovers" 2>/dev/null || true ;;
@@ -166,7 +170,7 @@ runner() {
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
     LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=none \
-    LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" \
+    LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" LINUX_RUNNER_LOG_FILE="${LOG_FILE:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -426,6 +430,10 @@ grep -Eq 'QUEUE_SLOTS|CACHE_SEED|LINUX_RUNNER_LABEL' "$dplist" && fail "the daem
 [ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
 # The copy sources jit.sh from its own directory, so it must travel with it.
 cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
+grep -Fq "<key>LINUX_RUNNER_LOG_FILE</key><string>$tmp/home/Library/Logs/linux-ephemeral-runner.log</string>" "$dplist" \
+  || fail "the daemon does not name the log run reopens: $(grep -A1 LOG_FILE "$dplist")"
+grep -Fq "<key>StandardOutPath</key><string>$tmp/home/Library/Logs/linux-ephemeral-runner.log</string>" "$dplist" \
+  && fail "launchd holds the rotated log open, so rotation would strand the daemon's writes"
 grep -Fq '<key>ExitTimeOut</key><integer>5400</integer>' "$dplist" || fail "the daemon is not given time to drain before the service manager kills it"
 has 'launchctl bootstrap system' "install-daemon"
 has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
@@ -501,6 +509,17 @@ has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstal
 [ ! -e "$dplist" ] || fail "uninstall-daemon left the LaunchDaemon"
 [ ! -e "$rule" ] || fail "uninstall-daemon left the newsyslog rule"
 ok "uninstall-daemon boots the daemon out and removes its plist and log rotation"
+
+echo "==> the log survives rotation: run reopens it for every line"
+log_path="$tmp/logs/fleet.log"
+rm -rf "$tmp/logs"; mkdir -p "$tmp/logs"
+LOG_FILE="$log_path" FLAGS=rotate-log runner run
+[ "$rc" -eq 0 ] || fail "a run with a log file exited $rc: $(cat "$tmp/out")"
+[ ! -s "$tmp/out" ] || fail "run wrote to stdout instead of its log: $(cat "$tmp/out")"
+[ -f "$log_path.0" ] || fail "the fake did not rotate the log"
+grep -q 'supervising' "$log_path.0" || fail "the rotated log lacks the lines before rotation: $(cat "$log_path.0")"
+[ -s "$log_path" ] || fail "nothing reached the log after rotation; the supervisor kept writing to the renamed file"
+ok "after newsyslog renames the log, the next line starts a new one at the same path"
 
 echo "runner supervisor passed"
 
