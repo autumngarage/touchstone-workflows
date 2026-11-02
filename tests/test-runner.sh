@@ -24,7 +24,6 @@ printf 'gh %s\n' "$*" >>"$FAKE_CALLS"
 case "$*" in
   *runner-groups/*/repositories*)
     [ -f "$FAKE_STATE/empty-group" ] && exit 0
-    if [ -f "$FAKE_STATE/seed-only-group" ]; then echo "autumngarage/hesperus true"; exit 0; fi
     echo "autumngarage/vesper true"
     [ -f "$FAKE_STATE/public-repo" ] && echo "autumngarage/touchstone false"
     exit 0
@@ -50,42 +49,14 @@ case "$*" in
     ;;
   # GitHub has already removed a single-use runner that took its job.
   *"-X DELETE"*) [ -f "$FAKE_STATE/delete-ok" ] && exit 0; exit 1 ;;
-  # What waits for a runner (AUT-2757). runs-fail: GitHub cannot say.
-  # queued-run is set with queued-jobs, whose lines are what the real jq would
-  # print for each queued job of the fleet: "queue" for a merge-queue job,
-  # "pr" for any other. runner-busy is what a runner reports as .busy.
-  *"actions/runs?per_page=1"*)
-    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
+  # The janitor's list: the real jq selects this host's offline runners;
+  # stale-runner is one a killed supervisor left.
+  *"actions/runners --jq"*)
+    [ ! -f "$FAKE_STATE/stale-runner" ] || echo 999
     exit 0
     ;;
-  *"actions/runs?status=queued"*)
-    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
-    [ -f "$FAKE_STATE/queued-run" ] && echo 101
-    exit 0
-    ;;
-  *"repos/autumngarage/vesper/actions/runs/101/jobs"*)
-    cat "$FAKE_STATE/queued-jobs" 2>/dev/null
-    # pr-after-start: a pull request begins to wait once both containers run.
-    [ ! -f "$FAKE_STATE/pr-after-start" ] || [ "$(wc -l <"$FAKE_STATE/started" 2>/dev/null || echo 0)" -lt 2 ] || echo pr
-    exit 0
-    ;;
-  *"orgs/autumngarage/actions/runners/"*"--jq .busy"*)
-    cat "$FAKE_STATE/runner-busy" 2>/dev/null || echo false
-    exit 0
-    ;;
-  # The cache seed's record (AUT-2672): seed-run is a recent push run of the
-  # seed workflow; seed-job-ok says that run has a successful job on the
-  # runner the query names. The real jq does the selecting; this answers as
-  # it would.
-  *"repos/autumngarage/hesperus --jq .default_branch"*) echo main ;;
-  *"actions/workflows/swift-cache.yml/runs?branch=main&event=push"*)
-    [ -f "$FAKE_STATE/seed-run" ] && echo "77 ${FAKE_SEED_STARTED:-2026-10-20T10:00:00Z}"
-    exit 0
-    ;;
-  *"actions/runs/77/jobs"*)
-    [ -f "$FAKE_STATE/seed-job-ok" ] && echo 555
-    exit 0
-    ;;
+  # A registered runner that has not taken its job, while the supervisor drains.
+  *"orgs/autumngarage/actions/runners/"*"--jq .busy"*) echo false ;;
 esac
 EOF
 cat >"$bin/docker" <<'EOF'
@@ -94,18 +65,6 @@ printf 'docker %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
   image)
     [ ! -f "$FAKE_STATE/no-image" ] || exit 1
-    [ "$2" = inspect ] || exit 0
-    # The base image's id; the cache image exists once commit made it.
-    case "$*" in
-      *-swift-cache*)
-        [ -f "$FAKE_STATE/cache-image" ] || exit 1
-        case "$*" in
-          *swift-cache.base*) cat "$FAKE_STATE/cache-base" ;;
-          *seed-started*) cat "$FAKE_STATE/cache-started" ;;
-        esac
-        ;;
-      *'{{.Id}}'*) cat "$FAKE_STATE/base-id" 2>/dev/null || echo sha256:base-1 ;;
-    esac
     ;;
   run)
     # What the container reads on stdin, where the configuration must arrive.
@@ -115,24 +74,6 @@ case "$1" in
     /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
     exit "${FAKE_DOCKER_RC:-0}"
     ;;
-  # Only the seed's validation writes the key file.
-  cp)
-    [ "$2" != -a ] || shift
-    case "$2" in *:/home/runner/.touchstone-swift-cache-key) [ -f "$FAKE_STATE/seed-key" ] || exit 1 ;; esac
-    [ "$3" != - ] || echo tar
-    case "$2" in *.build) [ ! -f "$FAKE_STATE/cp-fails" ] || exit 1 ;; esac
-    [ "$2" != - ] || cat >/dev/null
-    ;;
-  commit)
-    [ ! -f "$FAKE_STATE/commit-fails" ] || exit 1
-    for arg in "$@"; do
-      case "$arg" in
-        "LABEL touchstone.swift-cache.base="*) printf '%s\n' "${arg#*=}" >"$FAKE_STATE/cache-base" ;;
-        "LABEL touchstone.swift-cache.seed-started="*) printf '%s\n' "${arg#*=}" >"$FAKE_STATE/cache-started" ;;
-      esac
-    done
-    touch "$FAKE_STATE/cache-image"
-    ;;
   ps) cat "$FAKE_STATE/leftovers" 2>/dev/null || true ;;
   *) exit 0 ;;
 esac
@@ -140,7 +81,7 @@ EOF
 cat >"$bin/sleep" <<'EOF'
 #!/usr/bin/env bash
 printf 'sleep %s\n' "$*" >>"$FAKE_CALLS"
-# The janitor's interval is the one wait a test needs to take.
+# A test that needs a real wait names its length.
 [ "$1" != "${FAKE_REAL_SLEEP_FOR:-}" ] || exec /bin/sleep "$1"
 EOF
 cat >"$bin/hostname" <<'EOF'
@@ -206,29 +147,26 @@ EOF
 chmod +x "$bin"/*
 
 # runner ARGS...: run the script against the fakes with a fresh call log and
-# state; stdout+stderr land in $tmp/out and the exit code in $rc. KEEP_FAKE
-# keeps the fake engine's images from the previous call.
+# state; stdout+stderr land in $tmp/out and the exit code in $rc. KEEP_FAKE,
+# KEEP_HOME and KEEP_DAEMONS keep the fakes' state, the home directory, and the
+# installed daemon files from the previous call.
 runner() {
-  rm -rf "${tmp:?}/state" "${tmp:?}/daemons"
+  rm -rf "${tmp:?}/state"
+  [ -n "${KEEP_DAEMONS:-}" ] || rm -rf "${tmp:?}/daemons" "${tmp:?}/newsyslog"
   [ -n "${KEEP_FAKE:-}" ] || rm -rf "${tmp:?}/fake"
   [ -n "${KEEP_HOME:-}" ] || rm -rf "${tmp:?}/home"
   mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
   : >"$tmp/calls"
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
-  if [ -n "${QUEUED_JOBS:-}" ]; then
-    touch "$tmp/fake/queued-run"
-    printf '%b' "$QUEUED_JOBS" >"$tmp/fake/queued-jobs"
-  fi
-  [ -z "${BUSY:-}" ] || printf '%s\n' "$BUSY" >"$tmp/fake/runner-busy"
   set +e
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
     LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
     LINUX_RUNNER_QUEUE_SLOTS="${QUEUE_SLOTS:-}" \
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
-    LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD="${HOLD:-0}" \
-    LINUX_RUNNER_JANITOR_INTERVAL="${JANITOR:-60}" FAKE_REAL_SLEEP_FOR="${JANITOR:-60}" \
-    LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" FAKE_SEED_STARTED="${SEED_STARTED:-}" \
+    LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
+    LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=none \
+    LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -241,19 +179,23 @@ runner run
 [ "$rc" -eq 0 ] || fail "a clean one-job run exited $rc: $(cat "$tmp/out")"
 has 'generate-jitconfig' "registration"
 has 'runner_group_id=7' "registration binds the runner group"
-# The workflows select ["self-hosted", LINUX_RUNNER]. A just-in-time runner
-# carries only the labels it is registered with, so it must be given both, or
-# every job waits forever for a runner that never matches.
-has 'labels[]=self-hosted' "registration carries the self-hosted label every selector requires"
-has 'labels[]=linux-ephemeral' "registration carries the label LINUX_RUNNER names"
-# With no slot reserved, every slot takes every job, as before AUT-2704.
-has 'labels[]=linux-ephemeral-shared' "an unreserved slot carries the label validate requires outside the merge queue"
+# validate.yml selects ["self-hosted","linux-ephemeral"]. A just-in-time
+# runner carries only the labels it is registered with, so it gets exactly
+# those two: no role label, so every slot takes every job routed here.
+jit_line="$(grep 'generate-jitconfig' "$tmp/calls")"
+case "$jit_line" in
+  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f work_folder=_work') ;;
+  *) fail "a runner must register with exactly self-hosted and linux-ephemeral: $jit_line" ;;
+esac
+[ "$(printf '%s\n' "$jit_line" | grep -o 'labels\[\]=' | grep -c .)" -eq 2 ] \
+  || fail "a runner registered with labels beyond the two validate selects: $jit_line"
+ok "every runner registers with the labels self-hosted and linux-ephemeral, and no other"
 run_line="$(grep '^docker run ' "$tmp/calls")"
 # --pids-limit keeps a pull request that forks without end inside its own
 # container instead of exhausting the VM every slot shares.
 # The last literal is the container's own command text, matched as written.
 # shellcheck disable=SC2016
-for arg in '--init' ' -i ' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' 'exec ./run.sh --jitconfig "$jit"'; do
+for arg in '--init' ' -i ' '--memory 6g' '--cpus 4' '--pids-limit 4096' '--pull never' 'linux-ephemeral-runner:local bash -c' 'exec ./run.sh --jitconfig "$jit"'; do
   case "$run_line" in *"$arg"*) ;; *) fail "container is missing '$arg': $run_line" ;; esac
 done
 for forbidden in ' -v ' '--volume' '--mount' '--privileged' 'docker.sock' '--network' ' -e ' '--env' 'GH_TOKEN' '--cap-add'; do
@@ -267,166 +209,59 @@ has 'docker-stdin SINGLE-USE-CONFIG' "the configuration arrives on the container
 ok "the container gets the single-use configuration, on stdin, and nothing else"
 has '-X DELETE orgs/autumngarage/actions/runners/4242' "cleanup"
 has 'docker rm -f linux-ephemeral-testhost-1-' "the finished job's container is removed"
-lacks 'docker cp|docker commit|actions/workflows' "with no cache seed configured, a finished container is only removed"
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"
-
-echo "==> a slot kept ready for the merge queue takes only its jobs (AUT-2704)"
-SLOTS=3 QUEUE_SLOTS=1 runner run
-[ "$rc" -eq 0 ] || fail "a run with a reserved slot exited $rc: $(cat "$tmp/out")"
-registrations() { grep 'generate-jitconfig' "$tmp/calls" | grep -F -- "name=linux-ephemeral-testhost-$1-" || true; }
+SLOTS=3 runner run
+[ "$rc" -eq 0 ] || fail "a three-slot run exited $rc: $(cat "$tmp/out")"
 for slot in 1 2 3; do
-  [ "$(registrations "$slot" | grep -c .)" -eq 1 ] || fail "slot $slot did not register exactly once: $(cat "$tmp/calls")"
-  registrations "$slot" | grep -Fq 'labels[]=self-hosted -f labels[]=linux-ephemeral' || fail "slot $slot lost its required labels: $(registrations "$slot")"
+  [ "$(grep 'generate-jitconfig' "$tmp/calls" | grep -c -- "name=linux-ephemeral-testhost-$slot-")" -eq 1 ] \
+    || fail "slot $slot did not register exactly once: $(cat "$tmp/calls")"
 done
-registrations 1 | grep -Fq 'linux-ephemeral-shared' && fail "the reserved slot carries the shared label: $(registrations 1)"
-for slot in 2 3; do
-  registrations "$slot" | grep -Fq 'labels[]=linux-ephemeral-shared' || fail "unreserved slot $slot lacks the shared label: $(registrations "$slot")"
-done
-grep -Fq 'supervising 3 slot(s), 1 kept ready for the merge queue' "$tmp/out" || fail "the reservation is not logged: $(cat "$tmp/out")"
-ok "with nothing waiting, the first QUEUE_SLOTS slots lack the shared label; the others carry it"
+lacks '-shared' "identical slots"
+grep -Fq 'supervising 3 identical slot(s)' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
+ok "N slots register N identical runners"
 
-echo "==> a runner's role follows what is waiting for a runner (AUT-2757)"
-# queue_only: how many registrations lack the shared label (queue-only).
-registered() { grep -c 'generate-jitconfig' "$tmp/calls" || true; }
-queue_only() { grep 'generate-jitconfig' "$tmp/calls" | grep -vc 'linux-ephemeral-shared' || true; }
-# Which slot registers first varies, so each case holds for any order.
-# A pull request waits and the queue is idle: no slot sits ready for the queue.
-HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='pr\n' runner run
-[ "$rc" -eq 0 ] || fail "a run with a pull request waiting exited $rc: $(cat "$tmp/out")"
-[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 0 ] \
-  || fail "a waiting pull request left a slot idle for the queue: $(grep generate-jitconfig "$tmp/calls")"
-ok "while a pull request waits and no queue job does, the reserved slot takes pull requests too"
-# One queue job and one pull request wait: exactly one runner answers the queue.
-HOLD=4 SLOTS=2 QUEUE_SLOTS=1 QUEUED_JOBS='queue\npr\n' runner run
-[ "$(registered)" -eq 2 ] && [ "$(queue_only)" -eq 1 ] \
-  || fail "one waiting queue job did not get exactly one queue-only runner: $(grep generate-jitconfig "$tmp/calls")"
-ok "one waiting queue job gets one queue-only runner, however the slots race"
-# Two queue jobs and a pull request wait: two runners answer the queue.
-HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='queue\nqueue\npr\n' runner run
-[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
-  || fail "two waiting queue jobs did not get two queue-only runners: $(grep generate-jitconfig "$tmp/calls")"
-ok "queue jobs outrank pull requests for freed slots, up to the number that wait"
-# However many queue jobs wait, one runner stays shared: a pull request can use
-# nothing else, and a queue job can use a shared runner.
-HOLD=4 SLOTS=3 QUEUE_SLOTS=1 QUEUED_JOBS='queue\nqueue\nqueue\npr\n' runner run
-[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
-  || fail "queue-only runners were not capped below the slot count: $(grep generate-jitconfig "$tmp/calls")"
-ok "at most SLOTS-1 runners are queue-only, so pull requests always have a runner"
-# A queue-only runner that is busy answers nothing that waits.
-HOLD=4 SLOTS=3 QUEUE_SLOTS=1 BUSY=true QUEUED_JOBS='queue\npr\n' runner run
-[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 2 ] \
-  || fail "a busy queue-only runner was counted as waiting for the queue job: $(grep generate-jitconfig "$tmp/calls")"
-ok "only an idle queue-only runner answers a waiting queue job, on GitHub's word"
-# GitHub cannot say what waits: the fixed reservation.
-SLOTS=3 QUEUE_SLOTS=1 FLAGS=runs-fail runner run
-[ "$rc" -eq 0 ] || fail "a run that could not read the waiting jobs exited $rc: $(cat "$tmp/out")"
-grep -Fq 'using the fixed reservation' "$tmp/out" || fail "the fallback is not logged: $(cat "$tmp/out")"
-[ "$(registered)" -eq 3 ] && [ "$(queue_only)" -eq 1 ] \
-  || fail "the fixed reservation was not used: $(grep generate-jitconfig "$tmp/calls")"
-ok "without GitHub's answer, the first QUEUE_SLOTS slots are queue-only"
-# Off: no reservation and no look at what waits.
-SLOTS=3 QUEUED_JOBS='queue\n' runner run
-[ "$(queue_only)" -eq 0 ] || fail "a runner was queue-only with QUEUE_SLOTS unset: $(grep generate-jitconfig "$tmp/calls")"
-lacks 'actions/runs\?status=queued' "QUEUE_SLOTS unset"
-ok "with QUEUE_SLOTS unset every runner is shared and nothing waiting is read"
-# A pull request that starts waiting after the queue-only runner registered:
-# the janitor removes that idle runner, so the slot registers again.
-HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start delete-ok' QUEUED_JOBS='\n' runner run
-[ "$rc" -eq 0 ] || fail "a run with a janitor exited $rc: $(cat "$tmp/out")"
-grep -Fq 'recycled idle queue-only runner' "$tmp/out" \
-  || fail "an idle queue-only runner stayed beside a waiting pull request: $(cat "$tmp/out")"
-ok "an idle queue-only runner is removed once a pull request waits and no queue job needs it"
-# Not when a queue job waits for it.
-HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start delete-ok' QUEUED_JOBS='queue\n' runner run
-! grep -Fq 'recycled' "$tmp/out" || fail "a runner a waiting queue job needs was removed: $(cat "$tmp/out")"
-ok "an idle queue-only runner a waiting queue job needs is kept"
-# Not when GitHub refuses (the runner has a job).
-HOLD=6 JANITOR=1 SLOTS=2 QUEUE_SLOTS=1 FLAGS='pr-after-start' QUEUED_JOBS='\n' runner run
-! grep -Fq 'recycled' "$tmp/out" || fail "a removal GitHub refused was reported as done: $(cat "$tmp/out")"
-ok "a runner GitHub will not remove is not reported as recycled"
-# The token cannot read workflow runs: said at start, not discovered later.
-FLAGS=runs-fail SLOTS=2 QUEUE_SLOTS=1 runner run
-grep -Fq 'WARNING: the token cannot read the workflow runs of autumngarage/vesper' "$tmp/out" \
-  || fail "a token without Actions read access went unmentioned: $(cat "$tmp/out")"
-SLOTS=2 QUEUE_SLOTS=1 runner run
-! grep -Fq 'WARNING' "$tmp/out" || fail "a token that can read runs was warned about: $(cat "$tmp/out")"
-ok "a token that cannot read workflow runs is named when the supervisor starts"
-for bad in 3 4 x; do
-  SLOTS=3 QUEUE_SLOTS=$bad runner run
-  [ "$rc" -ne 0 ] || fail "QUEUE_SLOTS=$bad of 3 was accepted"
-  lacks 'generate-jitconfig' "QUEUE_SLOTS=$bad"
+echo "==> retired settings an installed wrapper still passes"
+for value in '' 0; do
+  QUEUE_SLOTS=$value runner run
+  [ "$rc" -eq 0 ] || fail "LINUX_RUNNER_QUEUE_SLOTS='$value' was refused: $(cat "$tmp/out")"
 done
-grep -Fq 'LINUX_RUNNER_QUEUE_SLOTS must be a non-negative integer' "$tmp/out" || fail "a malformed reservation was not named: $(cat "$tmp/out")"
-ok "a reservation that would leave pull requests no slot, or is not a number, registers nothing"
+ok "LINUX_RUNNER_QUEUE_SLOTS unset or 0 is accepted"
+for value in 1 3 x; do
+  SLOTS=3 QUEUE_SLOTS=$value runner run
+  [ "$rc" -ne 0 ] || fail "LINUX_RUNNER_QUEUE_SLOTS=$value was accepted"
+  grep -Fq 'LINUX_RUNNER_QUEUE_SLOTS is retired' "$tmp/out" || fail "QUEUE_SLOTS=$value: the refusal does not say why: $(cat "$tmp/out")"
+  lacks 'generate-jitconfig' "QUEUE_SLOTS=$value"
+done
+ok "a nonzero LINUX_RUNNER_QUEUE_SLOTS registers nothing and says the roles are retired"
+CACHE_SEED=autumngarage/hesperus:swift-cache.yml runner run
+[ "$rc" -eq 0 ] || fail "a run with the retired cache seed exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c 'LINUX_RUNNER_CACHE_SEED is retired and ignored' "$tmp/out")" -eq 1 ] \
+  || fail "the ignored cache seed is not noted once: $(cat "$tmp/out")"
+case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a job did not start from the base image: $(grep '^docker run ' "$tmp/calls")" ;; esac
+lacks 'docker cp|docker commit|actions/workflows|swift-cache' "the retired cache seed"
+runner run
+! grep -Fq 'CACHE_SEED' "$tmp/out" || fail "an unset cache seed was mentioned: $(cat "$tmp/out")"
+ok "LINUX_RUNNER_CACHE_SEED is noted once in the log and ignored; jobs start from the base image"
 
-echo "==> the cache seed's products are kept only on GitHub's word (AUT-2672)"
-seed=autumngarage/hesperus:swift-cache.yml
-# A job that left no key: nothing asked, nothing kept, the container removed.
-CACHE_SEED=$seed runner run
-[ "$rc" -eq 0 ] || fail "a cache-seed run exited $rc: $(cat "$tmp/out")"
-lacks 'actions/workflows|docker commit' "a job with no cache key"
-has 'docker rm -f linux-ephemeral-testhost-1-' "a job with no cache key"
-run_line="$(grep '^docker run ' "$tmp/calls")"
-case "$run_line" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "with no cache image, a job must start from the base: $run_line" ;; esac
-# A key in the container is the job's own claim. A pull request's job can
-# write one too, so without GitHub's record of the seed nothing is kept.
-for flags in 'seed-key' 'seed-key seed-run'; do
-  FLAGS=$flags CACHE_SEED=$seed runner run
-  [ "$rc" -eq 0 ] || fail "$flags: exited $rc: $(cat "$tmp/out")"
-  has 'actions/workflows/swift-cache.yml/runs?branch=main&event=push' "$flags: GitHub is asked for the seed's default-branch push runs"
-  case "$flags" in *seed-run*) has 'select(.runner_name == "linux-ephemeral-testhost-1-' "$flags: and for a job on this very runner" ;; esac
-  lacks 'docker commit' "$flags: a job GitHub does not record as the seed"
-  grep -q 'GitHub records no successful autumngarage/hesperus:swift-cache.yml job' "$tmp/out" || fail "$flags: the refusal is not logged: $(cat "$tmp/out")"
-  has 'docker rm -f linux-ephemeral-testhost-1-' "$flags: an unproven container is removed"
-done
-ok "a container's own claim to be the seed keeps nothing"
-FLAGS='seed-key seed-run seed-job-ok' CACHE_SEED=$seed runner run
-[ "$rc" -eq 0 ] || fail "a seed run exited $rc: $(cat "$tmp/out")"
-has 'docker cp -a linux-ephemeral-testhost-1-' "the seed's .build is copied"
-has ':/home/runner/_work/hesperus/hesperus/.build -' "from the seed's workspace"
-has ':/home/runner/swift-build-cache/autumngarage/hesperus' "into the cache path validate.yml reads"
-has 'docker commit --change LABEL touchstone.swift-cache.base=sha256:base-1 --change LABEL touchstone.swift-cache.seed-started=2026-10-20T10:00:00Z' "the cache image records its base and its seed"
-has 'linux-ephemeral-runner:local-swift-cache' "the cache image's tag"
-[ "$(grep -c '^docker rm -f linux-ephemeral-testhost-1-' "$tmp/calls")" -ge 2 ] || fail "the seed's and the staging containers are not both removed: $(cat "$tmp/calls")"
-[ -z "$(ls "$tmp/state")" ] || fail "keeping the cache left state behind: $(ls "$tmp/state")"
-ok "a job GitHub records as the seed's success leaves its products in the cache image"
-# The cache image holds the seed repository's build, so a group that admits
-# any other repository never starts a job from it.
-KEEP_FAKE=1 CACHE_SEED=$seed runner run
-case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a group shared with another repository started a job from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
-grep -q "admits repositories other than autumngarage/hesperus; this job starts without its build cache" "$tmp/out" || fail "the shared group is not logged: $(cat "$tmp/out")"
-ok "a runner group shared with another repository never starts a job from the cache image"
-# The next job starts from the cache image, while it was made from this base.
-FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
-case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local-swift-cache bash -c"*) ;; *) fail "the next job did not start from the cache image: $(grep '^docker run ' "$tmp/calls")" ;; esac
-echo sha256:base-2 >"$tmp/fake/base-id"
-FLAGS=seed-only-group KEEP_FAKE=1 CACHE_SEED=$seed runner run
-case "$(grep '^docker run ' "$tmp/calls")" in *"linux-ephemeral-runner:local bash -c"*) ;; *) fail "a rebuilt base kept the old products: $(grep '^docker run ' "$tmp/calls")" ;; esac
-ok "jobs start from the cache image only while its base is the base image as it is"
-# An older seed that finishes last does not replace a newer one's products.
-# (The run above found the seed's flags still set, so its cache image is now
-# made from base-2, by the same seed.)
-touch "$tmp/fake/seed-key" "$tmp/fake/seed-run" "$tmp/fake/seed-job-ok"
-SEED_STARTED=2026-10-20T09:00:00Z KEEP_FAKE=1 CACHE_SEED=$seed runner run
-lacks 'docker commit' "an older seed"
-grep -q 'already holds one started 2026-10-20T10:00:00Z' "$tmp/out" || fail "the older seed's refusal is not logged: $(cat "$tmp/out")"
-SEED_STARTED=2026-10-20T11:00:00Z KEEP_FAKE=1 CACHE_SEED=$seed runner run
-has 'touchstone.swift-cache.seed-started=2026-10-20T11:00:00Z' "a newer seed"
-ok "a newer seed replaces the products; an older one does not"
-FLAGS='seed-key seed-run seed-job-ok cp-fails' CACHE_SEED=$seed runner run
-[ "$rc" -eq 0 ] || fail "a failed copy stopped the slot: $(cat "$tmp/out")"
-lacks 'docker commit' "a failed copy"
-grep -q "jobs keep the previous ones" "$tmp/out" || fail "a failed copy is not logged: $(cat "$tmp/out")"
-ok "a copy that fails keeps nothing, says so, and the slot goes on"
-# What a killed supervisor left is cleared when the next one starts.
+echo "==> a restart clears what a killed supervisor left"
 mkdir -p "$tmp/fake"
-FLAGS='' runner run
 printf 'abc123\n' >"$tmp/fake/leftovers"
 KEEP_FAKE=1 runner run
 has 'docker ps -aq --filter name=^linux-ephemeral-testhost-' "leftovers are looked for"
 has 'docker rm -f abc123' "a leftover container is removed"
 ok "a restart removes the containers a killed supervisor left"
+FLAGS='stale-runner delete-ok' runner run
+[ "$rc" -eq 0 ] || fail "a run with a stale registration exited $rc: $(cat "$tmp/out")"
+has 'select(.status == "offline" and (.name | startswith("linux-ephemeral-testhost-")))' "the janitor asks only for this host's offline runners"
+has '-X DELETE orgs/autumngarage/actions/runners/999' "the stale registration is removed"
+line_of() { grep -nF -- "$1" "$tmp/calls" | head -1 | cut -d: -f1; }
+[ "$(line_of 'runners/999')" -lt "$(line_of 'generate-jitconfig')" ] \
+  || fail "the janitor ran after a slot registered, when an offline runner may be this supervisor's own: $(cat "$tmp/calls")"
+grep -Fq 'removed stale offline registration 999' "$tmp/out" || fail "the removal is not logged: $(cat "$tmp/out")"
+FLAGS='stale-runner' runner run
+grep -Fq 'could not remove stale offline registration 999' "$tmp/out" || fail "a refused removal is not logged: $(cat "$tmp/out")"
+ok "before any slot registers, this host's offline registrations are removed, and a refusal is logged"
 
 echo "==> a stop signal drains: running jobs finish, nothing new registers (AUT-2763)"
 # A supervisor holding two jobs (4 s each). The first TERM arrives while they
@@ -531,35 +366,19 @@ ok "a missing image registers nothing"
 SLOTS=0 runner run
 [ "$rc" -ne 0 ] || fail "zero slots was accepted"
 ok "the slot count must be a positive integer"
-CACHE_SEED=hesperus runner run
-refused 'LINUX_RUNNER_CACHE_SEED must be OWNER/REPO:WORKFLOW_FILE' "a malformed cache seed"
-lacks 'generate-jitconfig' "a malformed cache seed"
-ok "a malformed cache seed registers nothing"
-
-echo "==> install runs the supervisor from a copy, kept awake"
-runner install
-[ "$rc" -eq 0 ] || fail "install exited $rc: $(cat "$tmp/out")"
-plist="$tmp/home/Library/LaunchAgents/com.autumngarage.linux-ephemeral-runner.plist"
-[ -f "$plist" ] || fail "install wrote no LaunchAgent"
-grep -Fq '<string>/usr/bin/caffeinate</string>' "$plist" || fail "the agent is not kept awake"
-grep -Fq "<string>$tmp/state/linux-runner.sh</string>" "$plist" || fail "the agent does not run the installed copy"
-[ -f "$tmp/state/linux-runner.sh" ] || fail "install did not copy the supervisor"
-# The copy sources jit.sh from its own directory, so it must travel with it.
-cmp -s "$tmp/state/jit.sh" "$root/runner/jit.sh" || fail "install did not copy runner/jit.sh beside the supervisor"
-cmp -s "$tmp/state/queue.sh" "$root/runner/queue.sh" || fail "install did not copy runner/queue.sh beside the supervisor"
-grep -Fq '<key>LINUX_RUNNER_LABEL</key><string>linux-ephemeral</string>' "$plist" || fail "the agent lost its label"
-grep -Fq '<key>LINUX_RUNNER_QUEUE_SLOTS</key><string>0</string>' "$plist" || fail "the agent lost its merge-queue reservation"
-has 'launchctl bootstrap' "install"
-ok "the LaunchAgent runs a copy of the supervisor under caffeinate"
 
 echo "==> a headless host starts its own Colima VM"
 ENGINE=colima runner run
 [ "$rc" -eq 0 ] || fail "a colima run exited $rc: $(cat "$tmp/out")"
-has 'colima start --vm-type vz' "a stopped VM"
+has 'colima start --vm-type vz --arch aarch64 --cpu 8 --memory 16 --disk 60' "a stopped VM starts native, with its disk size"
 has 'docker run ' "colima run"
+LINUX_RUNNER_VM_DISK=120 ENGINE=colima runner run
+has '--disk 120' "LINUX_RUNNER_VM_DISK"
+LINUX_RUNNER_VM_DISK=0 ENGINE=colima runner run
+refused 'LINUX_RUNNER_VM_DISK must be a positive integer' "a zero disk"
 FLAGS=colima-up ENGINE=colima runner run
 lacks '^colima start' "a running VM"
-ok "the VM is started when it is down, and left alone when it is up"
+ok "the VM is started when it is down, with --arch aarch64 and --disk, and left alone when it is up"
 FLAGS=colima-fails ENGINE=colima runner run
 refused 'colima could not start its VM' "a VM that will not start"
 lacks 'generate-jitconfig' "no VM"
@@ -591,27 +410,38 @@ seed_token() {
   chmod "${1:-600}" "$user_state/github-token"
 }
 seed_token
-KEEP_HOME=1 runner install-daemon "$real_user"
+# What the installed wrapper passes: the retired settings, set to their off values.
+QUEUE_SLOTS=0 CACHE_SEED=autumngarage/hesperus:swift-cache.yml KEEP_HOME=1 runner install-daemon "$real_user"
 [ "$rc" -eq 0 ] || fail "install-daemon exited $rc: $(cat "$tmp/out")"
 dplist="$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist"
 [ -f "$dplist" ] || fail "install-daemon wrote no LaunchDaemon"
 grep -Fq "<key>UserName</key><string>$real_user</string>" "$dplist" || fail "the daemon does not run as the fleet's user"
 grep -Fq "<key>LINUX_RUNNER_ENGINE</key><string>colima</string>" "$dplist" || fail "the daemon does not use Colima"
+grep -Fq "<key>LINUX_RUNNER_VM_DISK</key><string>60</string>" "$dplist" || fail "the daemon does not carry the VM's disk size"
 grep -Fq "<key>LINUX_RUNNER_TOKEN_FILE</key><string>$user_state/github-token</string>" "$dplist" || fail "the daemon has no token file"
 grep -Fq "<string>$user_state/linux-runner.sh</string>" "$dplist" || fail "the daemon does not run the installed copy"
 grep -Fq "<key>HOME</key><string>$tmp/home</string>" "$dplist" || fail "the daemon's HOME is not the user's"
 grep -Fq 'ghp_DAEMON' "$dplist" && fail "the token was written into the plist"
+grep -Eq 'QUEUE_SLOTS|CACHE_SEED|LINUX_RUNNER_LABEL' "$dplist" && fail "the daemon carries a retired setting: $(cat "$dplist")"
 [ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
+# The copy sources jit.sh from its own directory, so it must travel with it.
 cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
-cmp -s "$user_state/queue.sh" "$root/runner/queue.sh" || fail "install-daemon did not copy runner/queue.sh beside the supervisor"
 grep -Fq '<key>ExitTimeOut</key><integer>5400</integer>' "$dplist" || fail "the daemon is not given time to drain before the service manager kills it"
 has 'launchctl bootstrap system' "install-daemon"
 has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
-ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token"
+ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token and no retired setting"
+rule="$tmp/newsyslog/linux-ephemeral-runner.conf"
+expected_rule="$tmp/home/Library/Logs/linux-ephemeral-runner.log $real_user:staff 644 5 10240 * NJ"
+[ "$(cat "$rule" 2>/dev/null)" = "$expected_rule" ] || fail "the newsyslog rule is not the owner's: $(cat "$rule" 2>/dev/null)"
+has "chown root:wheel $rule" "the newsyslog rule belongs to root"
+rule_mode="$(stat -c %a "$rule" 2>/dev/null || stat -f %Lp "$rule")"
+[ "$rule_mode" = 644 ] || fail "the newsyslog rule is mode $rule_mode"
+# The owner installed this rule by hand: installing again leaves it as it was.
 seed_token
-CACHE_SEED=autumngarage/hesperus:swift-cache.yml KEEP_HOME=1 runner install-daemon "$real_user"
-grep -Fq "<key>LINUX_RUNNER_CACHE_SEED</key><string>autumngarage/hesperus:swift-cache.yml</string>" "$dplist" || fail "the daemon lost its cache seed"
-ok "the LaunchDaemon carries the cache seed"
+KEEP_DAEMONS=1 KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "a second install-daemon exited $rc: $(cat "$tmp/out")"
+[ "$(cat "$rule")" = "$expected_rule" ] || fail "a second install changed the newsyslog rule: $(cat "$rule")"
+ok "install-daemon writes the newsyslog rule for the daemon's log, idempotently"
 seed_token
 FLAGS=not-root KEEP_HOME=1 runner install-daemon "$real_user"
 refused 'run it with sudo' "a non-root install"
@@ -625,15 +455,18 @@ KEEP_HOME=1 runner install-daemon "$real_user"
 refused 'must be private' "a readable token"
 runner install-daemon
 refused 'usage: sudo bash runner/linux-runner.sh install-daemon USER' "no user named"
-[ ! -f "$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist" ] || fail "a refused install left a LaunchDaemon"
+[ ! -f "$dplist" ] || fail "a refused install left a LaunchDaemon"
+[ ! -f "$rule" ] || fail "a refused install left a newsyslog rule"
 ok "install-daemon refuses without root, a real user, or that user's private token"
+runner install
+[ "$rc" -eq 2 ] || fail "the retired login-session install still ran (exit $rc): $(cat "$tmp/out")"
+ok "the login-session LaunchAgent is gone; the fleet runs only as a LaunchDaemon"
 
 echo "==> replacing a running fleet never leaves it stopped without saying how to start it"
 # launchd is still ending the old service when bootout returns, and a load in
 # that window fails with the old one already gone (AUT-2258 on the macOS
-# pool, AUT-2275 here). Both installs wait for it to leave and try the load
+# pool, AUT-2275 here). The install waits for it to leave and tries the load
 # again, through the one replace_service in jit.sh.
-line_of() { grep -nF -- "$1" "$tmp/calls" | head -1 | cut -d: -f1; }
 seed_token
 FLAGS=service-lingers KEEP_HOME=1 runner install-daemon "$real_user"
 [ "$rc" -eq 0 ] || fail "install-daemon over a daemon that was still leaving exited $rc: $(cat "$tmp/out")"
@@ -658,18 +491,16 @@ refused "sudo launchctl bootstrap system '$dplist'" "an install over a daemon th
 grep -q 'was still in launchd 60s after its bootout' "$tmp/out" || fail "the refusal did not say the old daemon was still there: $(cat "$tmp/out")"
 lacks 'launchctl bootstrap system' "an install over a daemon that never left"
 grep -q 'installed com.autumngarage.linux-ephemeral-runner' "$tmp/out" && fail "an install over a daemon that never left reported success: $(cat "$tmp/out")"
-# The login-session agent is replaced the same way, in its own domain and
-# with no sudo in the command it names.
-FLAGS=service-lingers runner install
-[ "$rc" -eq 0 ] || fail "install over an agent that was still leaving exited $rc: $(cat "$tmp/out")"
-[ "$(line_of 'sleep 1')" -lt "$(line_of 'launchctl bootstrap gui/')" ] || fail "the new agent was loaded before the old one had left: $(cat "$tmp/calls")"
-FLAGS=service-stuck runner install
-refused "Load it with: launchctl bootstrap gui/" "an agent launchd will not load"
-ok "both installs wait for the service they replace, retry the load, and name the command if they cannot"
-runner uninstall-daemon
+ok "the install waits for the daemon it replaces, retries the load, and names the command if it cannot"
+seed_token
+KEEP_HOME=1 runner install-daemon "$real_user"
+[ -f "$dplist" ] && [ -f "$rule" ] || fail "install-daemon left nothing to uninstall"
+KEEP_DAEMONS=1 runner uninstall-daemon
 [ "$rc" -eq 0 ] || fail "uninstall-daemon exited $rc"
 has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstall-daemon"
-ok "uninstall-daemon boots the daemon out"
+[ ! -e "$dplist" ] || fail "uninstall-daemon left the LaunchDaemon"
+[ ! -e "$rule" ] || fail "uninstall-daemon left the newsyslog rule"
+ok "uninstall-daemon boots the daemon out and removes its plist and log rotation"
 
 echo "runner supervisor passed"
 
