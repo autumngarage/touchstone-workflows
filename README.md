@@ -79,22 +79,6 @@ increase their resources. Changing a consumer's setting or adopting a new
 required-workflow pin requires that consumer's normal approval and rollout;
 source delivery alone does not change its live scheduling.
 
-## Linux overflow
-
-`runner/linux-overflow.sh` owns the Linux overflow functions used by
-ci-studio's existing `ci-watch.sh`. The watcher supplies routing, usage state
-and logging; this module does not start another controller. After review and
-merge, install the module alongside the watcher and replace its inline block
-from `OVERFLOW_WAIT` through `check_linux_overflow` with a source of that file.
-Back up the watcher, validate its shell syntax and restart only the watcher
-while it is sleeping. Existing state files retain their meaning; rollback
-restores the backup. Installation does not enable overflow.
-
-The timeout guard reads current PR, main and merge-queue Linux checks, so a
-rerun is not excluded by its original workflow creation time. Unreadable or
-truncated evidence returns routing to local runners. The captured API-shape
-fixture and guard tests live in `tests/test-linux-overflow.sh`.
-
 ## Swift build caches
 
 Consumers can opt into the validation workflow's SwiftPM cache with the
@@ -109,19 +93,6 @@ restore prefix across revisions. Cached `.build` output accelerates compilation;
 the declared validation command always runs, including on an exact cache hit.
 No runner volume or writable cache is shared between job containers.
 
-On the single-use Linux runners, the job image can carry the products of the
-consumer's last default-branch seed (`LINUX_RUNNER_CACHE_SEED`, AUT-2672), and
-validation copies them into place instead of downloading GitHub's cache when
-their recorded key has the run's restore prefix, the same products
-`restore-keys` would accept. The supervisor keeps them only when GitHub's own
-record says that runner ran the seed workflow's job for a push to the default
-branch and the job succeeded; a key the job wrote proves nothing by itself.
-The products sit in an image no job writes, so each job still starts from a
-fresh container and nothing a pull request does reaches another job. The
-image holds that repository's build, so a job starts from it only while the
-runner group admits that repository and no other; the supervisor checks the
-group before every registration.
-
 A consumer must also invoke this pinned workflow through `workflow_call` on
 default-branch pushes to produce reusable default-branch caches. PR-only caches
 are confined to their merge refs and do not seed other PRs, so required PR and
@@ -134,8 +105,8 @@ The protected workflow pin, consumer producer and repository opt-in must all be
 deployed before measuring cold/warm improvements. Passing the source contract
 alone is not evidence of a consumer cache hit or reduced build time.
 
-Validation keeps a 30-minute limit on local runners and for consumers without
-`SWIFT_BUILD_CACHE=true`. Hosted Swift-cache consumers get 60 minutes: the
+Validation keeps a 30-minute limit for consumers without
+`SWIFT_BUILD_CACHE=true`. Swift-cache consumers get 60 minutes: the
 measured two-CPU cold build took 20 minutes before tests, so a 30-minute limit
 cancelled useful work and forced the next attempt to rebuild it. This is a
 ceiling, not a target; backend/concurrency fixes and compatible caches still
@@ -144,198 +115,36 @@ reduce the work. Every validation command and spending guard remains in force.
 A reusable-workflow caller may explicitly pass `timeout_minutes`, which takes
 precedence; its existing default remains 30. Cache producers already passing
 60 retain that limit. Required PR, push and merge-queue workflows have no
-caller input and select the limit from their runner and Swift-cache settings.
+caller input and select the limit from their Swift-cache setting.
 Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-To choose the cloud outright, set the repository variable
-`LINUX_VALIDATION_RUNNER` to `blacksmith` (Blacksmith's 4-vCPU Ubuntu 24.04
-runner) or `github` (GitHub-hosted `ubuntu-latest`). Set, it decides where
-`validate-groups` runs for pull requests and the merge queue, and it wins over
-`LINUX_RUNNER` and `BLACKSMITH_LINUX`: an organization variable's selected
-repositories cannot send the repository back to a local pool. Its gate jobs
-then ignore `LINUX_GATE_RUNNER` and run on GitHub-hosted `ubuntu-latest`. Switching between
-the two values is the fallback when one cloud is down. Planning fails on any
-other value, so a misspelling cannot route to a local pool unnoticed. A
-repository that sets it gets the hosted 60-minute limit when it also sets
-`SWIFT_BUILD_CACHE=true`. Unset, the rules below apply unchanged.
+No job in these workflows runs on a self-hosted runner (AUT-3412). The Mac's
+single-use Linux fleet (`LINUX_RUNNER`, `LINUX_GATE_RUNNER`,
+`runner/linux-runner.sh`) is retired: portable work runs in the cloud and the
+Mac serves only macOS work. `tests/test-workflow.sh` fails if a job names
+`self-hosted`, `LINUX_RUNNER` or `LINUX_GATE_RUNNER` again.
 
-Set the repository variable `BLACKSMITH_LINUX=true` to use Blacksmith's managed
-ephemeral 4-vCPU Ubuntu 24.04 runners when `LINUX_RUNNER` does not select a local
-pool, including PR and merge-queue validation. Reusable callers can explicitly
-select Blacksmith with `blacksmith: true`; that input takes precedence over
-the local pool and defaults to false.
-Validation planning, final summaries, and review/delivery gates use the gate
-selector below; macOS jobs keep their existing routing.
+`validate-groups`, which runs the candidate's declared commands, picks a cloud:
 
-Blacksmith must be installed for the consumer repository and is billed
-separately from GitHub; the GitHub usage guard does not govern that bill.
-Adopt the reviewed workflow pin before enabling the variable. Existing overflow
-routing can retain the local pool as the default and remove its selection when
-full; Blacksmith then supplies hosted capacity. Removing the variable restores
-GitHub Ubuntu as that fallback without changing validation rules.
+1. a reusable caller's `blacksmith: true` input (default false), or the
+   repository variable `LINUX_VALIDATION_RUNNER=blacksmith`: Blacksmith's
+   4-vCPU Ubuntu 24.04 runner;
+2. `LINUX_VALIDATION_RUNNER=github`: GitHub-hosted `ubuntu-latest`;
+3. unset, `BLACKSMITH_LINUX=true`: Blacksmith;
+4. otherwise GitHub-hosted `ubuntu-latest`.
 
-Without Blacksmith opt-in, validation reads `LINUX_RUNNER`:
-
-```yaml
-runs-on: ${{ vars.LINUX_RUNNER && fromJSON(format(github.event_name == 'merge_group' && '["self-hosted","{0}"]' || '["self-hosted","{0}","{0}-shared"]', vars.LINUX_RUNNER)) || 'ubuntu-latest' }}
-```
-
-Outside the merge queue it also requires the label `LINUX_RUNNER-shared`. A
-runner registered without it is queue-only: it takes only merge-queue jobs.
-GitHub does not hand a freed runner to the job that has waited longest: on
-2026-10-20, with three slots, a queue validation waited 26 minutes while freed
-slots went to pull requests queued after it (AUT-2704), and a pull request
-ships only through the queue.
-
-`runner/linux-runner.sh` chooses each new runner's role when it registers,
-from what is waiting for a runner of the fleet (AUT-2757), so the split
-follows the load and no count needs tuning. With `LINUX_RUNNER_QUEUE_SLOTS=N`
-(0, off, by default; every runner is then shared):
-
-1. queue jobs waiting beyond the idle queue-only runners: the new runner is
-   queue-only, so a freed slot goes to the queue first;
-2. otherwise a slot among the first `N` stays queue-only, ready for the queue,
-   while no pull-request job waits, so no slot idles while pull requests wait;
-3. otherwise it is shared and takes anything.
-
-At most `SLOTS-1` runners are queue-only at once, so pull requests always have
-a runner, and queue jobs can use a shared one. Every minute, while a
-pull-request job waits, idle queue-only runners that no waiting queue job needs
-are removed and their slots register again with a fresh role. GitHub refuses to
-remove a runner that has a job, so nothing running is cut.
-
-**Stopping drains (AUT-2763).** The first `SIGTERM` or `SIGINT` to the
-supervisor (a `launchctl bootout`, or a restart through `linux-runner-admin
-apply`) stops registering runners, removes the registrations that have no job,
-and lets the jobs that run finish before it exits, so a restart cuts none of
-them. A cancelled merge-queue job evicts its entry and the ones behind it. A
-second signal stops at once, and the daemon's plist gives the drain
-`ExitTimeOut` 5400 s before the service manager kills it. A daemon installed
-before this change still has the default 20 s; its first restart is not graceful.
-
-The token the supervisor uses needs **Actions: read** on every repository in
-the runner group, in addition to the organization's self-hosted-runner
-permission, to see what waits. The supervisor checks at start and says so in
-its log; without it, the first `N` slots are queue-only, fixed. Give the
-runners the label before a consumer's validation pin requires it, or its
-pull-request jobs wait for a runner that never matches.
+Switching `LINUX_VALIDATION_RUNNER` between its two values is the fallback when
+one cloud is down. Planning fails on any other value, so a misspelling cannot
+fall through to the other cloud unnoticed. Blacksmith must be installed for the
+consumer repository and is billed separately from GitHub; the GitHub usage
+guard does not govern that bill. Adopt the reviewed workflow pin before
+setting either variable.
 
 Validation planning (`plan`), its final summary (`validate`), `review-gate`,
-and `delivery-evidence` read `LINUX_GATE_RUNNER`, without the merge-queue split:
-`fromJSON(format('["self-hosted","{0}"]', vars.LINUX_GATE_RUNNER))`. They run for seconds, and on one
-variable they waited in line behind validations: on a repository with two
-runners of its own, 23 minutes on average on 2026-10-11, long enough for
-`touchstone pr open` to give up on them (AUT-2452). So a repository that sets
-only `LINUX_RUNNER` validates on its own runners and runs its gates on
-GitHub-hosted ones, where they start at once and bill a minute each. Set
-`LINUX_GATE_RUNNER` as well only when GitHub-hosted jobs cannot start, for
-example when the plan's included minutes are used up. A repository that sets
-`LINUX_VALIDATION_RUNNER` runs these jobs on GitHub-hosted `ubuntu-latest`
-whatever `LINUX_GATE_RUNNER` says, so an organization variable cannot pull its
-gates back to a local pool either.
-
-With a variable unset, its jobs run on GitHub-hosted `ubuntu-latest`, exactly
-as before. Set, they run on a self-hosted runner with that label, and the
-`self-hosted` label is always required, so a variable can never name a hosted
-image (AUT-1595). The `source contract` job runs only in
-this public repository and stays on `ubuntu-latest` by name.
-
-**Both variables name only single-use runners.** `validate-groups` runs the
-candidate's declared commands. On a persistent self-hosted runner, a pull
-request could modify the host and reach every later job there, including
-`review-gate`, which receives the fallback reviewer's credential
-(touchstone-workflows#48). The workflow cannot see whether a runner is
-ephemeral, so the guarantee lives where runners are registered:
-`runner/linux-runner.sh` is the only thing that registers runners with this
-label. For each job it asks GitHub for a just-in-time configuration, which
-registers a runner for exactly one job, and starts a fresh container that
-holds that configuration and nothing else: no volume, no Docker socket, no
-host network, no credential (`tests/test-runner.sh` pins this). The image can
-include a default-branch seed's build products (see "Swift build caches");
-nothing else from a finished job is ever kept. Never register
-a long-lived runner with the label or into its group. Before every
-registration the supervisor also checks the group itself: it must be visible
-only to selected repositories, closed to public ones, and hold only private
-repositories, or nothing is registered.
-
-`LINUX_RUNNER`'s repositories and the runner group's repositories must be the
-same set, and `LINUX_GATE_RUNNER`'s, when it is set, must all be among them. A
-repository that resolves a variable but is outside the group queues those
-jobs forever. A public repository must be in none of them, because it takes
-fork pull requests.
-
-### Running the runners (AUT-1596)
-
-On the host: Docker, and `gh` logged in with `admin:org`. Once per
-organization, create the group for the private consumers that use it:
-
-```bash
-gh api -X POST orgs/autumngarage/actions/runner-groups -f name=linux-ephemeral \
-  -f visibility=selected -F allows_public_repositories=false \
-  -F 'selected_repository_ids[]=<repository id>'   # one per repository
-```
-
-Then, on the host, from a checkout of this repository:
-
-```bash
-bash runner/linux-runner.sh build     # the job image, from runner/Dockerfile
-bash runner/linux-runner.sh install   # a LaunchAgent that keeps the slots running, under caffeinate
-bash runner/linux-runner.sh status
-gh variable set LINUX_RUNNER --org autumngarage --visibility selected \
-  --repos '<the group repositories, comma-separated>' --body linux-ephemeral
-```
-
-`caffeinate -i` keeps the Mac from idle-sleeping while the agent runs; a
-closed lid still sleeps it, and queued jobs wait until it wakes. To move the
-fleet to another machine, install there and uninstall here
-(`bash runner/linux-runner.sh uninstall`); the label does not change. To go
-back to GitHub-hosted runners, `gh variable delete LINUX_RUNNER --org
-autumngarage`.
-
-#### On a headless Mac that runs other CI too
-
-A LaunchAgent lives in its user's login session, and `admin:org` in a login
-keychain is readable by anything that runs as that user. On a Mac that also
-hosts a persistent macOS runner, whose jobs run branch code as their own
-user, run the fleet at boot as an account that runs nothing else, with a
-token only it can read:
-
-1. Create a standard account for the fleet (e.g. `linuxci`) and never log in
-   as it. Install Colima and the Docker CLI once (`brew install colima docker`;
-   Docker Desktop needs a login session, Colima does not).
-2. Create a fine-grained token owned by the organization with one
-   organization permission, **Self-hosted runners: read and write**, and write
-   it where the daemon reads it, private to the fleet's account:
-
-   ```bash
-   sudo -u linuxci -H bash -c 'd="$HOME/Library/Application Support/linux-ephemeral-runner"
-     mkdir -p "$d" && umask 077 && cat >"$d/github-token"'   # paste the token, then Ctrl-D
-   ```
-
-3. Build the image as that account, from a checkout it can read (the build
-   starts the account's Colima VM; `sudo` resets `PATH`, so name Homebrew's),
-   then install the daemon:
-
-   ```bash
-   sudo -u linuxci -H env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
-     LINUX_RUNNER_ENGINE=colima bash runner/linux-runner.sh build
-   sudo bash runner/linux-runner.sh install-daemon linuxci
-   bash runner/linux-runner.sh status
-   ```
-
-The daemon starts before anyone logs in and after every reboot, starts the
-Colima VM if it is down, and keeps the slots running; its log is the
-account's `~/Library/Logs/linux-ephemeral-runner.log`. `sudo bash
-runner/linux-runner.sh uninstall-daemon` removes it.
-
-A required workflow runs in the consumer repository's context and reads the
-variables visible to that repository; a repository variable overrides the
-organization's. Confirm on the first run after setting it: the job's "Set up
-job" step names the runner that took it. If the organization variable does not
-resolve there, set it per repository instead:
-`gh variable set LINUX_RUNNER -R autumngarage/<repository> --body linux-ephemeral`.
+`delivery-evidence` and the `source contract` job run for seconds and always
+run on GitHub-hosted `ubuntu-latest`. macOS jobs keep their own routing.
 
 ### macOS runner pool (AUT-2013)
 
@@ -358,9 +167,15 @@ that must not overlap itself in the account selects it: cleanup that stops the
 account's processes (hesperus), and the smoke, whose macOS grants belong to
 that runner.
 
-**Queue priority (AUT-2813).** `MACOS_RUNNER_QUEUE_SLOTS` opts the Mac pool
-into the same demand-based registration policy as the Linux fleet. It defaults
-to `0`. Shared registrations also advertise `ci-studio-pool-shared`; consumers
+**Queue priority (AUT-2813).** `MACOS_RUNNER_QUEUE_SLOTS=N` opts the Mac pool
+into demand-based registration (`runner/queue.sh`, AUT-2704/AUT-2757). It
+defaults to `0`. GitHub does not hand a freed runner to the job that has waited
+longest, and a pull request ships only through the queue, so the supervisor
+chooses each new runner's role when it registers, from what is waiting: a
+queue-only runner when queue jobs wait beyond the idle queue-only runners;
+otherwise a queue-only slot among the first `N` while no pull-request job
+waits; otherwise a shared one. At most `SLOTS-1` runners are queue-only at
+once. Shared registrations also advertise `ci-studio-pool-shared`; consumers
 can require that extra label outside `merge_group`, leaving queue jobs able to
 use either role. At least one slot stays shared. Idle queue-only registrations
 are recycled when PRs wait and no queue job needs them. Demand includes queued
@@ -387,19 +202,18 @@ environment and never as a process argument. Root does no file work in the
 account's home; the account copies `ci-studio`'s runner files into each slot
 (`tests/test-macos-runner.sh` pins both). The runners are single-use, but the
 host is shared with `ci-studio`'s persistent runner, so the pool registers
-into the same runner group, `macos`, and checks it before every registration
-as `linux-runner.sh` does: visible only to selected repositories, and holding
-only private ones.
+into the same runner group, `macos`, and checks it before every registration:
+visible only to selected repositories, and holding only private ones.
 
 On the Mac, with the account logged in and `ci-studio` registered, give root a
-copy of the Linux fleet's token (the same one permission, **Self-hosted
-runners: read and write**), then install:
+fine-grained token owned by the organization with the one organization
+permission **Self-hosted runners: read and write** (and **Actions: read** on the
+group's repositories for queue priority), then install:
 
 ```bash
 state="/Library/Application Support/com.autumngarage.macos-pool-runner"
 sudo install -d -m 700 -o root -g wheel "$state"
-sudo install -m 600 -o root -g wheel \
-  "/Users/linuxci/Library/Application Support/linux-ephemeral-runner/github-token" "$state/github-token"
+sudo install -m 600 -o root -g wheel <token file> "$state/github-token"
 sudo bash runner/macos-runner.sh install-daemon      # MACOS_RUNNER_SLOTS=3 for more slots
 sudo bash runner/macos-runner.sh status
 gh variable set MACOS_TEST_RUNNER --repo autumngarage/nyx --body ci-studio-pool

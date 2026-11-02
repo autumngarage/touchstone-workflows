@@ -44,7 +44,7 @@
 #   MACOS_RUNNER_GROUP      runner group, restricted to the private consumers (macos)
 #   MACOS_RUNNER_LABEL      the label pool jobs select (ci-studio-pool)
 #   MACOS_RUNNER_SLOTS      pool jobs run at once, beside the first runner (2)
-#   MACOS_RUNNER_QUEUE_SLOTS  queue reservation using the Linux fleet's shared
+#   MACOS_RUNNER_QUEUE_SLOTS  queue reservation using the shared
 #                           demand policy (0: disabled). Before enabling, every
 #                           non-merge-group consumer must also select LABEL-shared.
 #                           Must be fewer than SLOTS; needs Actions read access.
@@ -52,7 +52,7 @@
 #   MACOS_RUNNER_STATE_DIR  root's directory for the token, the installed copy,
 #                           and slot state (/Library/Application Support/$AGENT_ID)
 #   MACOS_RUNNER_TOKEN_FILE the GitHub token, private to root (STATE_DIR/github-token);
-#                           the kind linux-runner.sh uses: a fine-grained token with
+#                           a fine-grained token with
 #                           the organization permission "Self-hosted runners: read and write"
 #   MACOS_RUNNER_RESTART_AFTER
 #                           seconds USER may be without a login session before the
@@ -123,7 +123,7 @@ SESSION_STALE_CMD="${MACOS_RUNNER_SESSION_STALE_CMD:-}"
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # log, die, need, the token file, the runner-group check, and just-in-time
-# registration, shared with runner/linux-runner.sh.
+# registration.
 # shellcheck source=runner/jit.sh
 . "$here/jit.sh"
 # shellcheck source=runner/queue.sh
