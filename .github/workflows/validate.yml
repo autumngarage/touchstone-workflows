@@ -106,8 +106,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="d2031284cff02a088a04987e0327f71e058c79ba"
-          touchstone_sha256="9de43e0c028ad6e4771b47338cbd88b0aab3d17600ab401ca17f17dfd4f9d5ef"
+          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
+          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -217,13 +217,39 @@ jobs:
           git config --global user.name "Touchstone CI"
           git config --global init.defaultBranch main
 
+      - name: Fetch pinned Touchstone validator
+        run: |
+          set -euo pipefail
+          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
+          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          validator="$RUNNER_TEMP/touchstone-run.sh"
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
+            --output "$validator"
+          printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
+
+      - name: Prepare declared validation setup
+        if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
+        env:
+          VALIDATION_GROUP: ${{ matrix.group }}
+        run: |
+          set -euo pipefail
+          group_args=()
+          if [ -n "$VALIDATION_GROUP" ]; then
+            group_args=(--group "$VALIDATION_GROUP")
+          fi
+          bash "$RUNNER_TEMP/touchstone-run.sh" prepare \
+            --project "$GITHUB_WORKSPACE" \
+            "${group_args[@]}" \
+            --json
+
       - name: Identify optional Swift build cache
         id: swift-cache
         if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
         env:
           CACHE_OS: ${{ runner.os }}
           CACHE_ARCH: ${{ runner.arch }}
-          CACHE_GRAPH: ${{ hashFiles('**/Package.swift', '**/Package.resolved', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}
+          CACHE_GRAPH: ${{ hashFiles('**/Package.swift', '**/Package.resolved', '.swift-version', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}
           CACHE_REVISION: ${{ github.sha }}
           CACHE_EVENT: ${{ github.event_name }}
           CACHE_REF: ${{ github.ref }}
@@ -231,7 +257,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! command -v swift >/dev/null 2>&1; then
-            echo "Swift cache skipped: the runner has no preinstalled toolchain."
+            echo "Swift cache skipped: declared setup left no Swift toolchain."
             exit 0
           fi
           toolchain="$(swift --version | sha256sum | cut -d ' ' -f 1)"
@@ -255,17 +281,6 @@ jobs:
           key: ${{ steps.swift-cache.outputs.key }}
           restore-keys: ${{ steps.swift-cache.outputs.prefix }}
 
-      - name: Fetch pinned Touchstone validator
-        run: |
-          set -euo pipefail
-          touchstone_revision="d2031284cff02a088a04987e0327f71e058c79ba"
-          touchstone_sha256="9de43e0c028ad6e4771b47338cbd88b0aab3d17600ab401ca17f17dfd4f9d5ef"
-          validator="$RUNNER_TEMP/touchstone-run.sh"
-          curl --fail --silent --show-error --location \
-            "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
-            --output "$validator"
-          printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
-
       - name: Run declared validation
         env:
           # Empty for the serial run (cache seeds, engines without a groups
@@ -275,6 +290,9 @@ jobs:
           TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY: ${{ steps.restore-swift-cache.outputs.cache-matched-key }}
         run: |
           set -euo pipefail
+          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          validator="$RUNNER_TEMP/touchstone-run.sh"
+          printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
           group_args=()
           if [ -n "$VALIDATION_GROUP" ]; then
             group_args=(--group "$VALIDATION_GROUP")
@@ -292,7 +310,7 @@ jobs:
           set -euo pipefail
           actual="$(swift --version | sha256sum | cut -d ' ' -f 1)"
           if [ "$actual" != "$EXPECTED_TOOLCHAIN" ]; then
-            echo "SWIFT_BUILD_CACHE requires validation setup to retain the preinstalled Swift toolchain." >&2
+            echo "SWIFT_BUILD_CACHE requires validation to retain the prepared Swift toolchain." >&2
             exit 1
           fi
 

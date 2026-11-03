@@ -218,14 +218,15 @@ assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 # one group. The source-contract job fetches its own copy by contract.
 assert_count 3 'uses: actions/checkout@[0-9a-f]{40}'
 assert_count 2 'touchstone_revision="[0-9a-f]{40}"'
-assert_count 2 'touchstone_sha256="[0-9a-f]{64}"'
+assert_count 3 'touchstone_sha256="[0-9a-f]{64}"'
 assert_count 3 'raw\.githubusercontent\.com/autumngarage/touchstone/'
-assert_count 3 'sha256sum --check --strict'
+assert_count 4 'sha256sum --check --strict'
 assert_count 2 'touchstone-run\.sh" validate'
+assert_count 1 'touchstone-run\.sh" prepare'
 # The workflow must pass the runner-provided variable literally.
 # shellcheck disable=SC2016
-assert_count 2 '--project "\$GITHUB_WORKSPACE"'
-assert_count 2 '--json'
+assert_count 3 '--project "\$GITHUB_WORKSPACE"'
+assert_count 3 '--json'
 # The merge queue tests a temporary merge commit; a required check that does
 # not report there ejects every queue entry.
 assert_count 1 '^  merge_group:'
@@ -266,7 +267,7 @@ for gate in "$review_gate" "$delivery_evidence"; do grep -q "PLACEHOLDER" "$gate
 assert_active_line_count "$workflow" 2 \
   '"https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \' \
   "validator fetch"
-assert_active_line_count "$workflow" 2 \
+assert_active_line_count "$workflow" 3 \
   "printf '%s  %s\\n' \"\$touchstone_sha256\" \"\$validator\" | sha256sum --check --strict" \
   "validator checksum"
 # The source manifest owns engine compatibility. The consumer workflow keeps
@@ -283,8 +284,8 @@ jq -e '
 ' "$source_contract" >/dev/null || fail "$source_contract: invalid validation-engine contract"
 manifest_engine_revision="$(jq -r '.validationEngine.revision' "$source_contract")"
 manifest_engine_sha256="$(jq -r '.validationEngine.sha256' "$source_contract")"
-# Both fetch sites pin the same engine; collapse identical pins so any
-# drift between them still differs from the manifest and stays fatal.
+# Fetches and the post-preparation execution check bind the same engine;
+# collapsing identical pins makes drift at any boundary fatal.
 workflow_engine_revision="$(sed -n 's/^[[:space:]]*touchstone_revision="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow" | sort -u)"
 workflow_engine_sha256="$(sed -n 's/^[[:space:]]*touchstone_sha256="\([0-9a-f][0-9a-f]*\)"$/\1/p' "$workflow" | sort -u)"
 [ "$workflow_engine_revision" = "$manifest_engine_revision" ] \
@@ -321,6 +322,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       '' \
       '[validation]' \
       'runtime = "bash"' \
+      'setup = "touch setup-ran"' \
       '' \
       '[[validation.targets]]' \
       'name = "root"' \
@@ -345,13 +347,18 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       || fail "declared validation engine rejected project schema $schema"
     jq -e --argjson schema "$schema" '.schema == $schema and .verdict == "valid"' "$project/result.json" >/dev/null \
       || fail "declared validation engine reported the wrong result for project schema $schema"
+    bash "$TOUCHSTONE_ENGINE_PATH" prepare --project "$project" --json >"$project/preparation.json" \
+      || fail "declared validation engine failed to prepare project schema $schema"
+    jq -e '.verdict == "prepared" and .ran == 0 and .failed == 0' "$project/preparation.json" >/dev/null \
+      || fail "preparation claimed validation for schema $schema"
+    [ -f "$project/setup-ran" ] || fail "preparation skipped declared setup"
     bash "$TOUCHSTONE_ENGINE_PATH" validate --project "$project" --json >"$project/execution.json" \
       || fail "declared validation engine failed project schema $schema through the production path"
     jq -e '.verdict == "passed" and .ran == 1 and .skipped == 0 and .failed == 0' "$project/execution.json" >/dev/null \
       || fail "declared validation engine reported the wrong production result for project schema $schema"
   done
   rm -rf "$engine_fixture"
-  echo "  OK: declared validation engine accepts project schemas 1 and 2"
+  echo "  OK: declared validation engine prepares and validates project schemas 1-3"
 fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$review_gate" \
