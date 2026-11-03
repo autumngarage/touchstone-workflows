@@ -83,9 +83,13 @@ source delivery alone does not change its live scheduling.
 
 Consumers can opt into the validation workflow's SwiftPM cache with the
 repository variable `SWIFT_BUILD_CACHE=true`. It applies to Linux runners with
-a preinstalled Swift toolchain and a checked-in `Package.resolved`. Validation
-setup must retain that toolchain; a change fails the job before cache save.
-Without a preinstalled toolchain, validation runs normally without a cache.
+a checked-in `Package.resolved`. Declared setup runs before fingerprinting the
+toolchain and restoring its cache, so it can select or install a compiler.
+Installers must expose their selected path to later Actions steps. Setup must
+be idempotent: ordinary validation runs it again and must retain the prepared
+compiler; a later change fails before cache save. Without Swift after
+preparation, validation runs normally without a cache. Non-cache consumers
+retain their single ordinary setup run.
 
 The workflow owns the cache key and its inputs. It separates platform,
 architecture, toolchain and dependency/build declarations, with a compatible
