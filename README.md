@@ -79,6 +79,21 @@ increase their resources. Changing a consumer's setting or adopting a new
 required-workflow pin requires that consumer's normal approval and rollout;
 source delivery alone does not change its live scheduling.
 
+## Git history transfer
+
+`VALIDATION_BLOBLESS_CHECKOUT=true` opts the candidate-execution checkout into
+Git's `blob:none` partial fetch. Its full commit/tree history, refs and exact
+worktree remain available; historical file contents are fetched from GitHub
+when a command needs them. Unset or false keeps the existing complete fetch.
+The source-contract and planning checkouts do not change.
+
+Opt in only after auditing historical readers: missing blobs require a
+reachable origin and checkout credentials during validation. An offline
+history reader or a reader after credential cleanup must retain a complete
+checkout. Lazy fetches can offset the initial transfer reduction; measure a
+complete ordinary validation, not just checkout. Adopting the reviewed
+workflow pin and the consumer setting is a separate normal rollout.
+
 ## Swift build caches
 
 Consumers can opt into the validation workflow's SwiftPM cache with the

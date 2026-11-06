@@ -217,6 +217,109 @@ assert_active_line "$workflow" 'timeout_minutes:' "validate timeout input"
 # it against the candidate: the plan to read its groups, each shard to run
 # one group. The source-contract job fetches its own copy by contract.
 assert_count 3 'uses: actions/checkout@[0-9a-f]{40}'
+# Preserve full history; only candidate execution may opt out of eagerly
+# transferring historical blobs. The other checkout owners remain unchanged.
+ruby -rpsych - "$workflow" <<'RUBY'
+document = Psych.parse_file(ARGV.fetch(0)).to_ruby
+checkouts = []
+document.fetch('jobs').each do |job_name, job|
+  (job['steps'] || []).each do |step|
+    checkouts << [job_name, step] if step.fetch('uses', '').start_with?('actions/checkout@')
+  end
+end
+candidate = checkouts.select { |job, step| job == 'validate-groups' && step['name'] == 'Checkout target repository' }
+raise 'candidate checkout must be unique' unless candidate.length == 1
+settings = candidate.first.last.fetch('with')
+expected = "${{ vars.VALIDATION_BLOBLESS_CHECKOUT == 'true' && 'blob:none' || '' }}"
+raise 'candidate checkout must retain full history' unless settings['fetch-depth'] == 0
+raise 'candidate checkout filter must remain explicitly opt-in with an empty default' unless settings['filter'] == expected
+checkouts.each do |job, step|
+  next if job == 'validate-groups' && step['name'] == 'Checkout target repository'
+  raise 'only candidate checkout may configure a filter' if step.fetch('with', {}).key?('filter')
+end
+RUBY
+
+# Exercise Git's real protocol once, not for each recursive structural fixture.
+# Mirror checkout's init/fetch-all-refspecs/checkout sequence, including a merge.
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+(
+  history_fixture="$(mktemp -d)"
+  trap 'rm -rf "$history_fixture"' EXIT HUP INT TERM
+  seed="$history_fixture/seed"
+  git init -q -b main "$seed"
+  git -C "$seed" config user.email fixture@example.invalid
+  git -C "$seed" config user.name fixture
+  git -C "$seed" config uploadpack.allowFilter true
+  python3 - "$seed/old.bin" <<'PY'
+import random, sys
+from pathlib import Path
+Path(sys.argv[1]).write_bytes(random.Random(0).randbytes(16384))
+PY
+  cp "$seed/old.bin" "$history_fixture/old.bin"
+  printf 'base\n' >"$seed/README"
+  git -C "$seed" add README old.bin
+  git -C "$seed" commit -qm initial
+  old_commit="$(git -C "$seed" rev-parse HEAD)"
+  old_blob="$(git -C "$seed" rev-parse HEAD:old.bin)"
+  git -C "$seed" rm -q old.bin
+  git -C "$seed" commit -qm remove-old-file
+  base="$(git -C "$seed" rev-parse HEAD)"
+  git -C "$seed" tag fixture-base "$base"
+  git -C "$seed" checkout -qb feature
+  printf 'feature\n' >"$seed/feature.txt"
+  git -C "$seed" add feature.txt
+  git -C "$seed" commit -qm feature
+  feature="$(git -C "$seed" rev-parse HEAD)"
+  git -C "$seed" checkout -q main
+  printf 'main\n' >"$seed/main.txt"
+  git -C "$seed" add main.txt
+  git -C "$seed" commit -qm main
+  main="$(git -C "$seed" rev-parse HEAD)"
+  queue_ref="gh-readonly-queue/main/pr-7-$base"
+  git -C "$seed" checkout -qb "$queue_ref"
+  git -C "$seed" merge -q --no-ff feature -m candidate
+  candidate="$(git -C "$seed" rev-parse HEAD)"
+  git -C "$seed" archive "$candidate" >"$history_fixture/expected.tar"
+  git -C "$seed" diff --name-only --no-renames "$base" "$candidate" >"$history_fixture/expected-paths"
+  for filter in full blobless; do
+    checkout="$history_fixture/$filter"
+    git init -q "$checkout"
+    git -C "$checkout" remote add origin "file://$seed"
+    # File transport is this fixture's stand-in for authenticated GitHub HTTPS.
+    git -C "$checkout" config protocol.file.allow always
+    options=()
+    [ "$filter" != blobless ] || options=(--filter=blob:none)
+    git -C "$checkout" -c protocol.version=2 fetch -q --no-tags --prune --no-recurse-submodules \
+      ${options[@]+"${options[@]}"} origin '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+    git -C "$checkout" checkout -q -B "$queue_ref" "refs/remotes/origin/$queue_ref"
+    [ "$(git -C "$checkout" rev-parse HEAD)" = "$candidate" ] || fail 'checkout changed candidate identity'
+    [ "$(git -C "$checkout" rev-parse 'HEAD^{tree}')" = "$(git -C "$seed" rev-parse 'HEAD^{tree}')" ] || fail 'checkout changed candidate tree'
+    [ "$(git -C "$checkout" rev-parse HEAD^1)" = "$main" ] || fail 'checkout lost first parent'
+    [ "$(git -C "$checkout" rev-parse HEAD^2)" = "$feature" ] || fail 'checkout lost second parent'
+    [ "$(git -C "$checkout" merge-base HEAD^1 HEAD^2)" = "$base" ] || fail 'checkout lost merge base'
+    [ "$(git -C "$checkout" rev-parse refs/tags/fixture-base)" = "$base" ] || fail 'checkout lost tag'
+    [ "$(git -C "$checkout" rev-parse --is-shallow-repository)" = false ] || fail 'checkout became shallow'
+    [ -z "$(git -C "$checkout" status --porcelain)" ] || fail 'checkout worktree differs'
+    git -C "$checkout" diff --name-only --no-renames "$base" HEAD >"$history_fixture/paths"
+    cmp "$history_fixture/paths" "$history_fixture/expected-paths" || fail 'checkout changed path selection'
+    git -C "$checkout" archive HEAD >"$history_fixture/actual.tar"
+    cmp "$history_fixture/expected.tar" "$history_fixture/actual.tar" || fail 'checkout changed current archive'
+    git -C "$checkout" rev-list --objects --all --missing=print >"$history_fixture/objects"
+    if [ "$filter" = blobless ]; then
+      grep -Fxq "?$old_blob" "$history_fixture/objects" || fail 'unused historical blob was transferred eagerly'
+      git -C "$checkout" remote set-url origin "file://$history_fixture/disconnected"
+      if git -C "$checkout" show "$old_commit:old.bin" >"$history_fixture/absent" 2>"$history_fixture/disconnected.log"; then
+        fail 'a disconnected historical read silently succeeded'
+      fi
+      git -C "$checkout" remote set-url origin "file://$seed"
+    else
+      if grep -Fxq "?$old_blob" "$history_fixture/objects"; then fail 'default checkout lost historical blob'; fi
+    fi
+    git -C "$checkout" show "$old_commit:old.bin" >"$history_fixture/returned.bin"
+    cmp "$history_fixture/old.bin" "$history_fixture/returned.bin" || fail 'historical read changed bytes'
+  done
+)
+fi
 assert_count 2 'touchstone_revision="[0-9a-f]{40}"'
 assert_count 3 'touchstone_sha256="[0-9a-f]{64}"'
 assert_count 3 'raw\.githubusercontent\.com/autumngarage/touchstone/'
