@@ -34,6 +34,14 @@ on:
         description: Run on this runner instead of the routed one (local, blacksmith or github).
         type: string
         default: ''
+      separate_scheduled_validation:
+        description: Give an opted-in caller's scheduled validation a separate concurrency group from its seeds.
+        type: boolean
+        default: false
+      force_full_checkout:
+        description: Keep a complete checkout even when the repository opts into blobless history.
+        type: boolean
+        default: false
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, edited]
   push:
@@ -47,8 +55,10 @@ on:
 # head's run, which would otherwise finish and bill for a verdict nobody reads
 # (AUT-1591). A merge-queue run is never cancelled: the queue owns that
 # verdict, and each queue entry has its own ref, so no two share a group.
+# The called workflow sees the caller's ref. A caller that separates its
+# scheduled validation must opt in here too, or both roles share this key.
 concurrency:
-  group: validate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  group: validate-${{ github.repository }}-${{ inputs.separate_scheduled_validation && github.event_name == 'schedule' && 'schedule-' || '' }}${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
@@ -210,7 +220,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
-          filter: ${{ vars.VALIDATION_BLOBLESS_CHECKOUT == 'true' && 'blob:none' || '' }}
+          filter: ${{ inputs.force_full_checkout != true && vars.VALIDATION_BLOBLESS_CHECKOUT == 'true' && 'blob:none' || '' }}
 
       - name: Configure git identity
         run: |
