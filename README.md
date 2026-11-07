@@ -85,7 +85,9 @@ source delivery alone does not change its live scheduling.
 Git's `blob:none` partial fetch. Its full commit/tree history, refs and exact
 worktree remain available; historical file contents are fetched from GitHub
 when a command needs them. Unset or false keeps the existing complete fetch.
-The source-contract and planning checkouts do not change.
+The source-contract and planning checkouts do not change. A reusable caller
+can pass `force_full_checkout: true` to retain a complete checkout when
+adopting a new pin. The default leaves the repository opt-in in control.
 
 Opt in only after auditing historical readers: missing blobs require a
 reachable origin and checkout credentials during validation. An offline
@@ -123,6 +125,12 @@ the same validator, so it cannot drift into a second validation implementation.
 The protected workflow pin, consumer producer and repository opt-in must all be
 deployed before measuring cold/warm improvements. Passing the source contract
 alone is not evidence of a consumer cache hit or reduced build time.
+
+A caller that schedules full validation separately from its seeds can pass
+`separate_scheduled_validation: true` to separate the called workflow's group
+as well. The option affects only the schedule event; seed coalescing, pull
+request replacement and merge-queue validation retain their existing keys.
+The two roles may then overlap, so peak runner demand can increase.
 
 Validation keeps a 30-minute limit for consumers without
 `SWIFT_BUILD_CACHE=true`. Swift-cache consumers get 60 minutes: the

@@ -221,6 +221,34 @@ assert_count 3 'uses: actions/checkout@[0-9a-f]{40}'
 # transferring historical blobs. The other checkout owners remain unchanged.
 ruby -rpsych - "$workflow" <<'RUBY'
 document = Psych.parse_file(ARGV.fetch(0)).to_ruby
+# Bind the actual group template to the caller contexts used by cache runs.
+# The old template resolves the opted-in schedule to the same key as a seed.
+group = document.fetch('concurrency').fetch('group')
+main = 'refs/heads/main'
+queue = 'refs/heads/gh-readonly-queue/main/pr-17-candidate'
+[
+  ['schedule', true, main, nil, "schedule-#{main}"],
+  ['schedule', false, main, nil, main],
+  ['schedule', nil, main, nil, main],
+  ['push', true, main, nil, main],
+  ['workflow_dispatch', true, main, nil, main],
+  ['pull_request', true, 'refs/pull/17/merge', '17', '17'],
+  ['merge_group', true, queue, nil, queue],
+].each do |event, opted_in, ref, number, expected|
+  substitutions = {
+    '${{ github.repository }}' => 'autumngarage/hesperus',
+    '${{ github.event.pull_request.number || github.ref }}' => number || ref,
+    "${{ inputs.separate_scheduled_validation && github.event_name == 'schedule' && 'schedule-' || '' }}" =>
+      opted_in && event == 'schedule' ? 'schedule-' : '',
+  }
+  resolved = group.gsub(/\$\{\{ [^}]+ \}\}/) { |part| substitutions.fetch(part) }
+  raise "unexpected validation group for #{event}/#{opted_in.inspect}: #{resolved}" unless resolved == "validate-autumngarage/hesperus-#{expected}"
+end
+inputs = (document['on'] || document.fetch(true)).fetch('workflow_call').fetch('inputs')
+%w[separate_scheduled_validation force_full_checkout].each do |name|
+  option = inputs.fetch(name)
+  raise "#{name} must be a default-off boolean" unless option['type'] == 'boolean' && option['default'] == false
+end
 checkouts = []
 document.fetch('jobs').each do |job_name, job|
   (job['steps'] || []).each do |step|
@@ -230,9 +258,9 @@ end
 candidate = checkouts.select { |job, step| job == 'validate-groups' && step['name'] == 'Checkout target repository' }
 raise 'candidate checkout must be unique' unless candidate.length == 1
 settings = candidate.first.last.fetch('with')
-expected = "${{ vars.VALIDATION_BLOBLESS_CHECKOUT == 'true' && 'blob:none' || '' }}"
+expected = "${{ inputs.force_full_checkout != true && vars.VALIDATION_BLOBLESS_CHECKOUT == 'true' && 'blob:none' || '' }}"
 raise 'candidate checkout must retain full history' unless settings['fetch-depth'] == 0
-raise 'candidate checkout filter must remain explicitly opt-in with an empty default' unless settings['filter'] == expected
+raise 'candidate checkout must honor full-checkout override and the existing blobless opt-in' unless settings['filter'] == expected
 checkouts.each do |job, step|
   next if job == 'validate-groups' && step['name'] == 'Checkout target repository'
   raise 'only candidate checkout may configure a filter' if step.fetch('with', {}).key?('filter')
@@ -492,9 +520,6 @@ assert_active_line "$review_gate" \
 # AUT-1591: a newer push supersedes the older head's validation and evidence
 # runs too, and a merge-queue run is never cancelled. Each workflow keeps its
 # own group so one cannot cancel another's run.
-assert_active_line "$workflow" \
-  'group: validate-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}' \
-  "validation run concurrency identity"
 assert_active_line "$workflow" \
   'cancel-in-progress: ${{ github.event_name == '\''pull_request'\'' }}' \
   "pull-request validation run replacement"
