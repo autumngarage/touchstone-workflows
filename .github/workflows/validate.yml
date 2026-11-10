@@ -258,6 +258,8 @@ jobs:
         id: swift-cache
         if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
         env:
+          CACHE_SKIP_GROUPS: ${{ vars.SWIFT_BUILD_CACHE_SKIP_GROUPS }}
+          VALIDATION_GROUP: ${{ matrix.group }}
           CACHE_OS: ${{ runner.os }}
           CACHE_ARCH: ${{ runner.arch }}
           CACHE_GRAPH: ${{ hashFiles('**/Package.swift', '**/Package.resolved', '.swift-version', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}
@@ -267,6 +269,14 @@ jobs:
           CACHE_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
+          if [ -n "${VALIDATION_GROUP:-}" ]; then
+            case ",${CACHE_SKIP_GROUPS:-}," in
+              *,"$VALIDATION_GROUP",*)
+                echo "Swift cache skipped for validation group $VALIDATION_GROUP."
+                exit 0
+                ;;
+            esac
+          fi
           if ! command -v swift >/dev/null 2>&1; then
             echo "Swift cache skipped: declared setup left no Swift toolchain."
             exit 0

@@ -101,6 +101,19 @@ with tempfile.TemporaryDirectory() as temporary:
     assert baseline["prefix"] == newer["prefix"] and baseline["key"] != newer["key"]
     assert baseline["key"] == baseline["prefix"] + "head-a"
     assert baseline["save"] == "true"
+    for event, configured in (
+        ("pull_request", "checks-b,checks"),
+        ("merge_group", "checks,checks-b,swift-other"),
+        ("schedule", "checks,checks-b"),
+    ):
+        skipped = identify(CACHE_EVENT=event, VALIDATION_GROUP="checks-b", CACHE_SKIP_GROUPS=configured)
+        assert skipped == {}, (event, skipped)
+    for configured in ("", "checks", "checks-b-extra", "extra-checks-b", "CHECKS-B", " checks-b"):
+        assert identify(VALIDATION_GROUP="checks-b", CACHE_SKIP_GROUPS=configured) == baseline, configured
+    for event in ("push", "workflow_dispatch"):
+        assert identify(CACHE_EVENT=event, VALIDATION_GROUP="", CACHE_SKIP_GROUPS="checks-b,all,") == baseline
+    assert key["env"]["CACHE_SKIP_GROUPS"] == "${{ vars.SWIFT_BUILD_CACHE_SKIP_GROUPS }}"
+    assert key["env"]["VALIDATION_GROUP"] == prepare["env"]["VALIDATION_GROUP"]
     assert identify(CACHE_EVENT="workflow_dispatch")["save"] == "true"
     assert identify(CACHE_REF="refs/heads/trunk", CACHE_DEFAULT_BRANCH="trunk")["save"] == "true"
     for change in (
@@ -165,6 +178,13 @@ esac
     subprocess.run(["bash", "-c", validation_shell], env=prepared_env, check=True)
     assert task.exists() and "validate --project" in calls.read_text()
     subprocess.run(["bash", "-c", check["run"]], env=dict(prepared_env, EXPECTED_TOOLCHAIN=selected["toolchain"]), check=True)
+
+    task.unlink()
+    without_cache = dict(transport_env, VALIDATION_GROUP="checks-b", CACHE_SKIP_GROUPS="checks-b")
+    subprocess.run(["bash", "-c", prepare["run"]], env=without_cache, check=True)
+    assert identify(VALIDATION_GROUP="checks-b", CACHE_SKIP_GROUPS="checks-b") == {}
+    subprocess.run(["bash", "-c", validation_shell], env=without_cache, check=True)
+    assert task.exists() and "--group checks-b" in calls.read_text()
 
     task.unlink()
     failed = subprocess.run(["bash", "-c", prepare["run"]], env=dict(transport_env, PREPARE_FAIL="true"), capture_output=True, text=True)
