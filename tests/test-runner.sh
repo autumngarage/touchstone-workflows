@@ -7,7 +7,16 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 script="$root/runner/linux-runner.sh"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+drain_supervisor=
+cleanup() {
+  # Only this fixture's isolated process group may still hold fake jobs.
+  if [ -n "$drain_supervisor" ]; then
+    kill -KILL -- "-$drain_supervisor" 2>/dev/null || true
+    wait "$drain_supervisor" 2>/dev/null || true
+  fi
+  rm -rf "$tmp"
+}
+trap cleanup EXIT
 
 fail() {
   echo "FAIL: $*" >&2
@@ -39,7 +48,9 @@ case "$*" in
     exit 0
     ;;
   *generate-jitconfig*)
-    if [ -f "$FAKE_STATE/jit-fails" ] && [ ! -f "$FAKE_STATE/jit-failed" ]; then
+    if { [ -f "$FAKE_STATE/jit-fails" ] ||
+        { [ -f "$FAKE_STATE/hold-for-drain" ] && [[ "$*" == *name=linux-ephemeral-testhost-1-* ]]; }; } &&
+      [ ! -f "$FAKE_STATE/jit-failed" ]; then
       touch "$FAKE_STATE/jit-failed"
       echo "HTTP 502: Bad Gateway" >&2
       exit 1
@@ -70,8 +81,22 @@ case "$1" in
     # What the container reads on stdin, where the configuration must arrive.
     case " $* " in *" -i "*) printf 'docker-stdin %s\n' "$(cat)" >>"$FAKE_CALLS" ;; esac
     echo run >>"$FAKE_STATE/started"
-    # A real runner waits for its job; HOLD says for how long.
-    /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
+    if [ -f "$FAKE_STATE/hold-for-drain" ]; then
+      case " $* " in
+        *" --name linux-ephemeral-testhost-1-"*) slot=1 ;;
+        *" --name linux-ephemeral-testhost-2-"*) slot=2 ;;
+        *) exit 1 ;;
+      esac
+      touch "$FAKE_STATE/started-$slot"
+      deadline=$((SECONDS + 20))
+      until [ -f "$FAKE_STATE/release-drain" ]; do
+        [ "$SECONDS" -lt "$deadline" ] || exit 1
+        /bin/sleep 0.1
+      done
+      touch "$FAKE_STATE/finished-$slot"
+    else
+      /bin/sleep "${FAKE_DOCKER_HOLD:-0}"
+    fi
     # newsyslog rotating the supervisor's log while a job runs.
     if [ -f "$FAKE_STATE/rotate-log" ] && [ -n "${LINUX_RUNNER_LOG_FILE:-}" ]; then
       mv "$LINUX_RUNNER_LOG_FILE" "$LINUX_RUNNER_LOG_FILE.0"
@@ -219,7 +244,11 @@ SLOTS=3 runner run
 [ "$rc" -eq 0 ] || fail "a three-slot run exited $rc: $(cat "$tmp/out")"
 for slot in 1 2 3; do
   [ "$(grep 'generate-jitconfig' "$tmp/calls" | grep -c -- "name=linux-ephemeral-testhost-$slot-")" -eq 1 ] \
-    || fail "slot $slot did not register exactly once: $(cat "$tmp/calls")"
+    || fail "slot $slot did not register exactly once
+Supervisor output
+$(cat "$tmp/out")
+Fake calls
+$(cat "$tmp/calls")"
 done
 lacks '-shared' "identical slots"
 grep -Fq 'supervising 3 identical slot(s)' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
@@ -268,29 +297,49 @@ grep -Fq 'could not remove stale offline registration 999' "$tmp/out" || fail "a
 ok "before any slot registers, this host's offline registrations are removed, and a refusal is logged"
 
 echo "==> a stop signal drains: running jobs finish, nothing new registers (AUT-2763)"
-# A supervisor holding two jobs (4 s each). The first TERM arrives while they
-# run: both must finish, no third runner may register, and it exits cleanly.
+# Keep two distinct jobs running through the drain acknowledgement. One
+# deliberate startup refusal proves the registration count starts at TERM.
 # Job control gives the supervisor its own process group, which stop_slots ends.
 set -m
 rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/home"
 mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
 : >"$tmp/calls"
-touch "$tmp/fake/delete-ok"
+touch "$tmp/fake/delete-ok" "$tmp/fake/hold-for-drain"
 PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
   LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=2 LINUX_RUNNER_MAX_JOBS=5 \
   LINUX_RUNNER_ENGINE=docker LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
-  FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD=4 FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=none \
+  FAKE_HOME="$tmp/home" FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=1 \
   LINUX_RUNNER_DRAIN_INTERVAL=1 \
   bash "$script" run >"$tmp/out" 2>&1 &
-sup=$!
-until [ "$(grep -c '^run$' "$tmp/fake/started" 2>/dev/null || echo 0)" -ge 2 ]; do /bin/sleep 0.2; done
-kill -TERM "$sup"
-/bin/sleep 1
-kill -0 "$sup" 2>/dev/null || fail "a stop signal ended the supervisor while jobs were running: $(cat "$tmp/out")"
-rc=0; wait "$sup" || rc=$?
+drain_supervisor=$!
+wait_for_drain_file() {
+  local file="$1" deadline=$((SECONDS + 10))
+  until [ -f "$file" ]; do
+    [ "$SECONDS" -lt "$deadline" ] && kill -0 "$drain_supervisor" 2>/dev/null \
+      || fail "did not observe ${file##*/} while the supervisor was live: $(cat "$tmp/out")"
+    /bin/sleep 0.1
+  done
+}
+wait_for_drain_file "$tmp/fake/started-1"
+wait_for_drain_file "$tmp/fake/started-2"
+[ -f "$tmp/fake/jit-failed" ] || fail "the startup refusal was not exercised"
+jit_before_term="$(grep -c 'generate-jitconfig' "$tmp/calls")"
+kill -TERM "$drain_supervisor"
+wait_for_drain_file "$tmp/state/draining"
+kill -0 "$drain_supervisor" 2>/dev/null || fail "the supervisor exited before the jobs were released"
+touch "$tmp/fake/release-drain"
+deadline=$((SECONDS + 10))
+while kill -0 "$drain_supervisor" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || fail "the supervisor did not finish draining: $(cat "$tmp/out")"
+  /bin/sleep 0.1
+done
+rc=0; wait "$drain_supervisor" || rc=$?
 [ "$rc" -eq 0 ] || fail "a drained supervisor exited $rc: $(cat "$tmp/out")"
-[ "$(grep -c 'generate-jitconfig' "$tmp/calls")" -eq 2 ] \
-  || fail "a runner registered after the stop signal: $(grep generate-jitconfig "$tmp/calls")"
+drain_supervisor=
+[ -f "$tmp/fake/finished-1" ] && [ -f "$tmp/fake/finished-2" ] \
+  || fail "both running jobs must finish before the supervisor exits: $(cat "$tmp/out")"
+[ "$(grep -c 'generate-jitconfig' "$tmp/calls")" -eq "$jit_before_term" ] \
+  || fail "a registration was attempted after the stop signal: $(grep generate-jitconfig "$tmp/calls")"
 grep -Fq 'draining' "$tmp/out" || fail "the drain is not logged: $(cat "$tmp/out")"
 [ ! -e "$tmp/state/draining" ] || fail "the drain marker outlived the supervisor"
 ok "the first stop signal lets running jobs finish and registers nothing more"
