@@ -244,7 +244,11 @@ SLOTS=3 runner run
 [ "$rc" -eq 0 ] || fail "a three-slot run exited $rc: $(cat "$tmp/out")"
 for slot in 1 2 3; do
   [ "$(grep 'generate-jitconfig' "$tmp/calls" | grep -c -- "name=linux-ephemeral-testhost-$slot-")" -eq 1 ] \
-    || fail "slot $slot did not register exactly once: $(cat "$tmp/calls")"
+    || fail "slot $slot did not register exactly once
+Supervisor output
+$(cat "$tmp/out")
+Fake calls
+$(cat "$tmp/calls")"
 done
 lacks '-shared' "identical slots"
 grep -Fq 'supervising 3 identical slot(s)' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
