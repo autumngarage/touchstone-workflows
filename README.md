@@ -108,6 +108,13 @@ compiler; a later change fails before cache save. Without Swift after
 preparation, validation runs normally without a cache. Non-cache consumers
 retain their single ordinary setup run.
 
+Set the optional repository variable `SWIFT_BUILD_CACHE_SKIP_GROUPS` to a
+comma-separated list of exact, case-sensitive group names, without spaces,
+for groups that do not consume SwiftPM build output. Their declared setup
+and validation still run. An unset or unmatched value keeps existing cache
+behavior. Serial runs, including default-branch cache producers, are not
+named groups and always retain their existing cache behavior.
+
 The workflow owns the cache key and its inputs. It separates platform,
 architecture, toolchain and dependency/build declarations, with a compatible
 restore prefix across revisions. Cached `.build` output accelerates compilation;
