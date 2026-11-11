@@ -419,8 +419,10 @@ ok "failed registration attempts do not count as ready slots"
 # A disabled reservation remains compatible with existing base-label consumers.
 lacks 'actions/runs\?status=' "disabled queue reservation does not inspect demand"
 has 'labels[]=ci-studio-pool-shared' "default runners advertise shared routing for staged consumer rollout"
-queue_only() { grep generate-jitconfig "$tmp/calls" | grep -vc ci-studio-pool-shared || true; }
-SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\npr\n' runner run
+# A registration request can fail or be retried. The supervisor reports the
+# role only after registration and bootstrap both succeed; assert that cohort.
+queue_only() { grep -c 'is waiting for a job (queue)$' "$tmp/out" || true; }
+SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration jit-fails' QUEUED_JOBS='queue\npr\n' runner run
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "one waiting queue job did not receive one Mac slot: $(cat "$tmp/out") $(cat "$tmp/calls")"
 ok "waiting merge validation receives a slot while other slots accept PRs"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\nqueue\nqueue\npr\n' runner run
