@@ -85,7 +85,15 @@ case "$1" in
         f="$(job "$2")"
         [ -f "$f" ] || exit 113
         n="$(cat "$f")"
-        if [ -f "$FAKE_STATE/hold-registration" ] && [ "$(grep -c generate-jitconfig "$FAKE_CALLS" || true)" -lt "$FAKE_SLOTS" ]; then n=1; fi
+        if [ -f "$FAKE_STATE/hold-registration" ]; then
+          # Attempts include failures, retries and registrations whose job has
+          # not started yet. Hold the first cohort until each slot bootstraps.
+          prefix="${2##*/}"
+          prefix="${prefix%-*}"
+          for ((slot=1; slot<=FAKE_SLOTS; slot++)); do
+            [ -f "$FAKE_STATE/ready-$prefix-$slot" ] || n=1
+          done
+        fi
         if [ "$n" -gt 0 ]; then
           echo $((n - 1)) >"$f"
           printf '\tstate = running\n\tpid = 99\n\tlast exit code = (never exited)\n\tendpoints = {\n\t\tstate = active\n\t}\n'
@@ -140,6 +148,7 @@ case "$1" in
     printf 'plist-mode %s\n' "$(stat -c %a "$3" 2>/dev/null || stat -f %Lp "$3")" >>"$FAKE_CALLS"
     echo "${FAKE_RUNNING_POLLS:-1}" >"$(job "$label")"
     echo "${FAKE_JOB_RC:-0}" >"$(job "$label").rc"
+    touch "$FAKE_STATE/ready-$label"
     ;;
   bootout)
     f="$(job "$2")"
@@ -381,6 +390,32 @@ lacks "rsync .*actions-runner-pool-1/" "a slot that has its files"
 ok "each slot has its own directory and job, and a prepared slot is not copied again"
 
 echo "==> Mac slots reuse the Linux queue policy (AUT-2813)"
+# A failed JIT request and its retry must not release a different slot's job.
+(
+  export FAKE_STATE="$tmp/readiness" FAKE_CALLS="$tmp/readiness-calls" FAKE_SLOTS=3 FAKE_RUNNING_POLLS=0
+  mkdir -p "$FAKE_STATE"
+  : >"$FAKE_CALLS"
+  touch "$FAKE_STATE/hold-registration" "$FAKE_STATE/jit-fails"
+  if "$bin/gh" generate-jitconfig >/dev/null 2>&1; then fail "the readiness fixture did not inject a failed JIT request"; fi
+  for slot in 1 2; do
+    "$bin/gh" generate-jitconfig >/dev/null
+    printf '<key>Label</key><string>%s-%s</string>\n' "$POOL_LABEL" "$slot" >"$FAKE_STATE/slot.plist"
+    "$bin/launchctl" bootstrap gui/502 "$FAKE_STATE/slot.plist"
+  done
+  # Three attempts, but only two bootstrapped slots: slot 1 must remain held.
+  "$bin/launchctl" print "gui/502/$POOL_LABEL-1" >"$FAKE_STATE/observed"
+  grep -q 'state = running' "$FAKE_STATE/observed" || fail "a failed registration released a job before every slot was ready"
+  "$bin/gh" generate-jitconfig >/dev/null
+  printf '<key>Label</key><string>%s-3</string>\n' "$POOL_LABEL" >"$FAKE_STATE/slot.plist"
+  touch "$FAKE_STATE/bootstrap-fails"
+  if "$bin/launchctl" bootstrap gui/502 "$FAKE_STATE/slot.plist"; then fail "the readiness fixture did not inject a failed bootstrap"; fi
+  "$bin/launchctl" print "gui/502/$POOL_LABEL-1" >"$FAKE_STATE/observed"
+  grep -q 'state = running' "$FAKE_STATE/observed" || fail "a failed bootstrap released a job before every slot was ready"
+  "$bin/launchctl" bootstrap gui/502 "$FAKE_STATE/slot.plist"
+  "$bin/launchctl" print "gui/502/$POOL_LABEL-1" >"$FAKE_STATE/observed"
+  grep -q 'state = not running' "$FAKE_STATE/observed" || fail "all ready slots did not release the held job"
+)
+ok "failed registration attempts do not count as ready slots"
 # A disabled reservation remains compatible with existing base-label consumers.
 lacks 'actions/runs\?status=' "disabled queue reservation does not inspect demand"
 has 'labels[]=ci-studio-pool-shared' "default runners advertise shared routing for staged consumer rollout"
@@ -389,13 +424,13 @@ SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\npr\n' runner r
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "one waiting queue job did not receive one Mac slot: $(cat "$tmp/out") $(cat "$tmp/calls")"
 ok "waiting merge validation receives a slot while other slots accept PRs"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='queue\nqueue\nqueue\npr\n' runner run
-[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 2 ] || fail "Mac queue reservation did not preserve a shared slot"
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 2 ] || fail "Mac queue reservation did not preserve a shared slot: $(cat "$tmp/out") $(cat "$tmp/calls")"
 ok "sustained queue demand leaves at least one shared runner"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='pr\n' runner run
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 0 ] || fail "an empty queue withheld a Mac slot from PRs"
 ok "without queue demand all Mac slots can serve PRs"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration in-progress-run' QUEUED_JOBS='queue\npr\n' runner run
-[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "an in-progress workflow hid its waiting Mac job"
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "an in-progress workflow hid its waiting Mac job: $(cat "$tmp/out") $(cat "$tmp/calls")"
 ok "waiting jobs in a partially started Mac workflow contribute demand"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration runs-fail' runner run
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "unreadable demand did not keep the bounded fallback reservation"
