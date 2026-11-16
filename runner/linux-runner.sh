@@ -128,13 +128,28 @@ ensure_engine() {
   need docker "install Docker Desktop, or the Docker CLI and Colima (brew install docker colima)"
   [ "$ENGINE" = colima ] || return 0
   need colima "install Colima (brew install colima)"
+  export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+  # A VM that runs but whose engine does not answer is stopped first: the supervisor starts with
+  # no job of its own running, so nothing is cut.
+  if colima status >/dev/null 2>&1 && ! docker info >/dev/null 2>&1; then
+    log "the Colima VM runs but its engine does not answer; stopping it to start it again"
+    colima stop --force || log "colima could not stop its VM; starting it anyway"
+  fi
   if ! colima status >/dev/null 2>&1; then
     # --disk sizes a new VM only; an existing VM keeps the disk it was made with.
     log "starting the Colima VM (aarch64, $VM_CPUS CPUs, ${VM_MEMORY} GiB memory, ${VM_DISK} GiB disk for a new VM)"
     colima start --vm-type vz --arch aarch64 --cpu "$VM_CPUS" --memory "$VM_MEMORY" --disk "$VM_DISK" \
       || die "colima could not start its VM; see 'colima start' as $(id -un)"
   fi
-  export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+}
+
+# engine_lost: whether this user's Colima engine stopped answering. A container that fails at
+# once with the engine still answering is the job's or the image's fault, and only waits.
+engine_lost() {
+  [ "$ENGINE" = colima ] || return 1
+  docker info >/dev/null 2>&1 && return 1
+  sleep 5
+  ! docker info >/dev/null 2>&1
 }
 
 # register_runner SLOT GID NAME: register runner NAME for one job and write the
@@ -218,6 +233,15 @@ run_slot() {
     log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
     # A container that dies at once (a missing image, a daemon that is down)
     # would otherwise register and discard runners in a tight loop.
+    if [ "$rc" -ne 0 ] && [ $(($(date +%s) - started)) -lt 30 ] && engine_lost; then
+      # No job runs on an engine that is gone, so the supervisor stops at once, and launchd
+      # (KeepAlive) starts it again; its ensure_engine starts the VM. Before, every slot
+      # retried against the dead engine until someone restarted the daemon.
+      log "slot $slot: the container engine stopped answering; the supervisor stops so launchd starts it, and the engine, again"
+      : >"$state_dir/engine-lost"
+      kill -TERM "$supervisor" 2>/dev/null || true
+      return 0
+    fi
     if [ "$rc" -ne 0 ] && [ $(($(date +%s) - started)) -lt 30 ]; then
       log "slot $slot: the container failed immediately; retrying in ${backoff}s"
       sleep "$backoff"
@@ -234,6 +258,11 @@ run_slot() {
 # entry and everything behind it. A second signal stops at once, and so does
 # the service manager's kill once its exit timeout has passed.
 drain_slots() {
+  if [ -e "$state_dir/engine-lost" ]; then
+    log "stopping at once: the container engine is gone, so no job is left to finish"
+    stop_slots
+    return
+  fi
   trap stop_slots INT TERM
   until mkdir "$state_dir/register.lock" 2>/dev/null; do sleep 1; done
   : >"$state_dir/draining"
@@ -296,6 +325,8 @@ forget_stale_runners() {
 
 cmd_run() {
   local gid slot pid pids drain_pid=""
+  # The process a slot stops when the engine is gone; $$ is the supervisor in every slot.
+  supervisor=$$
   if [ -n "$LOG_FILE" ]; then
     # Reopen the log for every line. newsyslog rotates it by renaming and
     # compressing it, and a descriptor held open across that would keep
@@ -325,7 +356,7 @@ cmd_run() {
   docker ps -aq --filter "name=^$prefix-" | while read -r leftover; do
     docker rm -f "$leftover" >/dev/null 2>&1 || true
   done
-  rm -f "$state_dir"/slot-* "$state_dir/draining"
+  rm -f "$state_dir"/slot-* "$state_dir/draining" "$state_dir/engine-lost"
   rmdir "$state_dir/register.lock" 2>/dev/null || true
   forget_stale_runners
   trap drain_slots INT TERM
