@@ -20,6 +20,12 @@ need() {
   command -v "$1" >/dev/null 2>&1 || die "$1 is not on PATH; $2"
 }
 
+# service_pid TARGET: the process launchd runs as TARGET (domain/label), or
+# nothing when none runs or no service is loaded.
+service_pid() {
+  { launchctl print "$1" 2>/dev/null || true; } | awk '$1 == "pid" && $2 == "=" { print $3; exit }'
+}
+
 # How long replace_service waits, in all, for the service it is replacing to
 # leave launchd and for the new one to load.
 REPLACE_WAIT=60
@@ -35,10 +41,34 @@ REPLACE_WAIT=60
 # hand (AUT-2258). So this waits for the service to leave, then loads the new
 # one, trying again for REPLACE_WAIT seconds in all, and if it still will not
 # load says what does.
+#
+# A supervisor that drains (it lets its running jobs finish when told to stop)
+# is stopped first with its own signal, not by bootout: launchd kills a
+# service 60 s after bootout's signal whatever its ExitTimeOut says, which on
+# 2026-11-16 cut off a release job a minute into the drain (#112). The wait
+# for that exit is bounded by PLIST's ExitTimeOut, then bootout ends what is
+# left. A supervisor that drained exits 0 and, with KeepAlive's
+# SuccessfulExit false, stays down; one that launchd starts again in that
+# window is new and has no job yet, so the bootout costs it nothing.
 replace_service() {
-  local domain="$1" label="$2" plist="$3" what="$4" waited=0 why load
+  local domain="$1" label="$2" plist="$3" what="$4" waited=0 why load pid limit
   load="launchctl bootstrap $domain '$plist'"
   [ "$domain" != system ] || load="sudo $load"
+  pid="$(service_pid "$domain/$label")"
+  if [ -n "$pid" ]; then
+    # The installers write the key on one line; launchd's default is 20 s.
+    limit="$(sed -n 's:.*<key>ExitTimeOut</key><integer>\([0-9][0-9]*\)</integer>.*:\1:p' "$plist")"
+    limit="${limit:-20}"
+    log "stopping the running supervisor ($pid); its running jobs have up to ${limit}s to finish"
+    launchctl kill TERM "$domain/$label" >/dev/null 2>&1 || true
+    while [ "$(service_pid "$domain/$label")" = "$pid" ] && [ "$waited" -lt "$limit" ]; do
+      sleep 5
+      waited=$((waited + 5))
+    done
+    [ "$(service_pid "$domain/$label")" != "$pid" ] \
+      || log "the supervisor was still running after ${limit}s; launchd ends it now"
+    waited=0
+  fi
   launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
   # Nothing is loaded over an old service that has not left: launchd would
   # refuse it, and the service still listed would be the one about to exit.

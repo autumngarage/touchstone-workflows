@@ -164,7 +164,9 @@ no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
   `runner/linux-runner.sh`, run at boot by
   `sudo bash runner/linux-runner.sh install-daemon <user>`: N identical
   single-use slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled
-  `linux-ephemeral` for one job, with no slot roles or cache images.
+  `linux-ephemeral` for one job, with no slot roles or cache images. Installing
+  again replaces a running fleet without cutting a job: its running jobs
+  finish first, for up to the daemon's `ExitTimeOut` (90 minutes).
 - `blacksmith` is Blacksmith's 4-vCPU Ubuntu 24.04 runner, and `github` is
   GitHub-hosted `ubuntu-latest`.
 - Unset settings fall through: the per-event setting, then

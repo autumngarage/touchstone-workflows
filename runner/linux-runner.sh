@@ -457,7 +457,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_LOG_FILE</key><string>$log_file</string>
   </dict>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>60</integer>
   <key>ExitTimeOut</key><integer>5400</integer>
   <key>StandardOutPath</key><string>$launchd_log</string>

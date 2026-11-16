@@ -127,7 +127,23 @@ cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
+  kill) : >"$FAKE_STATE/term-sent" ;;
+  bootout) : >"$FAKE_STATE/booted-out" ;;
+esac
+case "$1" in
   print)
+    # service-draining: a supervisor runs (pid 4242) until its TERM, then
+    # drains for 30 more looks, longer than launchd's 60 s after a bootout,
+    # and exits 0, staying loaded but stopped. service-never-drains: it runs on.
+    if { [ -f "$FAKE_STATE/service-draining" ] || [ -f "$FAKE_STATE/service-never-drains" ]; } && [ ! -f "$FAKE_STATE/booted-out" ]; then
+      if [ -f "$FAKE_STATE/term-sent" ] && [ -f "$FAKE_STATE/service-draining" ]; then
+        count="$(cat "$FAKE_STATE/drain-count" 2>/dev/null || echo 0)"
+        echo $((count + 1)) >"$FAKE_STATE/drain-count"
+        [ "$count" -lt 30 ] || { printf '\tstate = not running\n'; exit 0; }
+      fi
+      printf '\tstate = running\n\tpid = 4242\n'
+      exit 0
+    fi
     # service-stays: the service being replaced never leaves.
     [ ! -f "$FAKE_STATE/service-stays" ] || exit 0
     # service-lingers: it is still there for the first two looks after its
@@ -594,6 +610,25 @@ grep -q 'was still in launchd 60s after its bootout' "$tmp/out" || fail "the ref
 lacks 'launchctl bootstrap system' "an install over a daemon that never left"
 grep -q 'installed com.autumngarage.linux-ephemeral-runner' "$tmp/out" && fail "an install over a daemon that never left reported success: $(cat "$tmp/out")"
 ok "the install waits for the daemon it replaces, retries the load, and names the command if it cannot"
+# #112: bootout lets launchd kill a supervisor 60 s after its signal, which cut
+# off a release job a minute into its drain. A running supervisor gets its own
+# TERM, is waited for until its jobs finish, and only then is booted out.
+seed_token
+FLAGS=service-draining KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon over a draining fleet exited $rc: $(cat "$tmp/out")"
+has 'launchctl kill TERM system/com.autumngarage.linux-ephemeral-runner' "an install over a running fleet"
+[ "$(line_of 'launchctl kill TERM')" -lt "$(line_of 'launchctl bootout system')" ] || fail "the fleet was booted out before it was asked to drain: $(cat "$tmp/calls")"
+[ "$(sed -n "$(line_of 'launchctl kill TERM'),$(line_of 'launchctl bootout system')p" "$tmp/calls" | grep -c '^sleep 5$')" -ge 30 ] \
+  || fail "the install did not wait out a drain longer than launchd's 60 s: $(cat "$tmp/calls")"
+grep -Fq '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>' "$dplist" \
+  || fail "a drained supervisor exits 0, and launchd must not start it again before the new one loads"
+# A supervisor still running at the plist's ExitTimeOut is ended by bootout.
+seed_token
+FLAGS=service-never-drains KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon over a fleet that never drained exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c '^sleep 5$' "$tmp/calls")" -eq 1080 ] || fail "the drain wait was not bounded by the plist's ExitTimeOut (5400 s): $(grep -c '^sleep 5$' "$tmp/calls") waits"
+grep -q 'still running after 5400s; launchd ends it now' "$tmp/out" || fail "the install did not say it ended a supervisor that outlived its drain: $(cat "$tmp/out")"
+ok "a reinstall lets the running jobs finish, up to the plist's ExitTimeOut, before it boots the fleet out"
 seed_token
 KEEP_HOME=1 runner install-daemon "$real_user"
 [ -f "$dplist" ] && [ -f "$rule" ] || fail "install-daemon left nothing to uninstall"
