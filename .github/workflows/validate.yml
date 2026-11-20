@@ -74,8 +74,9 @@ jobs:
     # keeps changes to the adapter reviewable without adding work to consumers.
     if: github.repository == 'autumngarage/touchstone-workflows'
     name: source contract
-    # Runs this repository's candidate tests on GitHub-hosted Linux.
-    runs-on: ubuntu-latest
+    # The supervisor fixtures require atomic mkdir. Ubuntu 26.04's uutils
+    # can report two owners of one directory (Ubuntu bug 2171333).
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout workflow source
