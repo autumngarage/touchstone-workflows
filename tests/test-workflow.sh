@@ -87,9 +87,9 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     grep -Fxq "max_parallel=$expected" "$plan_fixture/outputs" || fail "incorrect parallel budget for $event/$budget"
     matrix="$(sed -n 's/^matrix=//p' "$plan_fixture/outputs")"
     [ "$(printf '%s' "$matrix" | jq '.include | length')" = "$groups" ] || fail "planner changed the declared groups"
-    if [ "$groups" = 3 ]; then
+    if [ "$contract" = "$grouped_contract" ] && [ "$groups" = 3 ]; then
       printf '%s' "$matrix" | jq -e '[.include[].group] == ["checks","swift-a","swift-b"]' >/dev/null || fail "planner lost a declared group"
-    else
+    elif [ "$groups" = 1 ]; then
       printf '%s' "$matrix" | jq -e '. == {include:[{name:"all",group:""}]}' >/dev/null || fail "planner lost its serial fallback"
     fi
   }
@@ -99,6 +99,39 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   check_plan merge_group 999999999999999999999999 "$grouped_contract" 3 3
   check_plan pull_request 3 '{}' 1 1
   for event in workflow_call workflow_dispatch push; do check_plan "$event" 3 "$grouped_contract" 1 1; done
+  check_targets() {
+    targets="$(sed -n 's/^group_targets=//p' "$plan_fixture/outputs")"
+    jq -e --argjson expected "$1" '. == $expected' <<<"$targets" >/dev/null || fail "unexpected runner targets: $targets"
+  }
+  LEGACY_TARGET=blacksmith check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"blacksmith","swift-a":"blacksmith","swift-b":"blacksmith"}'
+  export LINUX_LOCAL_PR_GROUPS='["checks","swift-a"]' PRIVATE_PR=true LOCAL_SEED=false LEGACY_TARGET=blacksmith
+  check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"local","swift-a":"local","swift-b":"github"}'
+  LINUX_LOCAL_PR_GROUPS='[]' check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  PRIVATE_PR=false check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  PRIVATE_PR=false check_plan merge_group 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  check_plan pull_request 2 '{"groups":[{"name":"checks"},{"name":"CHECKS"}]}' 2 2
+  jq -e 'length == 1 and (to_entries | all(.value == "github"))' <<<"$(sed -n 's/^group_targets=//p' "$plan_fixture/outputs")" >/dev/null || fail "case collision inherited a local target"
+  check_plan pull_request 3 '{}' 1 1
+  check_targets '{"all":"github"}'
+  for local_seed in true false; do
+    PRIVATE_PR=false LOCAL_SEED="$local_seed" check_plan workflow_dispatch 3 "$grouped_contract" 1 1
+    if [ "$local_seed" = true ]; then check_targets '{"all":"local"}'; else check_targets '{"all":"github"}'; fi
+  done
+  for bad_groups in 'checks' '"checks"' '[""]' '[1]' '["*"]'; do
+    : >"$plan_fixture/outputs"
+    if EVENT_NAME=pull_request VALIDATION_MAX_PARALLEL=2 PLANNED_CONTRACT="$grouped_contract" \
+      LINUX_LOCAL_PR_GROUPS="$bad_groups" RUNNER_TEMP="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      GITHUB_WORKSPACE="$plan_fixture" bash -c "$plan_script" >"$plan_fixture/diagnostic" 2>&1; then
+      fail "planner accepted invalid local group list $bad_groups"
+    fi
+    [ ! -s "$plan_fixture/outputs" ] || fail "invalid local group list published a matrix"
+  done
+  unset LINUX_LOCAL_PR_GROUPS PRIVATE_PR LOCAL_SEED LEGACY_TARGET
   for budget in 0 -1 1.5 invalid; do
     : >"$plan_fixture/outputs"
     if EVENT_NAME=merge_group VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$grouped_contract" \
@@ -118,7 +151,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[inputs.runner || (github.event_name == '"'"'merge_group'"'"' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == '"'"'pull_request'"'"' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith'"'"') || '"'"'github'"'"'] }}'
+runner_selector='runs-on: ${{ fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -165,6 +198,13 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
       || fail "$gate: a job runs somewhere other than GitHub-hosted ubuntu-latest"
   done
 fi
+# Bind each fixture flag to the corresponding GitHub trust boundary.
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'group_targets: ${{ steps.plan.outputs.group_targets }}' 'planned group targets'
+assert_active_line "$workflow" "PRIVATE_PR: \${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}" 'private same-repository PR'
+assert_active_line "$workflow" "LOCAL_SEED: \${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}" 'private default-branch local seed'
+assert_active_line "$workflow" "LEGACY_TARGET: \${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}" 'legacy runner precedence'
+assert_active_line "$workflow" 'LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}' 'trusted group configuration'
 # AUT-2851: explicit caller opt-in wins. The input stays false by default.
 # AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over
 # BLACKSMITH_LINUX; LINUX_PR_RUNNER and LINUX_QUEUE_RUNNER override it per
