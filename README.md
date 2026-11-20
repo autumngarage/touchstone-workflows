@@ -147,10 +147,20 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-Static repository settings route `validate-groups`, the job that runs the
-candidate's declared commands. Nothing rewrites them at run time: no watcher,
-no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
-`LINUX_GATE_RUNNER` routing is retired, AUT-3412).
+The protected plan assigns a runner to each validation group when the workflow
+starts. A private repository can set `LINUX_LOCAL_PR_GROUPS` to a JSON array
+of exact, case-sensitive group names it has qualified on its single-use Linux
+pool, for example `["lint","unit"]`. On a pull request from the same repository,
+each listed group waits for an eligible local runner. All other groups run on
+GitHub-hosted Ubuntu. If groups differ only by case, every spelling in the
+matrix must qualify before those jobs can use the pool.
+
+With this setting, forks, merge candidates, scheduled validation and ordinary
+cache producers use GitHub-hosted Ubuntu. A private repository’s default-branch
+push or manual caller can explicitly select `runner: local` for its serial run
+to seed a local cache. A Blacksmith request cannot select a paid runner
+under this policy. Set `[]` to send all PR groups to GitHub-hosted Ubuntu.
+A missing or empty setting preserves the following routing for existing consumers.
 
 | Setting | Applies to | Values |
 |---|---|---|

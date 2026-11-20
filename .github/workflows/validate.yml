@@ -108,6 +108,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
+      group_targets: ${{ steps.plan.outputs.group_targets }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
@@ -134,6 +135,10 @@ jobs:
           LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
           LINUX_QUEUE_RUNNER: ${{ vars.LINUX_QUEUE_RUNNER }}
           INPUT_RUNNER: ${{ inputs.runner }}
+          LEGACY_TARGET: ${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}
+          LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}
+          PRIVATE_PR: ${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}
+          LOCAL_SEED: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}
         run: |
           set -euo pipefail
           # A misspelt runner would fall through to another one unnoticed.
@@ -182,8 +187,29 @@ jobs:
           if [ "${#requested_parallelism}" -gt "${#group_count}" ] || [ "$requested_parallelism" -gt "$group_count" ]; then
             requested_parallelism="$group_count"
           fi
-          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
-          printf 'max_parallel=%s\n' "$requested_parallelism" >>"$GITHUB_OUTPUT"
+          # Keep placement out of the matrix: GitHub includes every matrix value in its check name.
+          if [ -z "${LINUX_LOCAL_PR_GROUPS:-}" ]; then
+            targets="$(jq -c --arg target "${LEGACY_TARGET:-github}" '
+              .include | unique_by(.name | ascii_downcase) | map({key:.name, value:$target}) | from_entries
+            ' <<<"$matrix")"
+          else
+            targets="$(jq -ce --argjson local_groups "$LINUX_LOCAL_PR_GROUPS" \
+              --arg private_pr "$PRIVATE_PR" --arg local_seed "$LOCAL_SEED" '
+              if ($local_groups | type != "array" or any(.[]; type != "string" or (test("^[A-Za-z0-9._-]+\\z") | not)))
+              then error("LINUX_LOCAL_PR_GROUPS must be a JSON array of named groups") else . end
+              | .include | group_by(.name | ascii_downcase) | map(
+                  # Actions object keys ignore case. A differently cased sibling must not inherit a local slot.
+                  {key: .[0].name, value: (
+                    if $local_seed == "true" and .[0].group == "" then "local"
+                    elif $private_pr == "true" and all(.[]; .group as $g | $local_groups | index($g) != null) then "local"
+                    else "github" end)})
+              | from_entries' <<<"$matrix")"
+          fi
+          {
+            printf 'group_targets=%s\n' "$targets"
+            printf 'matrix=%s\n' "$matrix"
+            printf 'max_parallel=%s\n' "$requested_parallelism"
+          } >>"$GITHUB_OUTPUT"
 
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
@@ -193,17 +219,8 @@ jobs:
     # No display name: a templated one would breach the source contract's
     # literal job-name guard, and GitHub already appends each shard's
     # matrix values (its group name) to the job ID in the check list.
-    # Executes the candidate's own declared commands. Static switches, all
-    # repository settings, pick the runner; nothing rewrites them at run time.
-    # See "Runner" in README.md.
-    #   LINUX_PR_RUNNER    pull requests from this repository
-    #   LINUX_QUEUE_RUNNER the merge queue
-    #   each `local` (the single-use linux-ephemeral fleet), `blacksmith` or
-    #   `github`; unset falls back to LINUX_VALIDATION_RUNNER (`blacksmith`
-    #   or `github`), then BLACKSMITH_LINUX=true, then GitHub-hosted. A fork's
-    #   pull request never runs local. A reusable caller's `runner` input
-    #   names the runner outright. The plan job refuses any other value.
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github'] }}
+    # Only the protected planner can select one of these targets for a candidate group.
+    runs-on: ${{ fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
