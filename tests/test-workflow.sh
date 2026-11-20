@@ -129,7 +129,7 @@ printf '%s\n' "$RUN_METADATA"
 exit "${API_STATUS:-0}"
 MOCK
     chmod +x "$plan_fixture/curl"
-    valid="$(jq -nc '{v:1,repository_id:"37",workflow_id:42,run_number:19,event:"pull_request",group:"checks",expires_at:(now|floor)+360}')"
+    valid="$(jq -nc '{v:1,repository_id:"37",workflow_id:42,run_number:19,event:"pull_request",group:"checks",expires_at:((now|floor)+360)}')"
     export GRANT="$valid"
     metadata='{"repository":{"id":37},"workflow_id":42,"id":860,"run_number":19,"run_attempt":1,"event":"pull_request","path":".github/workflows/validate.yml"}'
     export RUN_METADATA="$metadata"
