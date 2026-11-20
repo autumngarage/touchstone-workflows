@@ -160,7 +160,25 @@ cache producers use GitHub-hosted Ubuntu. A private repository’s default-branc
 push or manual caller can explicitly select `runner: local` for its serial run
 to seed a local cache. A Blacksmith request cannot select a paid runner
 under this policy. Set `[]` to send all PR groups to GitHub-hosted Ubuntu.
-A missing or empty setting preserves the following routing for existing consumers.
+An operator can temporarily place one of those local PR groups on GitHub-hosted
+Ubuntu by setting the repository variable `LINUX_GITHUB_OVERFLOW` to a JSON
+object. For example, the following grants group `unit` in one workflow run.
+
+```json
+{"v":1,"repository_id":"37","workflow_id":42,"run_number":19,"event":"pull_request","group":"unit","expires_at":1800000000}
+```
+
+Set `expires_at` to a Unix timestamp within the next ten minutes. The planner
+checks GitHub’s record for the current run, including the repository, workflow,
+path and run number. An expired grant, unavailable API, or ambiguous group
+preserves the original placement. Failed-job and full reruns use the original
+local assignment. The grant applies only to GitHub-hosted Ubuntu.
+
+The plan job requires `contents: read` and `actions: read`. Before upgrading a
+reusable `uses:` caller to this revision, allow both scopes on the calling job.
+Candidate validation jobs retain only `contents: read`.
+
+A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for existing consumers.
 
 | Setting | Applies to | Values |
 |---|---|---|

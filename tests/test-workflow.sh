@@ -70,12 +70,15 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   trap 'rm -rf "$plan_fixture"' EXIT HUP INT TERM
   # shellcheck disable=SC2016
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PLANNED_CONTRACT"\n' >"$plan_fixture/touchstone-run.sh"
-  plan_script="$(awk '
-    /^      - name: Plan validation groups$/ { step = 1 }
+  step_script() {
+    awk -v name="$1" '
+    $0 == "      - name: " name { step = 1 }
     step && /^        run: \|$/ { body = 1; next }
     body && /^          / { sub(/^          /, ""); print; next }
     body && /[^[:space:]]/ { exit }
-  ' "$workflow")"
+    ' "$workflow"
+  }
+  plan_script="$(step_script 'Plan validation groups')"
   [ -n "$plan_script" ] || fail "validation planner script is missing"
   grouped_contract='{"groups":[{"name":"checks"},{"name":"swift-a"},{"name":"swift-b"}]}'
   check_plan() {
@@ -108,6 +111,47 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   export LINUX_LOCAL_PR_GROUPS='["checks","swift-a"]' PRIVATE_PR=true LOCAL_SEED=false LEGACY_TARGET=blacksmith
   check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"local","swift-a":"local","swift-b":"github"}'
+  # Exercise the protected step with a current-run API stub. Only plausible
+  # grants may read the API, and only a fully matched response admits a group.
+  (
+    overflow_script="$(step_script 'Verify GitHub overflow grant')"
+    [ -n "$overflow_script" ] || fail "missing GitHub overflow grant verification"
+    export GITHUB_API_URL=https://api.github.test GITHUB_REPOSITORY=o/r GITHUB_REPOSITORY_ID=37
+    export GITHUB_RUN_NUMBER=19 GITHUB_RUN_ID=860 GH_TOKEN=fixture
+    export GITHUB_OUTPUT="$plan_fixture/group" API_READS="$plan_fixture/reads"
+    export MATRIX="$matrix" TARGETS="$targets"
+    export PATH="$plan_fixture:$PATH"
+    cat >"$plan_fixture/curl" <<'MOCK'
+#!/usr/bin/env bash
+echo read >>"$API_READS"
+[[ "${!#}" == 'https://api.github.test/repos/o/r/actions/runs/860' ]] || exit 3
+printf '%s\n' "$RUN_METADATA"
+exit "${API_STATUS:-0}"
+MOCK
+    chmod +x "$plan_fixture/curl"
+    valid="$(jq -nc '{v:1,repository_id:"37",workflow_id:42,run_number:19,event:"pull_request",group:"checks",expires_at:(now|floor)+360}')"
+    export GRANT="$valid"
+    metadata='{"repository":{"id":37},"workflow_id":42,"id":860,"run_number":19,"run_attempt":1,"event":"pull_request","path":".github/workflows/validate.yml"}'
+    export RUN_METADATA="$metadata"
+    check_grant() {
+      : >"$GITHUB_OUTPUT"; : >"$API_READS"
+      bash -c "$overflow_script" >/dev/null || fail "grant verification interrupted validation"
+      [ "$(cat "$GITHUB_OUTPUT")" = "$1" ] && [ "$(cat "$API_READS")" = "$2" ] \
+        || fail "unexpected GitHub overflow result: $(cat "$GITHUB_OUTPUT") / $(cat "$API_READS")"
+    }
+    check_grant 'group=checks' read
+    GRANT='invalid JSON' check_grant '' ''
+    for change in '.v=2' '.repository_id="38"' '.run_number=20' '.event="merge_group"' \
+      '.group="swift-b"' '.group="CHECKS"' '.expires_at=0' '.expires_at+=601' '.provider="paid"'; do
+      GRANT="$(jq -c "$change" <<<"$valid")" check_grant '' ''
+    done
+    MATRIX="$(jq -c '.include += [{name:"CHECKS",group:"CHECKS"}]' <<<"$matrix")" check_grant '' ''
+    for change in '.id=861' '.repository.id=38' '.workflow_id=43' '.run_number=20' \
+      '.run_attempt=2' '.event="push"' '.path="other.yml"'; do
+      RUN_METADATA="$(jq -c "$change" <<<"$metadata")" check_grant '' read
+    done
+    API_STATUS=22 check_grant '' read
+  )
   LINUX_LOCAL_PR_GROUPS='[]' check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
   PRIVATE_PR=false check_plan pull_request 3 "$grouped_contract" 3 3
@@ -151,7 +195,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
+runner_selector='runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -201,6 +245,9 @@ fi
 # Bind each fixture flag to the corresponding GitHub trust boundary.
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'group_targets: ${{ steps.plan.outputs.group_targets }}' 'planned group targets'
+assert_active_line "$workflow" 'github_overflow_group: ${{ steps.overflow.outputs.group }}' 'verified GitHub group'
+assert_active_line "$workflow" "if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''" 'first-attempt private same-repository overflow'
+assert_active_line "$workflow" 'GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}' 'trusted GitHub overflow configuration'
 assert_active_line "$workflow" "PRIVATE_PR: \${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}" 'private same-repository PR'
 assert_active_line "$workflow" "LOCAL_SEED: \${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}" 'private default-branch local seed'
 assert_active_line "$workflow" "LEGACY_TARGET: \${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}" 'legacy runner precedence'
@@ -661,7 +708,12 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
     jobs.each do |job_key, configuration|
       job = scalar.call(job_key, "job ID")
       fields = pairs.call(configuration, "job #{job}")
-      if fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
+      if File.basename(ARGV.fetch(0)) == "validate.yml" && job == "plan"
+        effective = pairs.call(one.call(fields, "permissions", "validation plan"), "plan permissions")
+        actual = effective.map { |key, value| [scalar.call(key, "scope"), scalar.call(value, "permission")] }
+        raise "validation plan needs only contents and actions read" unless actual.sort == [["actions","read"],["contents","read"]]
+        raise "validation jobs must inherit only contents read" unless declared_permissions == ["contents"]
+      elsif fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
         raise "job #{job} must not override permissions"
       end
     end
@@ -1244,7 +1296,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
+  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all plan-write; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -1270,6 +1322,9 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
         ;;
       quoted-write)
         sed 's/^  contents: read$/  contents: "write"/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      plan-write)
+        sed 's/^      actions: read$/      actions: write/' "$fixture/$status_publisher" >"$fixture/validate.next"
         ;;
       job-write-all)
         sed '/^    runs-on:/i\

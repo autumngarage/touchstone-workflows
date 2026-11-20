@@ -106,14 +106,20 @@ jobs:
     name: validate plan
     # Trusted declaration parsing, on GitHub-hosted Linux.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 5
     outputs:
       group_targets: ${{ steps.plan.outputs.group_targets }}
+      github_overflow_group: ${{ steps.overflow.outputs.group }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
 
       - name: Fetch pinned Touchstone validator
         run: |
@@ -211,6 +217,50 @@ jobs:
             printf 'max_parallel=%s\n' "$requested_parallelism"
           } >>"$GITHUB_OUTPUT"
 
+      - name: Verify GitHub overflow grant
+        id: overflow
+        if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''
+        env:
+          GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+          TARGETS: ${{ steps.plan.outputs.group_targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Multiple matrix names can share a case-insensitive Actions key.
+          # Exactly one already-local job must match before spending an API read.
+          if ! group="$(jq -ner --argjson grant "$GRANT" --argjson planned_matrix "$MATRIX" --argjson planned_targets "$TARGETS" \
+            --arg repo "$GITHUB_REPOSITORY_ID" --arg number "$GITHUB_RUN_NUMBER" '
+            $grant | select(
+              keys == ["event","expires_at","group","repository_id","run_number","v","workflow_id"]
+              and .v == 1 and .event == "pull_request" and .repository_id == $repo
+              and (.run_number | type == "number" and tostring == $number)
+              and (.workflow_id | type == "number" and floor == . and . > 0)
+              and (.expires_at | type == "number" and floor == . and . > now and . <= now + 600)
+            ) | .group as $g | select($planned_targets[$g] == "local"
+              and ([$planned_matrix.include[] | select((.name | ascii_downcase) == ($g | ascii_downcase)) | .group] == [$g])
+            ) | $g' 2>/dev/null)"; then
+            echo "No matching GitHub overflow grant. Keeping planned placement."
+            exit 0
+          fi
+          if ! run="$(curl --fail --silent --show-error --max-time 10 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"; then
+            echo "Could not read current run metadata. Keeping planned placement."
+            exit 0
+          fi
+          if jq -e --argjson grant "$GRANT" --arg id "$GITHUB_RUN_ID" '
+            (.id | tostring) == $id and (.repository.id | tostring) == $grant.repository_id
+            and .workflow_id == $grant.workflow_id and .run_number == $grant.run_number
+            and .event == $grant.event and .path == ".github/workflows/validate.yml"
+            and .run_attempt == 1 and $grant.expires_at > now
+          ' <<<"$run" >/dev/null; then
+            printf 'group=%s\n' "$group" >>"$GITHUB_OUTPUT"
+            echo "Selected GitHub-hosted Ubuntu for $group."
+          else
+            echo "Current run does not match its overflow grant. Keeping planned placement."
+          fi
+
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
@@ -220,7 +270,8 @@ jobs:
     # literal job-name guard, and GitHub already appends each shard's
     # matrix values (its group name) to the job ID in the check list.
     # Only the protected planner can select one of these targets for a candidate group.
-    runs-on: ${{ fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
+    # A failed-job rerun can reuse the first attempt's plan outputs.
+    runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
