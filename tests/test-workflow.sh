@@ -154,11 +154,12 @@ done
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   [ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
     || fail "$workflow: only candidate execution picks a cloud"
-  # The source contract, plan, and aggregation jobs.
-  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 3 ] \
-    || fail "$workflow: the source contract, plan, and aggregation jobs must run on GitHub-hosted ubuntu-latest"
+  assert_active_line <(sed -n '/^  source-contract:/,/^  plan:/p' "$workflow") \
+    'runs-on: ubuntu-24.04' 'source contract runner with atomic mkdir'
+  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 2 ] \
+    || fail "$workflow: the plan and aggregation jobs must run on GitHub-hosted ubuntu-latest"
   [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 4 ] \
-    || fail "$workflow: a job takes its runner from somewhere other than the cloud selector or ubuntu-latest"
+    || fail "$workflow: expected four runner declarations"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
       || fail "$gate: a job runs somewhere other than GitHub-hosted ubuntu-latest"
