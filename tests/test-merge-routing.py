@@ -22,7 +22,7 @@ spec.loader.exec_module(routing)
 SNAPSHOT = json.loads((ROOT / "tests/fixtures/merge-queue-hesperus.json").read_text())
 ENTRIES = SNAPSHOT["data"]["repository"]["mergeQueue"]["entries"]["nodes"]
 NOW = 1795272000
-ISSUER = {"creator_id": 1234, "creator_login": "fixture-ci-service", "creator_type": "User"}
+ISSUER = {"creator_id": 1234, "creator_login": "fixture-ci-service[bot]", "creator_type": "Bot", "app_id": 3456}
 
 
 def fixture():
@@ -127,6 +127,10 @@ class RoutingTests(unittest.TestCase):
         with self.assertRaises(routing.Refused):
             routing.status_grant(dict(self.request, attempt=2), [self.status], ISSUER, NOW)
         self.assertNotEqual(routing.runner_label(self.request), routing.runner_label(dict(self.request, attempt=2)))
+        with self.assertRaises(routing.Refused):
+            routing.status_grant(self.request, [self.status], dict(ISSUER, creator_type="User"), NOW)
+        with patch.dict(os.environ, {"GH_TOKEN": "registration-only"}), self.assertRaises(routing.Refused):
+            routing.GitHub("")
 
     def test_repeat_busy_draining_and_concurrent_reservations(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -206,29 +210,49 @@ class RoutingTests(unittest.TestCase):
         class API:
             def __init__(inner):
                 inner.posted = []
+                inner.existing = []
+                inner.runner_patch = {}
+
+            def statuses(inner, request):
+                return inner.existing
+
+            def queue(inner, repository, branch):
+                return SNAPSHOT
 
             def call(inner, path, payload=None):
-                if path == "/user":
-                    return {"id": ISSUER["creator_id"], "login": ISSUER["creator_login"], "type": ISSUER["creator_type"]}
+                if "/actions/runs/" in path:
+                    return self.run
                 if path.startswith("/orgs/"):
-                    return {"id": 789, "status": "online", "busy": False,
-                            "labels": [{"name": label} for label in ("self-hosted", "linux-kvm-x64-checks", routing.runner_label(self.request))]}
+                    return dict({"id": 789, "status": "online", "busy": False,
+                                 "labels": [{"name": label} for label in ("self-hosted", "linux-kvm-x64-checks", routing.runner_label(self.request))]}, **inner.runner_patch)
                 inner.posted.append(payload)
-                return payload
+                return dict(payload, id=100, creator=self.status["creator"], created_at=self.status["created_at"])
 
         reservation = {"request": self.request, "slot": "pc-checks", "reserved_at": NOW - 5}
         receipt = {"request": self.request, "slot": "pc-checks", "observed_at": NOW - 1, "isolation": "kvm",
                    "architecture": "x64", "guest_docker": True, "release_slots_preserved": True, "capacity_available": True,
                    "registration": "jit", "runner_id": 789}
-        with patch.dict(routing.POLICY, {self.request["repository"]: self.policy}):
+        with patch.dict(routing.POLICY, {self.request["repository"]: self.policy}), tempfile.TemporaryDirectory() as directory:
+            reservation = routing.reserve(directory, self.request, "pc-checks", now=lambda: NOW - 5)["reservation"]
             api = API()
-            routing.publish(api, reservation, receipt, ISSUER, now=lambda: NOW)
+            routing.publish(api, api, directory, reservation, receipt, ISSUER, now=lambda: NOW)
             self.assertEqual(api.posted[0]["context"], routing.context(self.request))
             for key, value in (("observed_at", NOW - 10), ("observed_at", NOW + 1), ("capacity_available", False),
                                ("isolation", "container"), ("guest_docker", False), ("release_slots_preserved", False), ("registration", "persistent")):
                 with self.subTest(key=key), self.assertRaises(routing.Refused):
-                    routing.publish(api, reservation, dict(receipt, **{key: value}), ISSUER, now=lambda: NOW)
+                    routing.publish(api, api, directory, reservation, dict(receipt, **{key: value}), ISSUER, now=lambda: NOW)
             self.assertEqual(len(api.posted), 1)
+            for update in ({"busy": True}, {"status": "offline"}, {"labels": []}, {"id": 1}):
+                api.runner_patch = update
+                with self.subTest(update=update), self.assertRaises(routing.Refused):
+                    routing.publish(api, api, directory, reservation, receipt, ISSUER, now=lambda: NOW)
+            api.runner_patch = {}
+            api.existing = [self.status]
+            self.assertTrue(routing.publish(api, api, directory, reservation, receipt, ISSUER, now=lambda: NOW)["reused"])
+            self.assertEqual(len(api.posted), 1)
+            api.existing = [dict(self.status, created_at="2020-01-01T00:00:00Z")]
+            with self.assertRaises(routing.Refused):
+                routing.publish(api, api, directory, reservation, receipt, ISSUER, now=lambda: NOW)
 
 
 if __name__ == "__main__":

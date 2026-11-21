@@ -135,6 +135,7 @@ def trusted_chain(request, snapshot):
 
 def status_grant(request, statuses, issuer, now):
     require(issuer and integer(issuer.get("creator_id")) and issuer.get("creator_login"), "no verified controller service identity")
+    require(issuer.get("creator_type") == "Bot" and integer(issuer.get("app_id")), "controller issuer is not a dedicated App")
     matches = [status for status in statuses if status.get("context") == context(request)]
     require(matches, "no local admission acknowledgement")
     # Status IDs are monotonic; an explicit later refusal must defeat a prior grant.
@@ -155,7 +156,8 @@ def status_grant(request, statuses, issuer, now):
 
 class GitHub:
     def __init__(self, token=None):
-        self.token = token or os.environ["GH_TOKEN"]
+        self.token = os.environ["GH_TOKEN"] if token is None else token
+        require(bool(self.token), "GitHub credential is unavailable")
         self.api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
     def call(self, path, payload=None):
@@ -250,11 +252,36 @@ def reserve(state_dir, request, slot, now=time.time):
         lock.rmdir()
 
 
-def publish(api, reservation, receipt, issuer, now=time.time):
+def publish(api, registration_api, state_dir, reservation, receipt, issuer, now=time.time):
+    state_dir = Path(state_dir)
+    lock = state_dir / "register.lock"
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        raise Refused("supervisor admission is busy") from None
+    try:
+        request = reservation["request"]
+        key = hashlib.sha256(context(request).encode()).hexdigest()
+        saved = json.loads((state_dir / ("merge-reservation-" + key + ".json")).read_text())
+        require(saved == reservation and not (state_dir / "draining").exists(), "reservation is no longer owned")
+        return publish_reserved(api, registration_api, reservation, receipt, issuer, now)
+    finally:
+        lock.rmdir()
+
+
+def publish_reserved(api, registration_api, reservation, receipt, issuer, now):
     """The controller calls this only after provisioning its reserved guest."""
     request = reservation["request"]
     policy = POLICY.get(request["repository"])
     require(issuer and policy and policy["issuer"] == issuer, "issuer is not installed in committed policy")
+    require(all(request[key] == policy[key] for key in ("repository_id", "workflow_id", "group", "capability")), "reservation is not qualified")
+    run = api.call(f'/repos/{request["repository"]}/actions/runs/{request["run_id"]}')
+    require(run.get("id") == request["run_id"] and run.get("run_attempt") == request["attempt"]
+            and run.get("head_sha") == request["head"] and run.get("event") == "merge_group"
+            and run.get("path") == ".github/workflows/validate.yml" and run.get("referenced_workflows") == []
+            and run.get("workflow_id") == request["workflow_id"] and run.get("status") == "in_progress",
+            "reserved run is no longer the current required candidate")
+    trusted_chain(request, api.queue(request["repository"], policy["branch"]))
     observed = now()
     require(receipt.get("slot") == reservation["slot"] and receipt.get("request") == request, "capacity acknowledgement differs")
     require(reservation["reserved_at"] <= receipt["observed_at"] <= observed
@@ -263,20 +290,24 @@ def publish(api, reservation, receipt, issuer, now=time.time):
             and receipt.get("release_slots_preserved") is True and receipt.get("capacity_available") is True
             and receipt.get("registration") == "jit",
             "reserved isolated capacity is not acknowledged")
-    runner = api.call(f'/orgs/{request["repository"].split("/")[0]}/actions/runners/{receipt["runner_id"]}')
+    runner = registration_api.call(f'/orgs/{request["repository"].split("/")[0]}/actions/runners/{receipt["runner_id"]}')
     labels = {label["name"] for label in runner["labels"]}
     require(runner["id"] == receipt["runner_id"] and runner.get("status") == "online"
             and runner.get("busy") is False,
             "reserved single-use runner is not ready")
     required_labels = {"self-hosted", "linux-kvm-x64-checks", runner_label(request)}
     require(required_labels <= labels <= required_labels | {"Linux", "X64"}, "reserved runner labels differ")
-    identity = api.call("/user")
-    require(identity.get("id") == issuer["creator_id"] and identity.get("login") == issuer["creator_login"]
-            and identity.get("type") == issuer["creator_type"], "controller credential is not the verified service")
-    return api.call(f'/repos/{request["repository"]}/statuses/{request["head"]}', {
+    statuses = api.statuses(request)
+    if any(status.get("context") == context(request) for status in statuses):
+        grant = status_grant(request, statuses, issuer, observed)
+        require(grant["runner_id"] == runner["id"], "existing admission acknowledges another runner")
+        return {"id": grant["status_id"], "reused": True}
+    status = api.call(f'/repos/{request["repository"]}/statuses/{request["head"]}', {
         "state": "success", "context": context(request), "target_url": run_url(request),
         "description": f'v1;ttl={TTL};capability={request["capability"]};runner={runner["id"]}',
     })
+    status_grant(request, [status], issuer, now())
+    return status
 
 
 def main():
@@ -288,6 +319,7 @@ def main():
     reservation.add_argument("--request", required=True)
     reservation.add_argument("--slot", required=True)
     publication = subcommands.add_parser("publish")
+    publication.add_argument("--state-dir", required=True)
     publication.add_argument("--reservation", required=True)
     publication.add_argument("--receipt", required=True)
     args = parser.parse_args()
@@ -303,7 +335,9 @@ def main():
             reservation = json.loads(Path(args.reservation).read_text())
             receipt = json.loads(Path(args.receipt).read_text())
             issuer = POLICY[reservation["request"]["repository"]]["issuer"]
-            print(json.dumps(publish(GitHub(), reservation, receipt, issuer)))
+            # Registration credentials remain separate from the restricted App
+            # installation token; neither enters the candidate guest.
+            print(json.dumps(publish(GitHub(os.environ["GH_STATUS_TOKEN"]), GitHub(), args.state_dir, reservation, receipt, issuer)))
     except (Refused, KeyError, TypeError, ValueError, OSError, urllib.error.URLError) as error:
         print(f"Local merge admission refused: {error}", file=sys.stderr)
         if args.command != "plan":
