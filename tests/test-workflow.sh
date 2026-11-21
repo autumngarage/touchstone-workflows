@@ -34,6 +34,11 @@ assert_active_line() {
 
 assert_count 1 'name: validate \(ubuntu-latest\)'
 
+# shellcheck disable=SC2016
+assert_active_line "$workflow" \
+  'SAME_REPOSITORY_PR: ${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.head.repo.full_name == github.repository }}' \
+  "same-repository PR provenance"
+
 # A known-invalid queue candidate must not retain running/queued build slots.
 # Author and maintenance runs still collect every shard's evidence. GitHub owns
 # the matrix cancellation; the required aggregate must reject every non-success.
@@ -81,6 +86,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   plan_script="$(step_script 'Plan validation groups')"
   [ -n "$plan_script" ] || fail "validation planner script is missing"
   grouped_contract='{"groups":[{"name":"checks"},{"name":"swift-a"},{"name":"swift-b"}]}'
+  export SAME_REPOSITORY_PR=true
   check_plan() {
     event="$1" budget="$2" contract="$3" expected="$4" groups="$5"
     : >"$plan_fixture/outputs"
@@ -108,6 +114,22 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   }
   LEGACY_TARGET=blacksmith check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"blacksmith","swift-a":"blacksmith","swift-b":"blacksmith"}'
+  for legacy_target in local blacksmith; do
+    for same_repository in false ''; do
+      SAME_REPOSITORY_PR="$same_repository" LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+      check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+    done
+    (
+      unset SAME_REPOSITORY_PR
+      LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+      check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+    )
+    # Public same-repository PRs retain their established legacy placement.
+    PRIVATE_PR=false LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+    check_targets "{\"checks\":\"$legacy_target\",\"swift-a\":\"$legacy_target\",\"swift-b\":\"$legacy_target\"}"
+    SAME_REPOSITORY_PR=false LEGACY_TARGET="$legacy_target" check_plan merge_group 3 "$grouped_contract" 3 3
+    check_targets "{\"checks\":\"$legacy_target\",\"swift-a\":\"$legacy_target\",\"swift-b\":\"$legacy_target\"}"
+  done
   export LINUX_LOCAL_PR_GROUPS='["checks","swift-a"]' PRIVATE_PR=true LOCAL_SEED=false LEGACY_TARGET=blacksmith
   check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"local","swift-a":"local","swift-b":"github"}'

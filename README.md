@@ -189,7 +189,9 @@ The plan job requires `contents: read` and `actions: read`. Before upgrading a
 reusable `uses:` caller to this revision, allow both scopes on the calling job.
 Candidate validation jobs retain only `contents: read`.
 
-A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for existing consumers.
+A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for
+existing consumers. Fork PRs, or PRs whose same-repository origin cannot be
+established, always use GitHub-hosted Ubuntu even when a global target is set.
 
 | Setting | Applies to | Values |
 |---|---|---|
@@ -198,8 +200,7 @@ A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for e
 | `LINUX_VALIDATION_RUNNER` | the default for both, and pushes and reusable callers | `blacksmith`, `github` |
 
 - `local` is the single-use `linux-ephemeral` fleet: each runner takes one job
-  in a fresh container with no mounts or credentials, then exits. A fork's
-  pull request never runs there; it takes the default. Its supervisor is
+  in a fresh container with no mounts or credentials, then exits. Its supervisor is
   `runner/linux-runner.sh`, run at boot by
   `sudo bash runner/linux-runner.sh install-daemon <user>`: N identical
   single-use slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled

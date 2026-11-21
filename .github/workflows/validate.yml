@@ -145,6 +145,7 @@ jobs:
           LEGACY_TARGET: ${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}
           LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}
           PRIVATE_PR: ${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}
+          SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
           LOCAL_SEED: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}
         run: |
           set -euo pipefail
@@ -196,7 +197,12 @@ jobs:
           fi
           # Keep placement out of the matrix: GitHub includes every matrix value in its check name.
           if [ -z "${LINUX_LOCAL_PR_GROUPS:-}" ]; then
-            targets="$(jq -c --arg target "${LEGACY_TARGET:-github}" '
+            legacy_target="${LEGACY_TARGET:-github}"
+            # A fork must not inherit the base repository's global runner setting.
+            if [ "$EVENT_NAME" = pull_request ] && [ "${SAME_REPOSITORY_PR:-}" != true ]; then
+              legacy_target=github
+            fi
+            targets="$(jq -c --arg target "$legacy_target" '
               .include | unique_by(.name | ascii_downcase) | map({key:.name, value:$target}) | from_entries
             ' <<<"$matrix")"
           else
