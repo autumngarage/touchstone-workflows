@@ -168,8 +168,8 @@ class RoutingTests(unittest.TestCase):
                 inner.calls.append(path)
                 if "/actions/runs/" in path:
                     return test.run
-                if "/contents/" in path:
-                    return {"type": "file", "sha": inner.declaration}
+                if "/git/trees/" in path:
+                    return {"truncated": False, "tree": [{"path": ".touchstone.toml", "type": "blob", "mode": "100644", "sha": inner.declaration}]}
                 raise AssertionError(path)
 
             def queue(inner, repository, branch):
@@ -218,7 +218,7 @@ class RoutingTests(unittest.TestCase):
 
         reservation = {"request": self.request, "slot": "pc-checks", "reserved_at": NOW - 5}
         receipt = {"request": self.request, "slot": "pc-checks", "observed_at": NOW - 1, "isolation": "kvm",
-                   "guest_docker": True, "release_slots_preserved": True, "capacity_available": True,
+                   "architecture": "x64", "guest_docker": True, "release_slots_preserved": True, "capacity_available": True,
                    "registration": "jit", "runner_id": 789}
         with patch.dict(routing.POLICY, {self.request["repository"]: self.policy}):
             api = API()

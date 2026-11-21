@@ -200,10 +200,13 @@ def plan(api, event, matrix, targets, now=time.time, pause=time.sleep):
     request = qualified_request(event, run, matrix, targets, policy)
     trusted_chain(request, api.queue(repository, policy["branch"]))
     # Qualification does not authorize a candidate to replace the group commands.
-    declarations = [api.call(f'/repos/{repository}/contents/.touchstone.toml?ref={revision}')
+    trees = [api.call(f'/repos/{repository}/git/trees/{revision}')
                     for revision in (request["base"], request["head"])]
-    require(all(item.get("type") == "file" and sha(item.get("sha")) for item in declarations)
-            and declarations[0]["sha"] == declarations[1]["sha"], "qualification declaration changed or unavailable")
+    require(all(tree.get("truncated") is False for tree in trees), "declaration trees are incomplete")
+    declarations = [[entry for entry in tree["tree"] if entry["path"] == ".touchstone.toml"] for tree in trees]
+    require(all(len(entries) == 1 and entries[0].get("type") == "blob"
+                and entries[0].get("mode") in ("100644", "100755") and sha(entries[0].get("sha"))
+                for entries in declarations) and declarations[0] == declarations[1], "qualification declaration changed or unavailable")
     pause(ADMISSION_WINDOW)
     # Fetch after the exclusive reservation/JIT acknowledgement, never from vars.
     grant = status_grant(request, api.statuses(request), policy["issuer"], now())
@@ -256,7 +259,7 @@ def publish(api, reservation, receipt, issuer, now=time.time):
     require(receipt.get("slot") == reservation["slot"] and receipt.get("request") == request, "capacity acknowledgement differs")
     require(reservation["reserved_at"] <= receipt["observed_at"] <= observed
             and observed - receipt["observed_at"] <= 15, "capacity acknowledgement predates reservation or is stale")
-    require(receipt.get("isolation") == "kvm" and receipt.get("guest_docker") is True
+    require(receipt.get("isolation") == "kvm" and receipt.get("architecture") == "x64" and receipt.get("guest_docker") is True
             and receipt.get("release_slots_preserved") is True and receipt.get("capacity_available") is True
             and receipt.get("registration") == "jit",
             "reserved isolated capacity is not acknowledged")
