@@ -4,7 +4,7 @@ PartOf=hesperus-kvm-guest.service
 
 [Service]
 Type=notify
-ExecStart=/usr/bin/python3 -I /opt/hesperus-runner/kvm-admission.py guard
+ExecStart=/usr/bin/python3 -I /opt/hesperus-runner/native/kvm-admission.py guard
 TimeoutStartSec=15s
 PrivateTmp=yes
 ProtectHome=yes

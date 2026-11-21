@@ -115,7 +115,8 @@ class AdmissionTests(unittest.TestCase):
         source = "f" * 40
         config = {"repository": repository, "signal_source_sha": source, "signal_workflow_id": 11, "control_group_id": 14,
                   "control_label": "hesperus-runscaler-pc", "routine_group_id": 99,
-                  "validation_source_ref": "autumngarage/touchstone-workflows/.github/workflows/validate.yml@" + source}
+                  "validation_source_ref": "autumngarage/touchstone-workflows/.github/workflows/validate.yml@refs/heads/main",
+                  "validation_source_sha": source}
         signal = {"id": 1, "repository": repo, "event": "merge_group", "workflow_id": 11,
                   "path": ".github/workflows/local-merge-intake.yml", "status": "completed", "conclusion": "success",
                   "run_attempt": 1, "head_sha": head, "referenced_workflows": [{"path":
@@ -130,7 +131,8 @@ class AdmissionTests(unittest.TestCase):
             def __init__(inner):
                 inner.signal, inner.control, inner.native = signal, control, native
                 inner.jobs = []
-                inner.rules = []
+                inner.rules = [{"parameters": {"workflows": [{"path": ".github/workflows/validate.yml", "ref": "refs/heads/main",
+                                                               "sha": source, "repository_id": admission.SOURCE_REPOSITORY_ID}]}}]
             def call(inner, path, payload=None):
                 if path.endswith("/actions/runs/1"):
                     return inner.signal
@@ -174,9 +176,24 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaises(admission.routing.Refused):
                 admission.authoritative_request(api, api, (repository, 1), config)
             api.jobs = []
+            api.rules[0]["parameters"]["workflows"][0]["sha"] = "a" * 40
+            with self.assertRaises(admission.routing.Refused):
+                admission.authoritative_request(api, api, (repository, 1), config)
+            api.rules[0]["parameters"]["workflows"][0]["sha"] = config["validation_source_sha"]
             api.signal["referenced_workflows"][0]["sha"] = "a" * 40
             with self.assertRaises(admission.routing.Refused):
                 admission.authoritative_request(api, api, (repository, 1), config)
+
+    def test_interrupted_registration_checkpoint_keeps_recoverable_original_lease(self):
+        repository, policy, config, api = self.request_fixture()
+        with patch.dict(admission.routing.POLICY, {repository: policy}), tempfile.TemporaryDirectory() as directory:
+            request = admission.authoritative_request(api, api, (repository, 1), config)
+            config["state_dir"] = directory
+            reservation = admission.routing.reserve(directory, request, "pc-kvm")["reservation"]
+            path = admission.reservation_file(config, reservation)
+            with patch.object(Path, "replace", side_effect=OSError("interrupted checkpoint")), self.assertRaises(OSError):
+                admission.checkpoint_registration(config, dict(reservation, runner_id=789))
+            self.assertEqual(json.loads(path.read_text()), reservation)
 
     def test_optional_signal_must_not_become_a_required_workflow_or_status(self):
         repository, policy, config, api = self.request_fixture()

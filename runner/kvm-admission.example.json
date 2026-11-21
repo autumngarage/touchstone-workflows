@@ -7,6 +7,7 @@
   "signal_source_sha": null,
   "routine_group_id": null,
   "validation_source_ref": null,
+  "validation_source_sha": null,
   "base_sha256": null,
   "seed_sha256": null,
   "status_token_file": "/etc/hesperus-kvm/status-token",

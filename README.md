@@ -297,6 +297,9 @@ planner delay. If the fresh grant misses the natural planning work, that
 candidate stays hosted. The old hosted checks job ran 18m17s (19 billed Linux
 job minutes); a successful local assignment removes that hosted job. These
 are prior measurements, not a claim that the new dispatch has been qualified.
+The measured planner already rounds to one billed minute; the new path adds
+no fixed delay to that minimum. Actual timing and savings still need native
+measurement. [GitHub rounds each job to whole minutes](https://docs.github.com/en/billing/reference/actions-runner-pricing).
 
 Installation inputs live in the [configuration example](runner/kvm-admission.example.json),
 [control pool configuration](runner/runscaler-intake.toml), and
@@ -312,11 +315,17 @@ retains its lease if teardown or native assignment is uncertain.
 Run `python3 runner/kvm-admission.py install-dry-run --config <configuration>`
 to list exact installation files without changing the machine. The existing
 Runscaler service's reviewed drop-in uses the adapter; the four-slot release
-service is not changed. Activation requires the dedicated App policy, qualified
+service and its shared helpers are not changed. Native files install beneath
+`/opt/hesperus-runner/native`. Activation requires the dedicated App policy, qualified
 native source/IDs, pinned immutable guest inputs and SSH identity, and a private
 operator-rotated installation-token file. No App private key goes to the PC.
 The adapter reads the short-lived status token for every API request. Keep
 the service disabled until those gates and a real native qualification pass.
+GitHub's retained `prepared_workflow_job` audit evidence identifies imposed
+validation by `@refs/heads/main`; `validation_source_ref` records that runner
+admission identity. The separate `validation_source_sha` must match the
+effective pinned required-workflow rule. Do not substitute one meaning for
+the other. The optional reusable signal remains SHA-pinned.
 
 The plan job requires `contents: read`, `actions: read`, `pull-requests: read`
 and `statuses: read`. Before upgrading a reusable `uses:` caller to this

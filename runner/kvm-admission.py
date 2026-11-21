@@ -28,12 +28,13 @@ SOURCE_SIGNAL_NAME = "Local merge admission signal"
 SIGNAL_NAME = "intake / " + SOURCE_SIGNAL_NAME
 UNIT = "hesperus-kvm-guest.service"
 CONTROL_IMAGE = "127.0.0.1:5000/hesperus/runner@sha256:7d669156418c995e9ddd99d2f5bba88b1385e35b497fad00419197921ef9450d"
+SOURCE_REPOSITORY_ID = 1333343261
 INSTALL_FILES = {
-    "kvm-admission.py": ("/opt/hesperus-runner/kvm-admission.py", "0555"),
-    "merge-routing.py": ("/opt/hesperus-runner/merge-routing.py", "0444"),
-    "jit.sh": ("/opt/hesperus-runner/jit.sh", "0444"),
-    "kvm-guest.sh": ("/opt/hesperus-runner/kvm-guest.sh", "0555"),
-    "runscaler-intake.sh": ("/opt/hesperus-runner/runscaler-intake.sh", "0555"),
+    "kvm-admission.py": ("/opt/hesperus-runner/native/kvm-admission.py", "0555"),
+    "merge-routing.py": ("/opt/hesperus-runner/native/merge-routing.py", "0444"),
+    "jit.sh": ("/opt/hesperus-runner/native/jit.sh", "0444"),
+    "kvm-guest.sh": ("/opt/hesperus-runner/native/kvm-guest.sh", "0555"),
+    "runscaler-intake.sh": ("/opt/hesperus-runner/native/runscaler-intake.sh", "0555"),
     "hesperus-kvm-guest.service": ("/etc/systemd/system/hesperus-kvm-guest.service", "0444"),
     "hesperus-kvm-guard.service": ("/etc/systemd/system/hesperus-kvm-guard.service", "0444"),
     "hesperus-runscaler-intake.conf": ("/etc/systemd/system/hesperus-runscaler.service.d/40-native-intake.conf", "0444"),
@@ -162,11 +163,17 @@ def authoritative_request(api, registration_api, hint, config):
             and control_group.get("restricted_to_workflows") is True and control_group.get("selected_workflows") == [source], "control group trust differs")
     # The optional signal cannot become an accidental required-workflow wait.
     rules = api.call(f"/repos/{repository}/rules/branches/{policy['branch']}")
+    approved_validation = False
     for rule in rules:
         parameters = rule.get("parameters", {})
         for workflow in parameters.get("workflows", []):
             require(workflow.get("path") not in (".github/workflows/merge-intake.yml", ".github/workflows/local-merge-intake.yml"), "signal is a required workflow")
+            approved_validation |= (workflow.get("path") == ".github/workflows/validate.yml"
+                                    and workflow.get("repository_id") == SOURCE_REPOSITORY_ID
+                                    and workflow.get("sha") == config["validation_source_sha"]
+                                    and workflow.get("ref") == config["validation_source_ref"].split("@", 1)[1])
         require(all(check["context"] not in (SOURCE_SIGNAL_NAME, SIGNAL_NAME) for check in parameters.get("required_status_checks", [])), "signal is a required status")
+    require(approved_validation, "effective required workflow differs from qualified source")
     runs = api.call(f'/repos/{repository}/actions/runs?event=merge_group&head_sha={signal["head_sha"]}&per_page=100')
     require(runs.get("total_count", 101) <= 100, "native run census exceeds bound")
     matches = [run for run in runs["workflow_runs"] if run.get("workflow_id") == policy["workflow_id"] and run.get("status") in ("queued", "in_progress")]
@@ -192,7 +199,7 @@ def guest_ssh(config, remote):
     return ["ssh", "-F", "/dev/null", "-i", config["guest_key"], "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=3", "-o", "StrictHostKeyChecking=yes", "-o", "ProxyUseFdpass=yes",
             "-o", "HostKeyAlias=hesperus-kvm-routine", "-o", "UserKnownHostsFile=" + config["guest_known_hosts"],
-            "-o", "ProxyCommand=python3 -I /opt/hesperus-runner/kvm-admission.py vsock",
+            "-o", "ProxyCommand=python3 -I /opt/hesperus-runner/native/kvm-admission.py vsock",
             "pilot@hesperus-kvm-routine", remote]
 
 
@@ -213,7 +220,7 @@ def admit(api, registration_api, config, request):
     require(jit.get("encoded_jit_config") and jit.get("runner", {}).get("id"), "JIT registration was not acknowledged")
     reservation["runner_id"] = jit["runner"]["id"]
     reservation["registration_at"] = time.time()
-    reservation_file(config, reservation).write_text(json.dumps(reservation) + "\n")
+    checkpoint_registration(config, reservation)
     remote = (f"docker run --rm -i --cpus 2 --memory 3g --pids-limit 4096 "
               f"--group-add $(stat -c %g /var/run/docker.sock) -v /var/run/docker.sock:/var/run/docker.sock "
               f"{image} bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig \"$jit\"'")
@@ -239,6 +246,13 @@ def admit(api, registration_api, config, request):
 def reservation_file(config, reservation):
     key = hashlib.sha256(routing.context(reservation["request"]).encode()).hexdigest()
     return Path(config["state_dir"]) / ("merge-reservation-" + key + ".json")
+
+
+def checkpoint_registration(config, reservation):
+    path = reservation_file(config, reservation)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(reservation) + "\n")
+    temporary.replace(path)
 
 
 def reconcile(api, registration_api, config, reservation, worker=None):
@@ -351,7 +365,8 @@ def activation_check(config):
             and routing.integer(issuer.get("creator_id")), "verified App is not installed; activation refused")
     require(routing.sha(config.get("signal_source_sha")) and routing.integer(config.get("signal_workflow_id"))
             and routing.integer(config.get("routine_group_id"))
-            and re.fullmatch(r"autumngarage/touchstone-workflows/\.github/workflows/validate.yml@[0-9a-f]{40}", config.get("validation_source_ref") or ""),
+            and routing.sha(config.get("validation_source_sha"))
+            and config.get("validation_source_ref") == "autumngarage/touchstone-workflows/.github/workflows/validate.yml@refs/heads/main",
             "native target has not been qualified")
     StatusAPI(config["status_token_file"])
     for filename, key in (("base.qcow2", "base_sha256"), ("seed.iso", "seed_sha256")):
