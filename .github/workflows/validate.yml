@@ -502,8 +502,8 @@ jobs:
     if: ${{ always() && github.repository != 'autumngarage/touchstone-workflows' }}
     needs: [plan, validate-groups]
     name: validate (ubuntu-latest)
-    # Reporting completed shard verdicts, on GitHub-hosted Linux.
-    runs-on: ubuntu-latest
+    # Reporting completed shard verdicts needs only a shell.
+    runs-on: ubuntu-slim
     timeout-minutes: 5
     steps:
       - name: Require every validation group
