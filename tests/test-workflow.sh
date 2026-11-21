@@ -329,7 +329,7 @@ assert_active_line_count "$workflow" 2 'VALIDATION_EVENT: ${{ needs.plan.outputs
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
+runner_selector='runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -380,6 +380,25 @@ fi
 assert_active_line "$workflow" 'group_targets: ${{ steps.plan.outputs.group_targets }}' 'planned group targets'
 assert_active_line "$workflow" 'github_overflow_group: ${{ steps.overflow.outputs.group }}' 'verified GitHub group'
 assert_active_line "$workflow" 'github_arm_group: ${{ steps.arm.outputs.group }}' 'qualified GitHub Arm group'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'local_merge_group: ${{ steps.local-merge.outputs.group }}' 'admitted local merge group'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'local_merge_labels: ${{ steps.local-merge.outputs.labels }}' 'admitted single-use selector'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'local_merge_attempt: ${{ steps.local-merge.outputs.attempt }}' 'admitted attempt binding'
+assert_active_line "$workflow" "if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch)" 'private default-branch local merge intake'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'python3 "$helper" plan' 'pinned local merge planner'
+# The helper carries committed routing policy. Every reviewed revision must
+# bind the bytes actually exercised by the source contract, including policy.
+routing_checksum="$(sed -n 's/^[[:space:]]*routing_sha256="\([0-9a-f]*\)"$/\1/p' "$workflow")"
+[ "${#routing_checksum}" -eq 64 ] || fail 'local merge helper checksum is missing or ambiguous'
+if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  actual_routing_checksum="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$repo_root/runner/merge-routing.py")"
+  [ "$routing_checksum" = "$actual_routing_checksum" ] || fail 'local merge helper differs from its protected pin'
+fi
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'printf '\''%s  %s\n'\'' "$routing_sha256" "$helper" | sha256sum --check --strict' 'local merge helper integrity check'
 assert_active_line "$workflow" "if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.LINUX_QUEUE_ARM_GROUP != ''" 'private default-branch Arm integration'
 assert_active_line "$workflow" "if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''" 'first-attempt private same-repository overflow'
 assert_active_line "$workflow" 'GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}' 'trusted GitHub overflow configuration'
@@ -574,7 +593,7 @@ fi
 assert_count 2 'touchstone_revision="[0-9a-f]{40}"'
 assert_count 3 'touchstone_sha256="[0-9a-f]{64}"'
 assert_count 3 'raw\.githubusercontent\.com/autumngarage/touchstone/'
-assert_count 4 'sha256sum --check --strict'
+assert_count 5 'sha256sum --check --strict'
 assert_count 2 'touchstone-run\.sh" validate'
 assert_count 1 'touchstone-run\.sh" prepare'
 # The workflow must pass the runner-provided variable literally.
@@ -587,6 +606,7 @@ assert_count 1 '^  merge_group:'
 assert_count 1 'types: \[checks_requested\]'
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
+  PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/tests/test-merge-routing.py"
   python3 "$repo_root/tests/test-swift-cache.py"
 fi
 
@@ -849,7 +869,7 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
       if File.basename(ARGV.fetch(0)) == "validate.yml" && job == "plan"
         effective = pairs.call(one.call(fields, "permissions", "validation plan"), "plan permissions")
         actual = effective.map { |key, value| [scalar.call(key, "scope"), scalar.call(value, "permission")] }
-        raise "validation plan needs only contents and actions read" unless actual.sort == [["actions","read"],["contents","read"]]
+        raise "validation plan needs only the declared read scopes" unless actual.sort == [["actions","read"],["contents","read"],["pull-requests","read"],["statuses","read"]]
         raise "validation jobs must inherit only contents read" unless declared_permissions == ["contents"]
       elsif fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
         raise "job #{job} must not override permissions"

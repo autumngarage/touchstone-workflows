@@ -220,8 +220,58 @@ API keeps the original placement. Qualify every command and container image in
 the group for Arm before enabling it. Clearing the variable restores the
 original placement on new runs.
 
-The plan job requires `contents: read` and `actions: read`. Before upgrading a
-reusable `uses:` caller to this revision, allow both scopes on the calling job.
+### Reserved isolated merge capacity
+
+The protected planner can assign one qualified merge group to an isolated
+single-use x64 KVM runner with Docker inside its guest. The committed
+[`POLICY`](runner/merge-routing.py) owns the eligible repository, workflow,
+group, capability and verified controller service identity. A missing issuer
+keeps installation closed; qualification measurements alone do not enable
+native placement. Other repositories require their own reviewed qualification.
+
+The planner follows GitHub's native merge-queue candidate/base chain and
+checks every contributing PR's private same-repository origin. It also requires
+an unchanged regular `.touchstone.toml` blob. Only a uniquely named, already
+hosted group can qualify. It waits at most one admission window after those
+checks, then reads commit statuses on that exact candidate. The controller's
+fresh success status must bind the repository, required workflow, run, attempt
+and group. Missing, stale, ambiguous or unavailable evidence preserves hosted
+placement. The existing qualified GitHub Arm route remains available.
+
+The controller uses the helper's `reserve` command under its existing
+`register.lock`, sharing that state directory with every controller that could
+admit the slot. Only `acquired: true` authorizes provisioning. Repeats return
+the original reservation; competing requests cannot reserve the same slot.
+After reservation, the provisioner checks capacity and release reservations,
+starts the isolated guest and acknowledges a run-specific JIT runner. The
+helper's `publish` command checks that fresh acknowledgement and GitHub's live
+runner before appending the status through a restricted App installation token.
+The returned status must identify the installed App's pinned bot account. Its
+request, receipt, status context, TTL and label contracts are defined by the
+helper; no runner administrator credential enters a workflow job.
+
+The controller's `GH_TOKEN` remains a runner registration credential;
+`GH_STATUS_TOKEN` is a separate short-lived installation token for the
+qualified repository, with Actions, Contents and Pull requests read and Commit
+statuses write. No release App private key belongs on the runner host. An
+absent or empty status token cannot fall back to the registration credential.
+
+Installation requires a separately verified service credential and a runner
+group restricted to the qualified private repository and protected workflow.
+The group must admit only isolated single-use guests, with no host Docker,
+host workspace or release labels. Keep a reservation until the controller has
+confirmed native job termination and reclaimed the guest, including an
+acknowledgement whose bounded planner window was missed. Status expiry never
+authorizes reusing possibly live capacity. A failed-job rerun cannot reuse an
+earlier attempt's selector; a full rerun needs a fresh reservation and grant.
+This route adds no paid provider admission or independent capacity controller.
+GitHub's existing organization budget hard stop owns hosted credit admission;
+a budget denial is an infrastructure hold, never a synthetic product verdict.
+Keep the delivery intent and controller recovery material when that happens.
+
+The plan job requires `contents: read`, `actions: read`, `pull-requests: read`
+and `statuses: read`. Before upgrading a reusable `uses:` caller to this
+revision, allow those scopes on the calling job.
 Candidate validation jobs retain only `contents: read`.
 
 A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for
