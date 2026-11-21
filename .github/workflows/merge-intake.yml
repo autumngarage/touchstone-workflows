@@ -1,0 +1,28 @@
+name: local merge intake
+
+# An optional caller emits demand for the existing outbound scale-set client.
+# Never install this workflow or its job as a required workflow/status: absence
+# of a control runner must leave required validation free to choose GitHub.
+on:
+  workflow_call:
+
+permissions: {}
+
+# An offline pool retains only the newest signal per repository. GitHub also
+# expires a self-hosted job after 24 hours queued; job timeout covers execution.
+concurrency:
+  group: local-merge-intake-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  signal:
+    if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    name: Local merge admission signal
+    runs-on:
+      group: hesperus-runscaler-pilot
+      labels: hesperus-runscaler-pc
+    timeout-minutes: 1
+    steps:
+      - name: Complete the trusted demand signal
+        shell: bash
+        run: printf '%s\n' 'Local merge admission signal completed.'

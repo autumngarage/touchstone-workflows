@@ -27,6 +27,7 @@
   "workflowPaths": [
     ".github/workflows/delivery-evidence.yml",
     ".github/workflows/review-gate.yml",
-    ".github/workflows/validate.yml"
+    ".github/workflows/validate.yml",
+    ".github/workflows/merge-intake.yml"
   ]
 }

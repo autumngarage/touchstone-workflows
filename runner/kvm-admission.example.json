@@ -1,0 +1,16 @@
+{
+  "repository": "autumngarage/hesperus",
+  "state_dir": "/var/lib/hesperus-runscaler/native-admission",
+  "control_group_id": 14,
+  "control_label": "hesperus-runscaler-pc",
+  "signal_workflow_id": null,
+  "signal_source_sha": null,
+  "routine_group_id": null,
+  "validation_source_ref": null,
+  "base_sha256": null,
+  "seed_sha256": null,
+  "status_token_file": "/etc/hesperus-kvm/status-token",
+  "guest_key": "/etc/hesperus-kvm/guest-key",
+  "guest_known_hosts": "/etc/hesperus-kvm/guest-known-hosts",
+  "runner_image": "sha256:7d669156418c995e9ddd99d2f5bba88b1385e35b497fad00419197921ef9450d"
+}
