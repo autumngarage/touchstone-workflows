@@ -32,6 +32,7 @@ assert_active_line() {
   assert_active_line_count "$1" 1 "$2" "$3"
 }
 
+
 assert_count 1 'name: validate \(ubuntu-latest\)'
 
 # shellcheck disable=SC2016
@@ -91,7 +92,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     event="$1" budget="$2" contract="$3" expected="$4" groups="$5"
     : >"$plan_fixture/outputs"
     EVENT_NAME="$event" VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$contract" \
-      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="${PLAN_PROJECT:-$plan_fixture}" GITHUB_OUTPUT="$plan_fixture/outputs" \
       bash -c "$plan_script" || fail "planner rejected event=$event budget=$budget"
     grep -Fxq "max_parallel=$expected" "$plan_fixture/outputs" || fail "incorrect parallel budget for $event/$budget"
     matrix="$(sed -n 's/^matrix=//p' "$plan_fixture/outputs")"
@@ -226,10 +227,101 @@ MOCK
     [ ! -s "$plan_fixture/outputs" ] || fail "invalid budget published runnable matrix outputs"
     grep -q 'VALIDATION_MAX_PARALLEL' "$plan_fixture/diagnostic" || fail "invalid budget has no diagnostic"
   done
+
+  # The validator owns eligibility; the planner admits its inventory only
+  # when the exact regular declaration is already present in the trusted base.
+  export PLAN_PROJECT="$plan_fixture/project"
+  mkdir "$PLAN_PROJECT"
+  git -C "$PLAN_PROJECT" init -q -b fixture
+  git -C "$PLAN_PROJECT" config user.name fixture
+  git -C "$PLAN_PROJECT" config user.email fixture@example.invalid
+  fixture_tasks='[{"name":"checks"},{"name":"kits-journey"},{"name":"swift-a"},{"name":"swift-b","pull_request":false},{"name":"permit-db","pull_request":false},{"name":"checks-b"}]'
+  eligibility_contract="$(jq -c '{schema:4,groups:map({name,tasks:[.name]}),pull_request_groups:map(select(.pull_request != false)|{name,tasks:[.name]})}' <<<"$fixture_tasks")"
+  {
+    printf '%s\n' 'schema = 4' '[validation]' 'runtime = "bash"' '[[validation.targets]]' 'name = "root"' 'path = "."'
+    jq -r '.[] | "[[validation.tasks]]\nname = " + (.name|@json) + "\ntarget = \"root\"\ngroup = " + (.name|@json) + "\ncommand = \"touch candidate-ran\"\nrequired = true" + (if .pull_request == false then "\npull_request = false" else "" end)' <<<"$fixture_tasks"
+  } >"$PLAN_PROJECT/.touchstone.toml"
+  git -C "$PLAN_PROJECT" add .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm base
+  VALIDATION_BASE_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  export VALIDATION_BASE_SHA
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm candidate
+  trusted_candidate="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  export GITHUB_SHA="$trusted_candidate"
+  check_event() {
+    grep -Fxq "validation_event=$1" "$plan_fixture/outputs" || fail "planner did not bind its execution event to $1"
+  }
+  check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_event pull_request
+  SAME_REPOSITORY_PR=false LEGACY_TARGET=blacksmith check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_targets '{"checks":"github","kits-journey":"github","swift-a":"github","checks-b":"github"}'
+  for event in merge_group schedule unknown; do
+    check_plan "$event" 6 "$eligibility_contract" 6 6
+    check_event ''
+  done
+  for event in push workflow_dispatch workflow_call; do
+    check_plan "$event" 6 "$eligibility_contract" 1 1
+    check_event ''
+  done
+  for change in 'del(.pull_request_groups)' '.pull_request_groups=[]' '.pull_request_groups=null' '.pull_request_groups="unknown"'; do
+    check_plan pull_request 6 "$(jq -c "$change" <<<"$eligibility_contract")" 6 6
+    check_event ''
+  done
+  for base in '' unknown 0000000000000000000000000000000000000000; do
+    VALIDATION_BASE_SHA="$base" check_plan pull_request 6 "$eligibility_contract" 6 6
+    check_event ''
+  done
+  GITHUB_SHA="$VALIDATION_BASE_SHA" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  VALIDATION_BASE_SHA="$(git -C "$PLAN_PROJECT" rev-parse "HEAD^{tree}")" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  # Worktree-only changes must not borrow the unchanged Git blobs' authority.
+  printf '\n# uncommitted change\n' >>"$PLAN_PROJECT/.touchstone.toml"
+  check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" add .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm changed-declaration
+  GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  git -C "$PLAN_PROJECT" update-index --chmod=+x .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm changed-mode
+  executable_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  GITHUB_SHA="$executable_base" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm matching-regular-executable
+  VALIDATION_BASE_SHA="$executable_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_event pull_request
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  cp "$PLAN_PROJECT/.touchstone.toml" "$PLAN_PROJECT/declaration"
+  rm "$PLAN_PROJECT/.touchstone.toml"
+  ln -s declaration "$PLAN_PROJECT/.touchstone.toml"
+  check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" add .touchstone.toml declaration
+  git -C "$PLAN_PROJECT" commit -qm symlink
+  symlink_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm matching-symlink
+  VALIDATION_BASE_SHA="$symlink_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  git -C "$PLAN_PROJECT" rm -q --cached .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm worktree-only-declaration
+  missing_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm still-untracked
+  VALIDATION_BASE_SHA="$missing_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  [ ! -e "$PLAN_PROJECT/candidate-ran" ] || fail "planning executed candidate code"
 )
 fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}' 'trusted declaration base'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'validation_event: ${{ steps.plan.outputs.validation_event }}' 'admitted event output'
+# shellcheck disable=SC2016
+assert_active_line_count "$workflow" 2 'VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}' 'preparation and execution event binding'
 
 # AUT-3412: candidate code never runs where a persistent host could keep what
 # it leaves. The one self-hosted target is the linux-ephemeral fleet, whose
@@ -543,7 +635,7 @@ jq -e '
   and .validationEngine.path == "scripts/touchstone-run.sh"
   and (.validationEngine.revision | test("^[0-9a-f]{40}$"))
   and (.validationEngine.sha256 | test("^[0-9a-f]{64}$"))
-  and .validationEngine.supportedProjectSchemas == [1, 2, 3]
+  and .validationEngine.supportedProjectSchemas == [1, 2, 3, 4]
 ' "$source_contract" >/dev/null || fail "$source_contract: invalid validation-engine contract"
 manifest_engine_revision="$(jq -r '.validationEngine.revision' "$source_contract")"
 manifest_engine_sha256="$(jq -r '.validationEngine.sha256' "$source_contract")"
@@ -577,7 +669,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
     || fail "declared validation engine checksum differs from $source_contract"
 
   engine_fixture="$(mktemp -d)"
-  for schema in 1 2 3; do
+  for schema in 1 2 3 4; do
     project="$engine_fixture/schema-$schema"
     mkdir -p "$project"
     printf '%s\n' \
@@ -596,6 +688,9 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       'target = "root"' \
       'command = "true"' \
       'required = true' >"$project/.touchstone.toml"
+    if [ "$schema" -eq 4 ]; then
+      printf '%s\n' 'pull_request = true' >>"$project/.touchstone.toml"
+    fi
     if [ "$schema" -eq 2 ]; then
       printf '%s\n' \
         '' \
@@ -621,7 +716,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       || fail "declared validation engine reported the wrong production result for project schema $schema"
   done
   rm -rf "$engine_fixture"
-  echo "  OK: declared validation engine prepares and validates project schemas 1-3"
+  echo "  OK: declared validation engine prepares and validates project schemas 1-4"
 fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$review_gate" \

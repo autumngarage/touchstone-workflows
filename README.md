@@ -19,8 +19,8 @@ repository and Touchstone's source policy. It names every top-level workflow,
 the workflow and job that publish the `source contract` status, and the exact
 required-check name. Its `validationEngine` declaration binds the consumer
 workflow's Touchstone repository, path, revision, checksum, and supported
-project schemas; the source-contract job executes schema-1 and schema-2
-fixtures with those exact bytes before an engine-pin change can land. Its
+project schemas; the source-contract job executes fixtures for every advertised
+schema with those exact bytes before an engine-pin change can land. Its
 `evidenceChecker` declaration publishes the delivery-evidence checker's repository,
 path, revision and SHA-256 digest. The evidence workflow reads that manifest at
 its defining job's immutable workflow revision (`job.workflow_*`), validates the
@@ -78,6 +78,34 @@ aggregate still run under the existing rules. This does not select runners or
 increase their resources. Changing a consumer's setting or adopting a new
 required-workflow pin requires that consumer's normal approval and rollout;
 source delivery alone does not change its live scheduling.
+
+## Pull request task eligibility
+
+The engine's [schema-4 task declaration](https://github.com/autumngarage/touchstone/blob/main/docs/validation-contract.md#schema-4--pull-request-eligibility)
+can exclude a task from PR validation with `pull_request = false`. New tasks
+remain eligible by default. The engine derives the PR inventory from those
+same declarations: a mixed group keeps its eligible tasks; an entirely
+deferred group needs no PR runner.
+
+The protected planner admits that reduction only when the GitHub candidate
+matches the checkout and the declaration is an identical regular Git blob at
+both the event's base commit and candidate commit. The actual checkout bytes
+must match too. It validates the complete contract without running project
+code before building the matrix. Changed, symlinked, untracked or unverifiable
+declarations retain the full plan. Missing eligibility metadata or an empty
+reduced inventory also retains the full plan.
+
+Both preparation and execution receive the admitted event. A full-plan
+fallback omits that event, so PR exclusions cannot suppress tasks inside an
+allocated group. Other events retain full integration coverage; pushes and
+manual/reusable cache producers retain their serial runs. Fork placement stays
+hosted, including when its declaration qualifies for fewer groups. Each run's
+plan outputs govern failed-job reruns too.
+
+This source capability does not migrate consumers or install a CLI. Before
+opting into a new schema, verify that the normal local `validate`/`adopt`
+entry points and every pinned validation caller, including cache producers,
+support it. Existing schemas and callers need no declaration changes.
 
 ## Git history transfer
 
