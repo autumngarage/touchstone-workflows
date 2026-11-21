@@ -7,4 +7,4 @@ on:
 permissions: {}
 jobs:
   intake:
-    uses: autumngarage/touchstone-workflows/.github/workflows/merge-intake.yml@REVIEWED_SOURCE_COMMIT
+    uses: autumngarage/touchstone-workflows/.github/workflows/merge-intake.yml@112aeef0c819a470f9a6a1957a8d4c898892346e

@@ -607,6 +607,7 @@ assert_count 1 'types: \[checks_requested\]'
 
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/tests/test-merge-routing.py"
+  PYTHONDONTWRITEBYTECODE=1 python3 "$repo_root/tests/test-kvm-admission.py"
   python3 "$repo_root/tests/test-swift-cache.py"
 fi
 
