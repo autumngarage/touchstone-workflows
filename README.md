@@ -262,9 +262,9 @@ Blacksmith must be installed for the consumer repository and is billed
 separately from GitHub. Adopt the reviewed workflow pin before setting a value
 it does not know.
 
-Validation planning (`plan`), its final summary (`validate`), `review-gate`,
-`delivery-evidence` and the `source contract` job run for seconds and always
-run on GitHub-hosted `ubuntu-latest`. macOS jobs keep their own routing.
+The final validation verdict uses GitHub’s single-CPU `ubuntu-slim` runner.
+The planner, `review-gate` and `delivery-evidence` use `ubuntu-latest`.
+The workflow source contract runs on `ubuntu-24.04`.
 
 ### macOS runner pool (AUT-2013)
 

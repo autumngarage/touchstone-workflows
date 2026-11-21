@@ -354,6 +354,7 @@ for job in plan validate-groups validate; do
   job_body="$(sed -n "/^  $job:/,/^  [a-z][a-z-]*:/p" "$workflow" | sed '$d')"
   expected_selector='runs-on: ubuntu-latest'
   [ "$job" != validate-groups ] || expected_selector="$runner_selector"
+  [ "$job" != validate ] || expected_selector='runs-on: ubuntu-slim'
   [ "$(printf '%s\n' "$job_body" | sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' | grep -Fxc -- "$expected_selector" || true)" -eq 1 ] \
     || fail "$workflow: $job must use its own runner selector"
 done
@@ -367,8 +368,6 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     || fail "$workflow: only candidate execution picks a cloud"
   assert_active_line <(sed -n '/^  source-contract:/,/^  plan:/p' "$workflow") \
     'runs-on: ubuntu-24.04' 'source contract runner with atomic mkdir'
-  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 2 ] \
-    || fail "$workflow: the plan and aggregation jobs must run on GitHub-hosted ubuntu-latest"
   [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 4 ] \
     || fail "$workflow: expected four runner declarations"
   for gate in "$review_gate" "$delivery_evidence"; do
