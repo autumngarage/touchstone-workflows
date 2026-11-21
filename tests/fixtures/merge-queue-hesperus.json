@@ -1,0 +1,316 @@
+{
+  "data": {
+    "repository": {
+      "databaseId": 1350057617,
+      "isPrivate": true,
+      "defaultBranchRef": {
+        "name": "main"
+      },
+      "mergeQueue": {
+        "entries": {
+          "nodes": [
+            {
+              "headCommit": {
+                "oid": "ae617019e5cd4f3c87cfe63fb70c836bf6173072"
+              },
+              "baseCommit": {
+                "oid": "92cc4c08b8334d7d00b33464bee603c8d61d438c"
+              },
+              "pullRequest": {
+                "number": 4214,
+                "headRefOid": "e54379c0062f111e1c55cfd0f5c09bda809f1fcd",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "f878528d236d76d1bc9ac5dd01c999b2c17f303b"
+              },
+              "baseCommit": {
+                "oid": "ae617019e5cd4f3c87cfe63fb70c836bf6173072"
+              },
+              "pullRequest": {
+                "number": 4270,
+                "headRefOid": "ac82e13dae48563426e906b06f942644e4d0ef63",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "53758194a4f56a6809f2e84da59f65086e0ffe8d"
+              },
+              "baseCommit": {
+                "oid": "f878528d236d76d1bc9ac5dd01c999b2c17f303b"
+              },
+              "pullRequest": {
+                "number": 4272,
+                "headRefOid": "a5d5941f54f2fa7d495c83b462e4bd70077508e8",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "c04b532bec659d2c73190e70fd99bb9c099e94e6"
+              },
+              "baseCommit": {
+                "oid": "53758194a4f56a6809f2e84da59f65086e0ffe8d"
+              },
+              "pullRequest": {
+                "number": 4273,
+                "headRefOid": "b04c62a80faa8d265b5a4217edeef7e468b33d01",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "329b3fc6158f7fb7410019b87b4d79498b21bb78"
+              },
+              "baseCommit": {
+                "oid": "c04b532bec659d2c73190e70fd99bb9c099e94e6"
+              },
+              "pullRequest": {
+                "number": 4249,
+                "headRefOid": "49095eb35e2a18c393715c9724460f5dc2e81a38",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "40f6932e55af6541fa328f1a6163d34d11b882e2"
+              },
+              "baseCommit": {
+                "oid": "329b3fc6158f7fb7410019b87b4d79498b21bb78"
+              },
+              "pullRequest": {
+                "number": 4274,
+                "headRefOid": "7813dadb1db9e65db22a74680b5936d1ebf69808",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "998296dc57a26158cdfd1828ec75a3e7926b52da"
+              },
+              "baseCommit": {
+                "oid": "40f6932e55af6541fa328f1a6163d34d11b882e2"
+              },
+              "pullRequest": {
+                "number": 4275,
+                "headRefOid": "27b1c8c82ed07a75a7fefdfd06d1101cc7e20daf",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "992fdbcd7794adee60658e210b6a3c9d498832c0"
+              },
+              "baseCommit": {
+                "oid": "998296dc57a26158cdfd1828ec75a3e7926b52da"
+              },
+              "pullRequest": {
+                "number": 4276,
+                "headRefOid": "af5b32fc84396b43fe7c27341859c4b9ee4ea645",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "e6cbf80056251535d369209a3580e8bbb19b0376"
+              },
+              "baseCommit": {
+                "oid": "992fdbcd7794adee60658e210b6a3c9d498832c0"
+              },
+              "pullRequest": {
+                "number": 4277,
+                "headRefOid": "08ba0d43eab9b93525e89ac67a1f17cf9ef27922",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "3aa3183cb6fd8aee04793c6781097f33a7625e13"
+              },
+              "baseCommit": {
+                "oid": "e6cbf80056251535d369209a3580e8bbb19b0376"
+              },
+              "pullRequest": {
+                "number": 4278,
+                "headRefOid": "38b879bd1bfccd1e33cc62b24fb4ca628161270d",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "b5d9377626967aadf3d3dde1c5591980f3cb3410"
+              },
+              "baseCommit": {
+                "oid": "3aa3183cb6fd8aee04793c6781097f33a7625e13"
+              },
+              "pullRequest": {
+                "number": 4279,
+                "headRefOid": "246334c537fc79f93013f14812d7ac18e4998c6e",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": {
+                "oid": "0507a12079ff034fbd74a19faa854d7d301301b7"
+              },
+              "baseCommit": {
+                "oid": "b5d9377626967aadf3d3dde1c5591980f3cb3410"
+              },
+              "pullRequest": {
+                "number": 4280,
+                "headRefOid": "a68a8829b98eac7d498235c6f21f9dd10bbe657c",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            },
+            {
+              "headCommit": null,
+              "baseCommit": null,
+              "pullRequest": {
+                "number": 4281,
+                "headRefOid": "6e7164d7e8e5f1be0a045f0fd81252ed4afb908f",
+                "isCrossRepository": false,
+                "headRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                },
+                "baseRepository": {
+                  "databaseId": 1350057617,
+                  "nameWithOwner": "autumngarage/hesperus",
+                  "isPrivate": true
+                }
+              }
+            }
+          ],
+          "pageInfo": {
+            "hasNextPage": false,
+            "endCursor": "MTM"
+          }
+        }
+      }
+    }
+  }
+}

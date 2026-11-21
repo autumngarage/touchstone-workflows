@@ -109,11 +109,16 @@ jobs:
     permissions:
       contents: read
       actions: read
+      pull-requests: read
+      statuses: read
     timeout-minutes: 5
     outputs:
       group_targets: ${{ steps.plan.outputs.group_targets }}
       github_overflow_group: ${{ steps.overflow.outputs.group }}
       github_arm_group: ${{ steps.arm.outputs.group }}
+      local_merge_group: ${{ steps.local-merge.outputs.group }}
+      local_merge_labels: ${{ steps.local-merge.outputs.labels }}
+      local_merge_attempt: ${{ steps.local-merge.outputs.attempt }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
       validation_event: ${{ steps.plan.outputs.validation_event }}
@@ -335,6 +340,29 @@ jobs:
             echo "Current workflow does not match the qualified integration. Keeping planned placement."
           fi
 
+      - name: Admit a qualified isolated local merge group
+        id: local-merge
+        if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch)
+        env:
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+          TARGETS: ${{ steps.plan.outputs.group_targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The planner executes only this reviewed helper, never target code.
+          routing_revision="54a8d14245c90d61926163039dd78eb71c160932"
+          routing_sha256="7f5f5fa4f45893eb4c1d34aaa625abb951c2cb59e5827d7e3a3892124cd2157b"
+          helper="$RUNNER_TEMP/merge-routing.py"
+          if ! curl --fail --silent --show-error --max-time 10 --location \
+            "https://raw.githubusercontent.com/autumngarage/touchstone-workflows/${routing_revision}/runner/merge-routing.py" \
+            --output "$helper"; then
+            echo 'Local merge admission helper unavailable. Keeping planned placement.' >&2
+            exit 0
+          fi
+          printf '%s  %s\n' "$routing_sha256" "$helper" | sha256sum --check --strict
+          python3 "$helper" plan
+          printf 'attempt=%s\n' "$GITHUB_RUN_ATTEMPT" >>"$GITHUB_OUTPUT"
+
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
@@ -345,7 +373,7 @@ jobs:
     # matrix values (its group name) to the job ID in the check list.
     # Only the protected planner can select one of these targets for a candidate group.
     # A failed-job rerun can reuse the first attempt's plan outputs.
-    runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
+    runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
