@@ -116,17 +116,19 @@ jobs:
       github_arm_group: ${{ steps.arm.outputs.group }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
+      validation_event: ${{ steps.plan.outputs.validation_event }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          fetch-depth: 2
 
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_revision="ca988d8db3bac765031c7190d4687a6d5e302890"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -137,6 +139,7 @@ jobs:
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
+          VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
           LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
           LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
@@ -170,6 +173,33 @@ jobs:
             --project "$GITHUB_WORKSPACE" \
             --check-contract \
             --json)"
+          unchanged_declaration() {
+            local base="${VALIDATION_BASE_SHA:-}" candidate="${GITHUB_SHA:-}" base_entry candidate_entry entry worktree_oid
+            [[ "$base" =~ ^[0-9a-f]{40}$ && "$candidate" =~ ^[0-9a-f]{40}$ ]] || return 1
+            [ "$(git --no-replace-objects -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)" = "$candidate" ] || return 1
+            for entry in "$base" "$candidate"; do
+              [ "$(git --no-replace-objects -C "$GITHUB_WORKSPACE" cat-file -t "$entry" 2>/dev/null)" = commit ] || return 1
+            done
+            base_entry="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" ls-tree "$base" -- .touchstone.toml 2>/dev/null)" || return 1
+            candidate_entry="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" ls-tree "$candidate" -- .touchstone.toml 2>/dev/null)" || return 1
+            for entry in "$base_entry" "$candidate_entry"; do
+              case "$entry" in '100644 blob '*|'100755 blob '*) ;; *) return 1 ;; esac
+            done
+            [ "$base_entry" = "$candidate_entry" ] || return 1
+            [ -f "$GITHUB_WORKSPACE/.touchstone.toml" ] && [ ! -L "$GITHUB_WORKSPACE/.touchstone.toml" ] || return 1
+            worktree_oid="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" hash-object --no-filters -- .touchstone.toml 2>/dev/null)" || return 1
+            [ "$worktree_oid" = "$(awk '{print $3}' <<<"$candidate_entry")" ]
+          }
+          planned_groups="$(jq -c '.groups // []' <<<"$contract")"
+          validation_event=''
+          if [ "$EVENT_NAME" = pull_request ] && jq -e '(.pull_request_groups | type == "array" and length > 0)' <<<"$contract" >/dev/null; then
+            if unchanged_declaration; then
+              planned_groups="$(jq -c '.pull_request_groups' <<<"$contract")"
+              validation_event=pull_request
+            else
+              echo 'PR declaration provenance changed or unavailable; retaining full validation.' >&2
+            fi
+          fi
           # Cache seeds stay one serial run: the saved build products must
           # come from a single complete validation. An engine whose
           # contract carries no groups inventory also runs serially, so
@@ -178,10 +208,10 @@ jobs:
           if [ "$EVENT_NAME" = workflow_call ] || [ "$EVENT_NAME" = push ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             matrix='{"include":[{"name":"all","group":""}]}'
           else
-            matrix="$(printf '%s' "$contract" | jq -c '
-              if (.groups // [] | length) == 0
+            matrix="$(printf '%s' "$planned_groups" | jq -c '
+              if length == 0
               then {"include":[{"name":"all","group":""}]}
-              else {"include":[.groups[] | {"name":.name,"group":.name}]}
+              else {"include":[.[] | {"name":.name,"group":.name}]}
               end')"
           fi
           requested_parallelism="${VALIDATION_MAX_PARALLEL:-2}"
@@ -222,6 +252,7 @@ jobs:
             printf 'group_targets=%s\n' "$targets"
             printf 'matrix=%s\n' "$matrix"
             printf 'max_parallel=%s\n' "$requested_parallelism"
+            printf 'validation_event=%s\n' "$validation_event"
           } >>"$GITHUB_OUTPUT"
 
       - name: Verify GitHub overflow grant
@@ -343,8 +374,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_revision="ca988d8db3bac765031c7190d4687a6d5e302890"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -355,15 +386,19 @@ jobs:
         if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
         env:
           VALIDATION_GROUP: ${{ matrix.group }}
+          VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}
         run: |
           set -euo pipefail
-          group_args=()
+          selection_args=()
           if [ -n "$VALIDATION_GROUP" ]; then
-            group_args=(--group "$VALIDATION_GROUP")
+            selection_args+=(--group "$VALIDATION_GROUP")
+          fi
+          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
+            selection_args+=(--event pull_request)
           fi
           bash "$RUNNER_TEMP/touchstone-run.sh" prepare \
             --project "$GITHUB_WORKSPACE" \
-            "${group_args[@]}" \
+            ${selection_args[@]+"${selection_args[@]}"} \
             --json
 
       - name: Identify optional Swift build cache
@@ -409,20 +444,24 @@ jobs:
           # Empty for the serial run (cache seeds, engines without a groups
           # inventory); otherwise this shard's declared group name.
           VALIDATION_GROUP: ${{ matrix.group }}
+          VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}
           TOUCHSTONE_SWIFT_CACHE_KEY: ${{ steps.swift-cache.outputs.key }}
           TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY: ${{ steps.restore-swift-cache.outputs.cache-matched-key }}
         run: |
           set -euo pipefail
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
-          group_args=()
+          selection_args=()
           if [ -n "$VALIDATION_GROUP" ]; then
-            group_args=(--group "$VALIDATION_GROUP")
+            selection_args+=(--group "$VALIDATION_GROUP")
+          fi
+          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
+            selection_args+=(--event pull_request)
           fi
           bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
-            "${group_args[@]}" \
+            ${selection_args[@]+"${selection_args[@]}"} \
             --json
 
       - name: Verify cached toolchain stayed in force
