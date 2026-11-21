@@ -74,8 +74,9 @@ jobs:
     # keeps changes to the adapter reviewable without adding work to consumers.
     if: github.repository == 'autumngarage/touchstone-workflows'
     name: source contract
-    # Runs this repository's candidate tests on GitHub-hosted Linux.
-    runs-on: ubuntu-latest
+    # The supervisor fixtures require atomic mkdir. Ubuntu 26.04's uutils
+    # can report two owners of one directory (Ubuntu bug 2171333).
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Checkout workflow source
@@ -105,19 +106,29 @@ jobs:
     name: validate plan
     # Trusted declaration parsing, on GitHub-hosted Linux.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     timeout-minutes: 5
     outputs:
+      group_targets: ${{ steps.plan.outputs.group_targets }}
+      github_overflow_group: ${{ steps.overflow.outputs.group }}
+      github_arm_group: ${{ steps.arm.outputs.group }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
+      validation_event: ${{ steps.plan.outputs.validation_event }}
     steps:
       - name: Checkout target repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          fetch-depth: 2
 
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_revision="ca988d8db3bac765031c7190d4687a6d5e302890"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -128,11 +139,17 @@ jobs:
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
+          VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
           LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
           LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
           LINUX_QUEUE_RUNNER: ${{ vars.LINUX_QUEUE_RUNNER }}
           INPUT_RUNNER: ${{ inputs.runner }}
+          LEGACY_TARGET: ${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}
+          LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}
+          PRIVATE_PR: ${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}
+          SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+          LOCAL_SEED: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}
         run: |
           set -euo pipefail
           # A misspelt runner would fall through to another one unnoticed.
@@ -156,6 +173,33 @@ jobs:
             --project "$GITHUB_WORKSPACE" \
             --check-contract \
             --json)"
+          unchanged_declaration() {
+            local base="${VALIDATION_BASE_SHA:-}" candidate="${GITHUB_SHA:-}" base_entry candidate_entry entry worktree_oid
+            [[ "$base" =~ ^[0-9a-f]{40}$ && "$candidate" =~ ^[0-9a-f]{40}$ ]] || return 1
+            [ "$(git --no-replace-objects -C "$GITHUB_WORKSPACE" rev-parse HEAD 2>/dev/null)" = "$candidate" ] || return 1
+            for entry in "$base" "$candidate"; do
+              [ "$(git --no-replace-objects -C "$GITHUB_WORKSPACE" cat-file -t "$entry" 2>/dev/null)" = commit ] || return 1
+            done
+            base_entry="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" ls-tree "$base" -- .touchstone.toml 2>/dev/null)" || return 1
+            candidate_entry="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" ls-tree "$candidate" -- .touchstone.toml 2>/dev/null)" || return 1
+            for entry in "$base_entry" "$candidate_entry"; do
+              case "$entry" in '100644 blob '*|'100755 blob '*) ;; *) return 1 ;; esac
+            done
+            [ "$base_entry" = "$candidate_entry" ] || return 1
+            [ -f "$GITHUB_WORKSPACE/.touchstone.toml" ] && [ ! -L "$GITHUB_WORKSPACE/.touchstone.toml" ] || return 1
+            worktree_oid="$(git --no-replace-objects -C "$GITHUB_WORKSPACE" hash-object --no-filters -- .touchstone.toml 2>/dev/null)" || return 1
+            [ "$worktree_oid" = "$(awk '{print $3}' <<<"$candidate_entry")" ]
+          }
+          planned_groups="$(jq -c '.groups // []' <<<"$contract")"
+          validation_event=''
+          if [ "$EVENT_NAME" = pull_request ] && jq -e '(.pull_request_groups | type == "array" and length > 0)' <<<"$contract" >/dev/null; then
+            if unchanged_declaration; then
+              planned_groups="$(jq -c '.pull_request_groups' <<<"$contract")"
+              validation_event=pull_request
+            else
+              echo 'PR declaration provenance changed or unavailable; retaining full validation.' >&2
+            fi
+          fi
           # Cache seeds stay one serial run: the saved build products must
           # come from a single complete validation. An engine whose
           # contract carries no groups inventory also runs serially, so
@@ -164,10 +208,10 @@ jobs:
           if [ "$EVENT_NAME" = workflow_call ] || [ "$EVENT_NAME" = push ] || [ "$EVENT_NAME" = workflow_dispatch ]; then
             matrix='{"include":[{"name":"all","group":""}]}'
           else
-            matrix="$(printf '%s' "$contract" | jq -c '
-              if (.groups // [] | length) == 0
+            matrix="$(printf '%s' "$planned_groups" | jq -c '
+              if length == 0
               then {"include":[{"name":"all","group":""}]}
-              else {"include":[.groups[] | {"name":.name,"group":.name}]}
+              else {"include":[.[] | {"name":.name,"group":.name}]}
               end')"
           fi
           requested_parallelism="${VALIDATION_MAX_PARALLEL:-2}"
@@ -181,8 +225,115 @@ jobs:
           if [ "${#requested_parallelism}" -gt "${#group_count}" ] || [ "$requested_parallelism" -gt "$group_count" ]; then
             requested_parallelism="$group_count"
           fi
-          printf 'matrix=%s\n' "$matrix" >>"$GITHUB_OUTPUT"
-          printf 'max_parallel=%s\n' "$requested_parallelism" >>"$GITHUB_OUTPUT"
+          # Keep placement out of the matrix: GitHub includes every matrix value in its check name.
+          if [ -z "${LINUX_LOCAL_PR_GROUPS:-}" ]; then
+            legacy_target="${LEGACY_TARGET:-github}"
+            # A fork must not inherit the base repository's global runner setting.
+            if [ "$EVENT_NAME" = pull_request ] && [ "${SAME_REPOSITORY_PR:-}" != true ]; then
+              legacy_target=github
+            fi
+            targets="$(jq -c --arg target "$legacy_target" '
+              .include | unique_by(.name | ascii_downcase) | map({key:.name, value:$target}) | from_entries
+            ' <<<"$matrix")"
+          else
+            targets="$(jq -ce --argjson local_groups "$LINUX_LOCAL_PR_GROUPS" \
+              --arg private_pr "$PRIVATE_PR" --arg local_seed "$LOCAL_SEED" '
+              if ($local_groups | type != "array" or any(.[]; type != "string" or (test("^[A-Za-z0-9._-]+\\z") | not)))
+              then error("LINUX_LOCAL_PR_GROUPS must be a JSON array of named groups") else . end
+              | .include | group_by(.name | ascii_downcase) | map(
+                  # Actions object keys ignore case. A differently cased sibling must not inherit a local slot.
+                  {key: .[0].name, value: (
+                    if $local_seed == "true" and .[0].group == "" then "local"
+                    elif $private_pr == "true" and all(.[]; .group as $g | $local_groups | index($g) != null) then "local"
+                    else "github" end)})
+              | from_entries' <<<"$matrix")"
+          fi
+          {
+            printf 'group_targets=%s\n' "$targets"
+            printf 'matrix=%s\n' "$matrix"
+            printf 'max_parallel=%s\n' "$requested_parallelism"
+            printf 'validation_event=%s\n' "$validation_event"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Verify GitHub overflow grant
+        id: overflow
+        if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''
+        env:
+          GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+          TARGETS: ${{ steps.plan.outputs.group_targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Multiple matrix names can share a case-insensitive Actions key.
+          # Exactly one already-local job must match before spending an API read.
+          if ! group="$(jq -ner --argjson grant "$GRANT" --argjson planned_matrix "$MATRIX" --argjson planned_targets "$TARGETS" \
+            --arg repo "$GITHUB_REPOSITORY_ID" --arg number "$GITHUB_RUN_NUMBER" '
+            $grant | select(
+              keys == ["event","expires_at","group","repository_id","run_number","v","workflow_id"]
+              and .v == 1 and .event == "pull_request" and .repository_id == $repo
+              and (.run_number | type == "number" and tostring == $number)
+              and (.workflow_id | type == "number" and floor == . and . > 0)
+              and (.expires_at | type == "number" and floor == . and . > now and . <= now + 600)
+            ) | .group as $g | select($planned_targets[$g] == "local"
+              and ([$planned_matrix.include[] | select((.name | ascii_downcase) == ($g | ascii_downcase)) | .group] == [$g])
+            ) | $g' 2>/dev/null)"; then
+            echo "No matching GitHub overflow grant. Keeping planned placement."
+            exit 0
+          fi
+          if ! run="$(curl --fail --silent --show-error --max-time 10 \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"; then
+            echo "Could not read current run metadata. Keeping planned placement."
+            exit 0
+          fi
+          if jq -e --argjson grant "$GRANT" --arg id "$GITHUB_RUN_ID" '
+            (.id | tostring) == $id and (.repository.id | tostring) == $grant.repository_id
+            and .workflow_id == $grant.workflow_id and .run_number == $grant.run_number
+            and .event == $grant.event and .path == ".github/workflows/validate.yml"
+            and .run_attempt == 1 and $grant.expires_at > now
+          ' <<<"$run" >/dev/null; then
+            printf 'group=%s\n' "$group" >>"$GITHUB_OUTPUT"
+            echo "Selected GitHub-hosted Ubuntu for $group."
+          else
+            echo "Current run does not match its overflow grant. Keeping planned placement."
+          fi
+
+      - name: Select standard GitHub Arm for a qualified integration group
+        id: arm
+        if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.LINUX_QUEUE_ARM_GROUP != ''
+        env:
+          CONFIG: ${{ vars.LINUX_QUEUE_ARM_GROUP }}
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+          TARGETS: ${{ steps.plan.outputs.group_targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Actions compares strings without case. Only one exactly named, already-hosted group qualifies.
+          if ! group="$(jq -ner --argjson config "$CONFIG" --argjson planned_matrix "$MATRIX" --argjson planned_targets "$TARGETS" '
+            $config | select(keys == ["group","workflow_id"] and (.workflow_id | type == "number" and . > 0 and floor == .))
+            | .group | select(type == "string" and test("^[A-Za-z0-9._-]+\\z")) as $g
+            | select($planned_targets[$g] == "github" and ([$planned_matrix.include[] | select((.name | ascii_downcase) == ($g | ascii_downcase)) | .group] == [$g]))
+            | $g' 2>/dev/null)"; then
+            echo "No qualified GitHub Arm group. Keeping planned placement."
+            exit 0
+          fi
+          if ! run="$(curl --fail --silent --show-error --max-time 10 --header "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"; then
+            echo "Could not read integration run metadata. Keeping planned placement."
+            exit 0
+          fi
+          # A reusable caller inherits its triggering event. Require the repository's own required run.
+          if jq -e --argjson config "$CONFIG" --arg id "$GITHUB_RUN_ID" --arg repo "$GITHUB_REPOSITORY_ID" --arg sha "$GITHUB_SHA" '
+            (.id | tostring) == $id and (.repository.id | tostring) == $repo
+            and .workflow_id == $config.workflow_id and .path == ".github/workflows/validate.yml"
+            and .event == "merge_group" and .head_sha == $sha and .referenced_workflows == []
+          ' <<<"$run" >/dev/null; then
+            printf 'group=%s\n' "$group" >>"$GITHUB_OUTPUT"
+            echo "Selected standard GitHub Arm for $group."
+          else
+            echo "Current workflow does not match the qualified integration. Keeping planned placement."
+          fi
 
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
@@ -192,17 +343,9 @@ jobs:
     # No display name: a templated one would breach the source contract's
     # literal job-name guard, and GitHub already appends each shard's
     # matrix values (its group name) to the job ID in the check list.
-    # Executes the candidate's own declared commands. Static switches, all
-    # repository settings, pick the runner; nothing rewrites them at run time.
-    # See "Runner" in README.md.
-    #   LINUX_PR_RUNNER    pull requests from this repository
-    #   LINUX_QUEUE_RUNNER the merge queue
-    #   each `local` (the single-use linux-ephemeral fleet), `blacksmith` or
-    #   `github`; unset falls back to LINUX_VALIDATION_RUNNER (`blacksmith`
-    #   or `github`), then BLACKSMITH_LINUX=true, then GitHub-hosted. A fork's
-    #   pull request never runs local. A reusable caller's `runner` input
-    #   names the runner outright. The plan job refuses any other value.
-    runs-on: ${{ inputs.blacksmith && 'blacksmith-4vcpu-ubuntu-2404' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github'] }}
+    # Only the protected planner can select one of these targets for a candidate group.
+    # A failed-job rerun can reuse the first attempt's plan outputs.
+    runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
@@ -231,8 +374,8 @@ jobs:
       - name: Fetch pinned Touchstone validator
         run: |
           set -euo pipefail
-          touchstone_revision="243a9dfadef14218d5eceb02177a6294d6587af2"
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_revision="ca988d8db3bac765031c7190d4687a6d5e302890"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -243,15 +386,19 @@ jobs:
         if: vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''
         env:
           VALIDATION_GROUP: ${{ matrix.group }}
+          VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}
         run: |
           set -euo pipefail
-          group_args=()
+          selection_args=()
           if [ -n "$VALIDATION_GROUP" ]; then
-            group_args=(--group "$VALIDATION_GROUP")
+            selection_args+=(--group "$VALIDATION_GROUP")
+          fi
+          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
+            selection_args+=(--event pull_request)
           fi
           bash "$RUNNER_TEMP/touchstone-run.sh" prepare \
             --project "$GITHUB_WORKSPACE" \
-            "${group_args[@]}" \
+            ${selection_args[@]+"${selection_args[@]}"} \
             --json
 
       - name: Identify optional Swift build cache
@@ -297,20 +444,24 @@ jobs:
           # Empty for the serial run (cache seeds, engines without a groups
           # inventory); otherwise this shard's declared group name.
           VALIDATION_GROUP: ${{ matrix.group }}
+          VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}
           TOUCHSTONE_SWIFT_CACHE_KEY: ${{ steps.swift-cache.outputs.key }}
           TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY: ${{ steps.restore-swift-cache.outputs.cache-matched-key }}
         run: |
           set -euo pipefail
-          touchstone_sha256="60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a"
+          touchstone_sha256="dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
-          group_args=()
+          selection_args=()
           if [ -n "$VALIDATION_GROUP" ]; then
-            group_args=(--group "$VALIDATION_GROUP")
+            selection_args+=(--group "$VALIDATION_GROUP")
+          fi
+          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
+            selection_args+=(--event pull_request)
           fi
           bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
-            "${group_args[@]}" \
+            ${selection_args[@]+"${selection_args[@]}"} \
             --json
 
       - name: Verify cached toolchain stayed in force

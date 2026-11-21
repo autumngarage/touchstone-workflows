@@ -104,6 +104,12 @@ case "$1" in
     exit "${FAKE_DOCKER_RC:-0}"
     ;;
   ps) cat "$FAKE_STATE/leftovers" 2>/dev/null || true ;;
+  # docker-down: the engine never answers. engine-dies: it stops answering once a container ran.
+  info)
+    [ ! -f "$FAKE_STATE/docker-down" ] || exit 1
+    { [ -f "$FAKE_STATE/engine-dies" ] && [ -f "$FAKE_STATE/started" ]; } && exit 1
+    exit 0
+    ;;
   *) exit 0 ;;
 esac
 EOF
@@ -121,7 +127,23 @@ cat >"$bin/launchctl" <<'EOF'
 #!/usr/bin/env bash
 printf 'launchctl %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
+  kill) : >"$FAKE_STATE/term-sent" ;;
+  bootout) : >"$FAKE_STATE/booted-out" ;;
+esac
+case "$1" in
   print)
+    # service-draining: a supervisor runs (pid 4242) until its TERM, then
+    # drains for 30 more looks, longer than launchd's 60 s after a bootout,
+    # and exits 0, staying loaded but stopped. service-never-drains: it runs on.
+    if { [ -f "$FAKE_STATE/service-draining" ] || [ -f "$FAKE_STATE/service-never-drains" ]; } && [ ! -f "$FAKE_STATE/booted-out" ]; then
+      if [ -f "$FAKE_STATE/term-sent" ] && [ -f "$FAKE_STATE/service-draining" ]; then
+        count="$(cat "$FAKE_STATE/drain-count" 2>/dev/null || echo 0)"
+        echo $((count + 1)) >"$FAKE_STATE/drain-count"
+        [ "$count" -lt 30 ] || { printf '\tstate = not running\n'; exit 0; }
+      fi
+      printf '\tstate = running\n\tpid = 4242\n'
+      exit 0
+    fi
     # service-stays: the service being replaced never leaves.
     [ ! -f "$FAKE_STATE/service-stays" ] || exit 0
     # service-lingers: it is still there for the first two looks after its
@@ -150,6 +172,7 @@ printf 'colima %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
   status) [ -f "$FAKE_STATE/colima-up" ] ;;
   start) [ ! -f "$FAKE_STATE/colima-fails" ] ;;
+  stop) rm -f "$FAKE_STATE/colima-up" ;;
 esac
 EOF
 # id: root unless the not-root flag is set; the user and group names the
@@ -391,6 +414,44 @@ DOCKER_RC=125 runner run
 has 'sleep 15' "immediate container failure"
 ok "a container that dies at once waits before the next registration"
 
+echo "==> an engine that stops answering is started again, with no one stepping in"
+ENGINE=colima FLAGS='colima-up docker-down' runner run
+[ "$rc" -eq 0 ] || fail "a supervisor starting on a VM whose engine is dead exited $rc: $(cat "$tmp/out")"
+[ "$(line_of 'colima stop --force')" -lt "$(line_of 'colima start')" ] \
+  || fail "a running VM whose engine does not answer was not stopped and started again: $(cat "$tmp/calls")"
+ok "a VM that runs while its engine does not answer is stopped and started again at start-up"
+ENGINE=colima FLAGS='colima-up' runner run
+lacks 'colima (stop|start)' "a healthy VM"
+ok "a VM whose engine answers is left alone"
+# A container that fails at once while the engine is gone: the supervisor stops at once, so
+# launchd starts it again, and no slot retries against the dead engine.
+set -m
+rm -rf "${tmp:?}/state" "${tmp:?}/fake"
+mkdir -p "$tmp/state" "$tmp/fake"
+: >"$tmp/calls"
+touch "$tmp/fake/colima-up" "$tmp/fake/engine-dies" "$tmp/fake/delete-ok"
+PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+  LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=2 LINUX_RUNNER_MAX_JOBS=5 \
+  LINUX_RUNNER_ENGINE=colima LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
+  FAKE_HOME="$tmp/home" FAKE_DOCKER_RC=125 FAKE_REAL_SLEEP_FOR=none \
+  bash "$script" run >"$tmp/out" 2>&1 &
+sup=$!
+deadline=$((SECONDS + 15))
+while kill -0 "$sup" 2>/dev/null; do
+  [ "$SECONDS" -lt "$deadline" ] || { kill -KILL "$sup" 2>/dev/null; fail "a supervisor whose engine died kept running: $(cat "$tmp/out")"; }
+  /bin/sleep 0.1
+done
+wait "$sup" 2>/dev/null || true
+set +m
+grep -Fq 'the container engine stopped answering' "$tmp/out" || fail "the lost engine is not logged: $(cat "$tmp/out")"
+grep -Fq 'stopping at once' "$tmp/out" || fail "the supervisor drained instead of stopping: $(cat "$tmp/out")"
+[ "$(grep -c '^docker run ' "$tmp/calls")" -le 2 ] || fail "slots kept starting containers on a dead engine: $(grep -c '^docker run ' "$tmp/calls")"
+ok "a container that fails at once on a dead engine stops the supervisor for launchd to restart"
+DOCKER_RC=125 ENGINE=colima FLAGS='colima-up' runner run
+has 'sleep 15' "an immediate failure with the engine answering"
+! grep -Fq 'stopped answering' "$tmp/out" || fail "a container's own failure was taken for a lost engine: $(cat "$tmp/out")"
+ok "a container that fails at once while the engine answers only waits"
+
 echo "==> it registers only into exactly one named group, with an image present"
 # refused TEXT LABEL: the last run failed and said TEXT.
 refused() {
@@ -549,6 +610,25 @@ grep -q 'was still in launchd 60s after its bootout' "$tmp/out" || fail "the ref
 lacks 'launchctl bootstrap system' "an install over a daemon that never left"
 grep -q 'installed com.autumngarage.linux-ephemeral-runner' "$tmp/out" && fail "an install over a daemon that never left reported success: $(cat "$tmp/out")"
 ok "the install waits for the daemon it replaces, retries the load, and names the command if it cannot"
+# #112: bootout lets launchd kill a supervisor 60 s after its signal, which cut
+# off a release job a minute into its drain. A running supervisor gets its own
+# TERM, is waited for until its jobs finish, and only then is booted out.
+seed_token
+FLAGS=service-draining KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon over a draining fleet exited $rc: $(cat "$tmp/out")"
+has 'launchctl kill TERM system/com.autumngarage.linux-ephemeral-runner' "an install over a running fleet"
+[ "$(line_of 'launchctl kill TERM')" -lt "$(line_of 'launchctl bootout system')" ] || fail "the fleet was booted out before it was asked to drain: $(cat "$tmp/calls")"
+[ "$(sed -n "$(line_of 'launchctl kill TERM'),$(line_of 'launchctl bootout system')p" "$tmp/calls" | grep -c '^sleep 5$')" -ge 30 ] \
+  || fail "the install did not wait out a drain longer than launchd's 60 s: $(cat "$tmp/calls")"
+grep -Fq '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>' "$dplist" \
+  || fail "a drained supervisor exits 0, and launchd must not start it again before the new one loads"
+# A supervisor still running at the plist's ExitTimeOut is ended by bootout.
+seed_token
+FLAGS=service-never-drains KEEP_HOME=1 runner install-daemon "$real_user"
+[ "$rc" -eq 0 ] || fail "install-daemon over a fleet that never drained exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c '^sleep 5$' "$tmp/calls")" -eq 1080 ] || fail "the drain wait was not bounded by the plist's ExitTimeOut (5400 s): $(grep -c '^sleep 5$' "$tmp/calls") waits"
+grep -q 'still running after 5400s; launchd ends it now' "$tmp/out" || fail "the install did not say it ended a supervisor that outlived its drain: $(cat "$tmp/out")"
+ok "a reinstall lets the running jobs finish, up to the plist's ExitTimeOut, before it boots the fleet out"
 seed_token
 KEEP_HOME=1 runner install-daemon "$real_user"
 [ -f "$dplist" ] && [ -f "$rule" ] || fail "install-daemon left nothing to uninstall"

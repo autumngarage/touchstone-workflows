@@ -19,8 +19,8 @@ repository and Touchstone's source policy. It names every top-level workflow,
 the workflow and job that publish the `source contract` status, and the exact
 required-check name. Its `validationEngine` declaration binds the consumer
 workflow's Touchstone repository, path, revision, checksum, and supported
-project schemas; the source-contract job executes schema-1 and schema-2
-fixtures with those exact bytes before an engine-pin change can land. Its
+project schemas; the source-contract job executes fixtures for every advertised
+schema with those exact bytes before an engine-pin change can land. Its
 `evidenceChecker` declaration publishes the delivery-evidence checker's repository,
 path, revision and SHA-256 digest. The evidence workflow reads that manifest at
 its defining job's immutable workflow revision (`job.workflow_*`), validates the
@@ -78,6 +78,34 @@ aggregate still run under the existing rules. This does not select runners or
 increase their resources. Changing a consumer's setting or adopting a new
 required-workflow pin requires that consumer's normal approval and rollout;
 source delivery alone does not change its live scheduling.
+
+## Pull request task eligibility
+
+The engine's [schema-4 task declaration](https://github.com/autumngarage/touchstone/blob/main/docs/validation-contract.md#schema-4--pull-request-eligibility)
+can exclude a task from PR validation with `pull_request = false`. New tasks
+remain eligible by default. The engine derives the PR inventory from those
+same declarations: a mixed group keeps its eligible tasks; an entirely
+deferred group needs no PR runner.
+
+The protected planner admits that reduction only when the GitHub candidate
+matches the checkout and the declaration is an identical regular Git blob at
+both the event's base commit and candidate commit. The actual checkout bytes
+must match too. It validates the complete contract without running project
+code before building the matrix. Changed, symlinked, untracked or unverifiable
+declarations retain the full plan. Missing eligibility metadata or an empty
+reduced inventory also retains the full plan.
+
+Both preparation and execution receive the admitted event. A full-plan
+fallback omits that event, so PR exclusions cannot suppress tasks inside an
+allocated group. Other events retain full integration coverage; pushes and
+manual/reusable cache producers retain their serial runs. Fork placement stays
+hosted, including when its declaration qualifies for fewer groups. Each run's
+plan outputs govern failed-job reruns too.
+
+This source capability does not migrate consumers or install a CLI. Before
+opting into a new schema, verify that the normal local `validate`/`adopt`
+entry points and every pinned validation caller, including cache producers,
+support it. Existing schemas and callers need no declaration changes.
 
 ## Git history transfer
 
@@ -147,10 +175,51 @@ Consumer policy must adopt the reviewed workflow pin before this takes effect.
 
 ## Runner
 
-Static repository settings route `validate-groups`, the job that runs the
-candidate's declared commands. Nothing rewrites them at run time: no watcher,
-no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
-`LINUX_GATE_RUNNER` routing is retired, AUT-3412).
+The protected plan assigns a runner to each validation group when the workflow
+starts. A private repository can set `LINUX_LOCAL_PR_GROUPS` to a JSON array
+of exact, case-sensitive group names it has qualified on its single-use Linux
+pool, for example `["lint","unit"]`. On a pull request from the same repository,
+each listed group waits for an eligible local runner. All other groups run on
+GitHub-hosted Ubuntu. If groups differ only by case, every spelling in the
+matrix must qualify before those jobs can use the pool.
+
+With this setting, forks, merge candidates, scheduled validation and ordinary
+cache producers use GitHub-hosted Ubuntu. A private repository’s default-branch
+push or manual caller can explicitly select `runner: local` for its serial run
+to seed a local cache. A Blacksmith request cannot select a paid runner
+under this policy. Set `[]` to send all PR groups to GitHub-hosted Ubuntu.
+An operator can temporarily place one of those local PR groups on GitHub-hosted
+Ubuntu by setting the repository variable `LINUX_GITHUB_OVERFLOW` to a JSON
+object. For example, the following grants group `unit` in one workflow run.
+
+```json
+{"v":1,"repository_id":"37","workflow_id":42,"run_number":19,"event":"pull_request","group":"unit","expires_at":1800000000}
+```
+
+Set `expires_at` to a Unix timestamp within the next ten minutes. The planner
+checks GitHub’s record for the current run, including the repository, workflow,
+path and run number. An expired grant, unavailable API, or ambiguous group
+preserves the original placement. Failed-job and full reruns use the original
+local assignment. The grant applies only to GitHub-hosted Ubuntu.
+
+A private repository can place one native Arm-compatible integration group on
+standard GitHub-hosted `ubuntu-24.04-arm`. Set `LINUX_QUEUE_ARM_GROUP` to
+`{"group":"unit","workflow_id":42}`, using the numeric workflow ID from a
+required validation run in the consuming repository. The planner confirms the
+default-branch merge group, current run identity and unique group name. The
+group must already target GitHub. Other workflows and groups keep their
+planned runner. An absent or invalid configuration or an unavailable GitHub
+API keeps the original placement. Qualify every command and container image in
+the group for Arm before enabling it. Clearing the variable restores the
+original placement on new runs.
+
+The plan job requires `contents: read` and `actions: read`. Before upgrading a
+reusable `uses:` caller to this revision, allow both scopes on the calling job.
+Candidate validation jobs retain only `contents: read`.
+
+A missing or empty `LINUX_LOCAL_PR_GROUPS` preserves the following routing for
+existing consumers. Fork PRs, or PRs whose same-repository origin cannot be
+established, always use GitHub-hosted Ubuntu even when a global target is set.
 
 | Setting | Applies to | Values |
 |---|---|---|
@@ -159,12 +228,13 @@ no overflow, no org-variable membership (the dynamic `LINUX_RUNNER` and
 | `LINUX_VALIDATION_RUNNER` | the default for both, and pushes and reusable callers | `blacksmith`, `github` |
 
 - `local` is the single-use `linux-ephemeral` fleet: each runner takes one job
-  in a fresh container with no mounts or credentials, then exits. A fork's
-  pull request never runs there; it takes the default. Its supervisor is
+  in a fresh container with no mounts or credentials, then exits. Its supervisor is
   `runner/linux-runner.sh`, run at boot by
   `sudo bash runner/linux-runner.sh install-daemon <user>`: N identical
   single-use slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled
-  `linux-ephemeral` for one job, with no slot roles or cache images.
+  `linux-ephemeral` for one job, with no slot roles or cache images. Installing
+  again replaces a running fleet without cutting a job: its running jobs
+  finish first, for up to the daemon's `ExitTimeOut` (90 minutes).
 - `blacksmith` is Blacksmith's 4-vCPU Ubuntu 24.04 runner, and `github` is
   GitHub-hosted `ubuntu-latest`.
 - Unset settings fall through: the per-event setting, then

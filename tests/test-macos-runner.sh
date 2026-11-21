@@ -432,7 +432,7 @@ SLOTS=3 QUEUE_SLOTS=1 FLAGS=hold-registration QUEUED_JOBS='pr\n' runner run
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 0 ] || fail "an empty queue withheld a Mac slot from PRs"
 ok "without queue demand all Mac slots can serve PRs"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration in-progress-run' QUEUED_JOBS='queue\npr\n' runner run
-[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "an in-progress workflow hid its waiting Mac job: $(cat "$tmp/out") $(cat "$tmp/calls")"
+[ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "an in-progress workflow hid its waiting Mac job: $(cat "$tmp/out") $(grep -E 'generate-jitconfig|actions/runs|runners/' "$tmp/calls")"
 ok "waiting jobs in a partially started Mac workflow contribute demand"
 SLOTS=3 QUEUE_SLOTS=1 FLAGS='hold-registration runs-fail' runner run
 [ "$rc" -eq 0 ] && [ "$(queue_only)" -eq 1 ] || fail "unreadable demand did not keep the bounded fallback reservation"
