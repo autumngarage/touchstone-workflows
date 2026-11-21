@@ -113,6 +113,7 @@ jobs:
     outputs:
       group_targets: ${{ steps.plan.outputs.group_targets }}
       github_overflow_group: ${{ steps.overflow.outputs.group }}
+      github_arm_group: ${{ steps.arm.outputs.group }}
       matrix: ${{ steps.plan.outputs.matrix }}
       max_parallel: ${{ steps.plan.outputs.max_parallel }}
     steps:
@@ -261,6 +262,42 @@ jobs:
             echo "Current run does not match its overflow grant. Keeping planned placement."
           fi
 
+      - name: Select standard GitHub Arm for a qualified integration group
+        id: arm
+        if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.LINUX_QUEUE_ARM_GROUP != ''
+        env:
+          CONFIG: ${{ vars.LINUX_QUEUE_ARM_GROUP }}
+          MATRIX: ${{ steps.plan.outputs.matrix }}
+          TARGETS: ${{ steps.plan.outputs.group_targets }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Actions compares strings without case. Only one exactly named, already-hosted group qualifies.
+          if ! group="$(jq -ner --argjson config "$CONFIG" --argjson planned_matrix "$MATRIX" --argjson planned_targets "$TARGETS" '
+            $config | select(keys == ["group","workflow_id"] and (.workflow_id | type == "number" and . > 0 and floor == .))
+            | .group | select(type == "string" and test("^[A-Za-z0-9._-]+\\z")) as $g
+            | select($planned_targets[$g] == "github" and ([$planned_matrix.include[] | select((.name | ascii_downcase) == ($g | ascii_downcase)) | .group] == [$g]))
+            | $g' 2>/dev/null)"; then
+            echo "No qualified GitHub Arm group. Keeping planned placement."
+            exit 0
+          fi
+          if ! run="$(curl --fail --silent --show-error --max-time 10 --header "Authorization: Bearer $GH_TOKEN" \
+            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")"; then
+            echo "Could not read integration run metadata. Keeping planned placement."
+            exit 0
+          fi
+          # A reusable caller inherits its triggering event. Require the repository's own required run.
+          if jq -e --argjson config "$CONFIG" --arg id "$GITHUB_RUN_ID" --arg repo "$GITHUB_REPOSITORY_ID" --arg sha "$GITHUB_SHA" '
+            (.id | tostring) == $id and (.repository.id | tostring) == $repo
+            and .workflow_id == $config.workflow_id and .path == ".github/workflows/validate.yml"
+            and .event == "merge_group" and .head_sha == $sha and .referenced_workflows == []
+          ' <<<"$run" >/dev/null; then
+            printf 'group=%s\n' "$group" >>"$GITHUB_OUTPUT"
+            echo "Selected standard GitHub Arm for $group."
+          else
+            echo "Current workflow does not match the qualified integration. Keeping planned placement."
+          fi
+
   validate-groups:
     # GitHub excludes required workflows from their source repository. Mirror
     # that boundary for this file's ordinary pull_request/push triggers.
@@ -271,7 +308,7 @@ jobs:
     # matrix values (its group name) to the job ID in the check list.
     # Only the protected planner can select one of these targets for a candidate group.
     # A failed-job rerun can reuse the first attempt's plan outputs.
-    runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
+    runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}

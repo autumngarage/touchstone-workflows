@@ -151,6 +151,26 @@ MOCK
       RUN_METADATA="$(jq -c "$change" <<<"$metadata")" check_grant '' read
     done
     API_STATUS=22 check_grant '' read
+
+    arm_script="$(step_script 'Select standard GitHub Arm for a qualified integration group')"
+    [ -n "$arm_script" ] || fail "missing GitHub Arm group verification"
+    check_arm() {
+      : >"$GITHUB_OUTPUT"; : >"$API_READS"
+      bash -c "$arm_script" >/dev/null || fail "Arm group selection interrupted validation"
+      [ "$(cat "$GITHUB_OUTPUT")" = "$1" ] && [ "$(cat "$API_READS")" = "$2" ] || fail "unexpected Arm placement or API read"
+    }
+    export CONFIG='{"group":"swift-b","workflow_id":42}' GITHUB_SHA=abc
+    arm_metadata='{"id":860,"repository":{"id":37},"workflow_id":42,"path":".github/workflows/validate.yml","event":"merge_group","head_sha":"abc","referenced_workflows":[]}'
+    export RUN_METADATA="$arm_metadata"
+    check_arm 'group=swift-b' read
+    for bad in '{}' 'invalid' '{"group":"checks","workflow_id":42}' '{"group":"SWIFT-B","workflow_id":42}' '{"group":"swift-b","workflow_id":"42"}'; do
+      CONFIG="$bad" check_arm '' ''
+    done
+    MATRIX="$(jq -c '.include += [{name:"SWIFT-B",group:"SWIFT-B"}]' <<<"$matrix")" check_arm '' ''
+    for change in '.id=861' '.repository.id=38' '.workflow_id=43' '.path="other"' '.event="pull_request"' '.head_sha="other"' '.referenced_workflows=[{}]' 'del(.referenced_workflows)'; do
+      RUN_METADATA="$(jq -c "$change" <<<"$arm_metadata")" check_arm '' read
+    done
+    API_STATUS=22 check_arm '' read
   )
   LINUX_LOCAL_PR_GROUPS='[]' check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
@@ -195,7 +215,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
+runner_selector='runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -246,6 +266,8 @@ fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'group_targets: ${{ steps.plan.outputs.group_targets }}' 'planned group targets'
 assert_active_line "$workflow" 'github_overflow_group: ${{ steps.overflow.outputs.group }}' 'verified GitHub group'
+assert_active_line "$workflow" 'github_arm_group: ${{ steps.arm.outputs.group }}' 'qualified GitHub Arm group'
+assert_active_line "$workflow" "if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.LINUX_QUEUE_ARM_GROUP != ''" 'private default-branch Arm integration'
 assert_active_line "$workflow" "if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''" 'first-attempt private same-repository overflow'
 assert_active_line "$workflow" 'GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}' 'trusted GitHub overflow configuration'
 assert_active_line "$workflow" "PRIVATE_PR: \${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}" 'private same-repository PR'
