@@ -1,0 +1,12 @@
+{
+  "repository": "autumngarage/hesperus",
+  "repository_id": 1350057617,
+  "app_id": null,
+  "creator_id": null,
+  "creator_login": null,
+  "installation_id": null,
+  "private_key_file": "/Users/henry/.config/hesperus-native-issuer/app.pem",
+  "ssh_identity_file": "/Users/henry/.config/hesperus-native-issuer/receiver-key",
+  "ssh_known_hosts_file": "/Users/henry/.config/hesperus-native-issuer/known_hosts",
+  "ssh_target": "linuxci@ci-linux-01.local"
+}

@@ -318,8 +318,10 @@ Runscaler service's reviewed drop-in uses the adapter; the four-slot release
 service and its shared helpers are not changed. Native files install beneath
 `/opt/hesperus-runner/native`. Activation requires the dedicated App policy, qualified
 native source/IDs, pinned immutable guest inputs and SSH identity, and a private
-operator-rotated installation-token file. No App private key goes to the PC.
-The adapter reads the short-lived status token for every API request. Keep
+automatically renewed [private installation credential](runner/status-issuer/README.md).
+The dedicated App key remains on Studio; its bounded launchd renewal sends
+only a one-repo token over restricted SSH. The adapter reloads and checks the
+credential's issuer, scope and expiry for every API request. Keep
 the service disabled until those gates and a real native qualification pass.
 GitHub's retained `prepared_workflow_job` audit evidence identifies imposed
 validation by `@refs/heads/main`; `validation_source_ref` records that runner
