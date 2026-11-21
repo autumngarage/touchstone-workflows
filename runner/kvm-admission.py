@@ -23,6 +23,12 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("routing", HERE / "merge-routing.py")
 routing = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(routing)
+credential_spec = importlib.util.spec_from_file_location("credential", HERE / "status-credential.py")
+credential = importlib.util.module_from_spec(credential_spec)
+credential_spec.loader.exec_module(credential)
+# One committed policy and refusal type across the controller boundaries.
+credential.routing = routing
+credential.require = routing.require
 require = routing.require
 SOURCE_SIGNAL_NAME = "Local merge admission signal"
 SIGNAL_NAME = "intake / " + SOURCE_SIGNAL_NAME
@@ -32,6 +38,7 @@ SOURCE_REPOSITORY_ID = 1333343261
 INSTALL_FILES = {
     "kvm-admission.py": ("/opt/hesperus-runner/native/kvm-admission.py", "0555"),
     "merge-routing.py": ("/opt/hesperus-runner/native/merge-routing.py", "0444"),
+    "status-credential.py": ("/opt/hesperus-runner/native/status-credential.py", "0555"),
     "jit.sh": ("/opt/hesperus-runner/native/jit.sh", "0444"),
     "kvm-guest.sh": ("/opt/hesperus-runner/native/kvm-guest.sh", "0555"),
     "runscaler-intake.sh": ("/opt/hesperus-runner/native/runscaler-intake.sh", "0555"),
@@ -297,19 +304,13 @@ def reconcile(api, registration_api, config, reservation, worker=None):
 
 
 class StatusAPI(routing.GitHub):
-    """Read the operator-rotated short-lived installation token per request."""
+    """Read the renewed, expiring installation credential per request."""
     def __init__(self, path):
         self.path = Path(path)
         super().__init__(self.read_token())
 
     def read_token(self):
-        info = self.path.lstat()
-        require(self.path.is_file() and not self.path.is_symlink()
-                and info.st_mode & 0o777 in (0o400, 0o600)
-                and info.st_uid in (0, os.geteuid()), "status credential is not private")
-        token = self.path.read_text().strip()
-        require(bool(token), "status credential is unavailable")
-        return token
+        return credential.read(self.path)["token"]
 
     def call(self, path, payload=None, method=None):
         self.token = self.read_token()
