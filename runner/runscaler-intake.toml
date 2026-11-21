@@ -1,0 +1,26 @@
+url = "https://github.com/autumngarage"
+name = "hesperus-runscaler-pc"
+runner-group = "hesperus-runscaler-pilot"
+runner-image = "127.0.0.1:5000/hesperus/runner@sha256:7d669156418c995e9ddd99d2f5bba88b1385e35b497fad00419197921ef9450d"
+provider = "docker"
+min-runners = 1
+max-runners = 1
+concurrent = 1
+drain-timeout = "5m"
+health-port = 0
+log-file = ""
+registration-sweep-mode = "off"
+[disk]
+guard = false
+[docker]
+socket = "/var/run/docker.sock"
+daemon-mode = "none"
+dind = false
+shared-volume = ""
+cache-volumes = []
+memory = 1024
+cpu = 1
+pids-limit = 256
+network = "hesperus-runscaler-pilot"
+prune = false
+buildx-cleanup = false

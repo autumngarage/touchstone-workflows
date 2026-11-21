@@ -158,7 +158,7 @@ class RoutingTests(unittest.TestCase):
                 self.assertEqual(child.exitcode, 0)
             self.assertEqual(sorted([results.get(timeout=1), results.get(timeout=1)]), [False, True])
 
-    def test_planner_reads_fresh_ack_after_bounded_intake_and_rechecks_chain(self):
+    def test_planner_reads_fresh_ack_without_waiting_and_rechecks_chain(self):
         test = self
 
         class API:
@@ -184,26 +184,23 @@ class RoutingTests(unittest.TestCase):
                 inner.calls.append("statuses")
                 return [] if inner.status is None else [inner.status]
 
-        with patch.dict(routing.POLICY, {self.request["repository"]: self.policy}), patch.dict(os.environ, {
+        with patch.object(routing.time, "sleep", side_effect=AssertionError("planner must not wait")), patch.dict(routing.POLICY, {self.request["repository"]: self.policy}), patch.dict(os.environ, {
             "GITHUB_RUN_ID": str(self.request["run_id"]), "GITHUB_RUN_ATTEMPT": "1",
         }):
             api = API()
-            def pause(seconds):
-                self.assertEqual(seconds, routing.ADMISSION_WINDOW)
-                api.calls.append("bounded-wait")
-            result = routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW, pause=pause)
+            result = routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW)
             self.assertEqual(result["runner_id"], 789)
-            self.assertEqual(api.calls[-3:], ["bounded-wait", "statuses", "queue"])
+            self.assertEqual(api.calls[-2:], ["statuses", "queue"])
             api.status = None
             with self.assertRaises(routing.Refused):
-                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW, pause=pause)
+                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW)
             api.status = dict(self.status, created_at="2020-01-01T00:00:00Z")
             with self.assertRaises(routing.Refused):
-                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW, pause=pause)
+                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW)
             self.policy["issuer"] = None
             api.calls.clear()
             with self.assertRaises(routing.Refused):
-                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW, pause=pause)
+                routing.plan(api, self.event, self.matrix, self.targets, now=lambda: NOW)
             self.assertEqual(api.calls, [])
 
     def test_publication_requires_post_reservation_capacity_and_live_jit_ack(self):

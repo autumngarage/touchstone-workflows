@@ -350,8 +350,8 @@ jobs:
         run: |
           set -euo pipefail
           # The planner executes only this reviewed helper, never target code.
-          routing_revision="54a8d14245c90d61926163039dd78eb71c160932"
-          routing_sha256="7f5f5fa4f45893eb4c1d34aaa625abb951c2cb59e5827d7e3a3892124cd2157b"
+          routing_revision="112aeef0c819a470f9a6a1957a8d4c898892346e"
+          routing_sha256="d2009562afa5704dae15c719a19368f1e6d39bfdd45c4c98f3e3061fa25ec4cf"
           helper="$RUNNER_TEMP/merge-routing.py"
           if ! curl --fail --silent --show-error --max-time 10 --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone-workflows/${routing_revision}/runner/merge-routing.py" \

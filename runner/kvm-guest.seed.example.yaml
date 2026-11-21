@@ -1,0 +1,42 @@
+#cloud-config
+# Build seed.iso with the separately verified base's SSH host key pinned in
+# guest-known-hosts. This file contains only a disposable public login key.
+preserve_hostname: false
+hostname: hesperus-kvm-routine
+ssh_deletekeys: false
+ssh_pwauth: false
+disable_root: true
+users:
+  - name: pilot
+    shell: /bin/bash
+    lock_passwd: true
+    groups: [docker]
+    ssh_authorized_keys:
+      - REPLACE_WITH_DISPOSABLE_PUBLIC_KEY
+write_files:
+  - path: /etc/systemd/resolved.conf.d/hesperus-kvm.conf
+    permissions: '0644'
+    content: |
+      [Resolve]
+      DNS=1.1.1.1 8.8.8.8
+      Domains=~.
+  - path: /etc/systemd/system/pilot-ssh.socket
+    permissions: '0644'
+    content: |
+      [Socket]
+      ListenStream=vsock::22
+      Accept=yes
+      [Install]
+      WantedBy=sockets.target
+  - path: /etc/systemd/system/pilot-ssh@.service
+    permissions: '0644'
+    content: |
+      [Service]
+      ExecStartPre=/usr/bin/install -d -m 0755 /run/sshd
+      ExecStart=-/usr/sbin/sshd -i
+      StandardInput=socket
+      StandardOutput=socket
+      StandardError=journal
+runcmd:
+  - [sh, -c, "mkdir -p /run/sshd && systemctl daemon-reload && systemctl enable --now pilot-ssh.socket"]
+  - [systemctl, restart, systemd-resolved]

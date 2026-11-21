@@ -20,7 +20,6 @@ import urllib.request
 
 CAPABILITY = "linux-x64-kvm-guest-docker"
 TTL = 120
-ADMISSION_WINDOW = 20
 MARKER = "touchstone/local"
 # Qualification is committed with the protected workflow, never read from a
 # candidate declaration or a mutable repository variable. Installation stays
@@ -84,7 +83,7 @@ def qualified_request(event, run, matrix, targets, policy):
     require(run.get("workflow_id") == policy["workflow_id"] and run.get("event") == "merge_group", "unqualified workflow")
     require(run.get("path") == ".github/workflows/validate.yml" and run.get("referenced_workflows") == [], "not the required native workflow")
     require(run.get("head_sha") == merge.get("head_sha") and run.get("head_branch") == merge.get("head_ref", "").removeprefix("refs/heads/"), "run candidate differs")
-    require(run.get("status") == "in_progress", "run is no longer active")
+    require(run.get("status") in ("queued", "in_progress"), "run is no longer active")
     group = policy["group"]
     matches = [entry for entry in matrix["include"] if entry["name"].lower() == group.lower()]
     require(matches == [{"name": group, "group": group}] and targets.get(group) == "github", "group is not uniquely hosted")
@@ -160,15 +159,15 @@ class GitHub:
         require(bool(self.token), "GitHub credential is unavailable")
         self.api = os.environ.get("GITHUB_API_URL", "https://api.github.com")
 
-    def call(self, path, payload=None):
+    def call(self, path, payload=None, method=None):
         url = self.api + path
         data = None if payload is None else json.dumps(payload).encode()
-        request = urllib.request.Request(url, data=data, headers={
+        request = urllib.request.Request(url, data=data, method=method, headers={
             "Authorization": "Bearer " + self.token, "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json",
         })
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.load(response)
+            return None if response.status == 204 else json.load(response)
 
     def queue(self, repository, branch):
         owner, name = repository.split("/")
@@ -191,7 +190,7 @@ class GitHub:
         raise Refused("admission status census exceeds its bounded read")
 
 
-def plan(api, event, matrix, targets, now=time.time, pause=time.sleep):
+def plan(api, event, matrix, targets, now=time.time):
     repository = event.get("repository", {}).get("full_name")
     policy = POLICY.get(repository)
     require(policy and policy["issuer"], "no installed qualified local merge policy")
@@ -209,7 +208,6 @@ def plan(api, event, matrix, targets, now=time.time, pause=time.sleep):
     require(all(len(entries) == 1 and entries[0].get("type") == "blob"
                 and entries[0].get("mode") in ("100644", "100755") and sha(entries[0].get("sha"))
                 for entries in declarations) and declarations[0] == declarations[1], "qualification declaration changed or unavailable")
-    pause(ADMISSION_WINDOW)
     # Fetch after the exclusive reservation/JIT acknowledgement, never from vars.
     grant = status_grant(request, api.statuses(request), policy["issuer"], now())
     # A candidate removed or rebuilt during intake cannot retain an assignment.
@@ -279,7 +277,7 @@ def publish_reserved(api, registration_api, reservation, receipt, issuer, now):
     require(run.get("id") == request["run_id"] and run.get("run_attempt") == request["attempt"]
             and run.get("head_sha") == request["head"] and run.get("event") == "merge_group"
             and run.get("path") == ".github/workflows/validate.yml" and run.get("referenced_workflows") == []
-            and run.get("workflow_id") == request["workflow_id"] and run.get("status") == "in_progress",
+            and run.get("workflow_id") == request["workflow_id"] and run.get("status") in ("queued", "in_progress"),
             "reserved run is no longer the current required candidate")
     trusted_chain(request, api.queue(request["repository"], policy["branch"]))
     observed = now()

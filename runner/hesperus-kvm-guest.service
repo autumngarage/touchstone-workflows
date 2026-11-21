@@ -1,0 +1,29 @@
+[Unit]
+Description=Single-use isolated Hesperus routine guest
+Requires=hesperus-kvm-guard.service
+After=hesperus-kvm-guard.service network-online.target
+BindsTo=hesperus-kvm-guard.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+SupplementaryGroups=kvm
+StateDirectory=hesperus-kvm-guest
+StateDirectoryMode=0700
+ExecStart=/opt/hesperus-runner/native/kvm-guest.sh
+ProtectHome=yes
+ProtectSystem=strict
+PrivateTmp=yes
+NoNewPrivileges=yes
+DevicePolicy=closed
+DeviceAllow=/dev/kvm rw
+DeviceAllow=/dev/vhost-vsock rw
+IPAddressDeny=127.0.0.0/8 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4 ::/0
+MemoryMax=4608M
+MemorySwapMax=0
+CPUQuota=200%
+CPUWeight=1
+IOWeight=1
+Nice=15
+RuntimeMaxSec=3h
+TimeoutStopSec=30s

@@ -1,0 +1,10 @@
+# Optional consumer workflow. Replace the pin only with the reviewed source
+# revision; never add this path or its signal job to a required ruleset/check.
+name: Optional local merge intake
+on:
+  merge_group:
+    types: [checks_requested]
+permissions: {}
+jobs:
+  intake:
+    uses: autumngarage/touchstone-workflows/.github/workflows/merge-intake.yml@112aeef0c819a470f9a6a1957a8d4c898892346e

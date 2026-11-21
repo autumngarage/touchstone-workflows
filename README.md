@@ -232,8 +232,8 @@ native placement. Other repositories require their own reviewed qualification.
 The planner follows GitHub's native merge-queue candidate/base chain and
 checks every contributing PR's private same-repository origin. It also requires
 an unchanged regular `.touchstone.toml` blob. Only a uniquely named, already
-hosted group can qualify. It waits at most one admission window after those
-checks, then reads commit statuses on that exact candidate. The controller's
+hosted group can qualify. After those checks it reads commit statuses once on
+that exact candidate, with no fixed intake wait. The controller's
 fresh success status must bind the repository, required workflow, run, attempt
 and group. Missing, stale, ambiguous or unavailable evidence preserves hosted
 placement. The existing qualified GitHub Arm route remains available.
@@ -260,14 +260,72 @@ Installation requires a separately verified service credential and a runner
 group restricted to the qualified private repository and protected workflow.
 The group must admit only isolated single-use guests, with no host Docker,
 host workspace or release labels. Keep a reservation until the controller has
-confirmed native job termination and reclaimed the guest, including an
-acknowledgement whose bounded planner window was missed. Status expiry never
+confirmed native job termination and reclaimed the guest. A grant whose
+planning window was missed first removes its idle exact registration after
+proving the group chose a different selector. Status expiry never
 authorizes reusing possibly live capacity. A failed-job rerun cannot reuse an
 earlier attempt's selector; a full rerun needs a fresh reservation and grant.
 This route adds no paid provider admission or independent capacity controller.
 GitHub's existing organization budget hard stop owns hosted credit admission;
 a budget denial is an infrastructure hold, never a synthetic product verdict.
 Keep the delivery intent and controller recovery material when that happens.
+
+The optional [`merge-intake`](.github/workflows/merge-intake.yml) reusable
+workflow emits a no-secret job to the already-qualified Runscaler control
+pool. Its [consumer example](runner/merge-intake.example.yml) is a separate
+workflow, outside every required workflow and status. Per-repository native
+concurrency replaces older pending signals and cancels older active signals;
+[GitHub expires a parked self-hosted job after 24 hours](https://docs.github.com/en/actions/reference/runners/self-hosted-runners#routing-precedence-for-self-hosted-runners). Its one-minute job
+timeout covers execution, not queue time. A missing control pool never blocks
+required validation, and the controller refuses a target that makes the
+signal required.
+
+[`kvm-admission.py`](runner/kvm-admission.py) consumes the pinned Runscaler
+manager's JSON lifecycle stream as a wake-up hint. It independently verifies
+the signal's native run/attempt/job, immutable reusable source and private
+runner group, then the unique still-planning native validation run and full
+queue chain. A late signal cannot move a group already assigned to a runner.
+The manager retains its standard outbound scale-set long poll; the adapter
+adds no hosted polling job or public listener. The routine guest receives an
+exact attempt-specific JIT selector, never the shared control-pool label.
+
+The [observed timing fixture](tests/fixtures/runscaler-timing.json) records
+the old cold control dispatch at 18 seconds and the organic validation plan
+at 25 seconds. The control qualification included an intentional 90-second
+sleep, which the new signal does not contain. The new path adds no fixed
+planner delay. If the fresh grant misses the natural planning work, that
+candidate stays hosted. The old hosted checks job ran 18m17s (19 billed Linux
+job minutes); a successful local assignment removes that hosted job. These
+are prior measurements, not a claim that the new dispatch has been qualified.
+The measured planner already rounds to one billed minute; the new path adds
+no fixed delay to that minimum. Actual timing and savings still need native
+measurement. [GitHub rounds each job to whole minutes](https://docs.github.com/en/billing/reference/actions-runner-pricing).
+
+Installation inputs live in the [configuration example](runner/kvm-admission.example.json),
+[control pool configuration](runner/runscaler-intake.toml), and
+[guest seed example](runner/kvm-guest.seed.example.yaml). The fixed systemd
+guest uses a fresh overlay, a separate DynamicUser, bounded CPU/memory/I/O,
+AF_VSOCK SSH, and no host mounts or private-network access. The release guard
+attributes host runner processes to their containers, preserves all four
+release listeners, refuses another guest/active release work, and removes
+routine capacity if that evidence changes. Only Docker inside the guest is
+available to a candidate. Reconciliation stops only the owned guest and
+retains its lease if teardown or native assignment is uncertain.
+
+Run `python3 runner/kvm-admission.py install-dry-run --config <configuration>`
+to list exact installation files without changing the machine. The existing
+Runscaler service's reviewed drop-in uses the adapter; the four-slot release
+service and its shared helpers are not changed. Native files install beneath
+`/opt/hesperus-runner/native`. Activation requires the dedicated App policy, qualified
+native source/IDs, pinned immutable guest inputs and SSH identity, and a private
+operator-rotated installation-token file. No App private key goes to the PC.
+The adapter reads the short-lived status token for every API request. Keep
+the service disabled until those gates and a real native qualification pass.
+GitHub's retained `prepared_workflow_job` audit evidence identifies imposed
+validation by `@refs/heads/main`; `validation_source_ref` records that runner
+admission identity. The separate `validation_source_sha` must match the
+effective pinned required-workflow rule. Do not substitute one meaning for
+the other. The optional reusable signal remains SHA-pinned.
 
 The plan job requires `contents: read`, `actions: read`, `pull-requests: read`
 and `statuses: read`. Before upgrading a reusable `uses:` caller to this
