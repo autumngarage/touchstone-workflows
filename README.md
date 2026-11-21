@@ -174,6 +174,17 @@ path and run number. An expired grant, unavailable API, or ambiguous group
 preserves the original placement. Failed-job and full reruns use the original
 local assignment. The grant applies only to GitHub-hosted Ubuntu.
 
+A private repository can place one native Arm-compatible integration group on
+standard GitHub-hosted `ubuntu-24.04-arm`. Set `LINUX_QUEUE_ARM_GROUP` to
+`{"group":"unit","workflow_id":42}`, using the numeric workflow ID from a
+required validation run in the consuming repository. The planner confirms the
+default-branch merge group, current run identity and unique group name. The
+group must already target GitHub. Other workflows and groups keep their
+planned runner. An absent or invalid configuration or an unavailable GitHub
+API keeps the original placement. Qualify every command and container image in
+the group for Arm before enabling it. Clearing the variable restores the
+original placement on new runs.
+
 The plan job requires `contents: read` and `actions: read`. Before upgrading a
 reusable `uses:` caller to this revision, allow both scopes on the calling job.
 Candidate validation jobs retain only `contents: read`.
