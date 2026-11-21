@@ -26,7 +26,9 @@ prepare = next(s for s in steps if s.get("name") == "Prepare declared validation
 fetch = next(s for s in steps if s.get("name") == "Fetch pinned Touchstone validator")
 assert key["if"] == "vars.SWIFT_BUILD_CACHE == 'true' && runner.os == 'Linux' && hashFiles('Package.resolved') != ''"
 assert prepare["if"] == key["if"], "only opted-in Linux cache consumers prepare twice"
-assert prepare["env"] == {"VALIDATION_GROUP": "${{ matrix.group }}"}
+assert prepare["env"] == {"VALIDATION_GROUP": "${{ matrix.group }}",
+                          "VALIDATION_EVENT": "${{ needs.plan.outputs.validation_event }}"}
+assert validate["env"]["VALIDATION_EVENT"] == prepare["env"]["VALIDATION_EVENT"]
 assert key["env"]["CACHE_GRAPH"] == "${{ hashFiles('**/Package.swift', '**/Package.resolved', '.swift-version', '.touchstone.toml', 'scripts/ci-setup-swift.sh', 'scripts/swift-check.sh') }}"
 assert key["env"]["CACHE_OS"] == "${{ runner.os }}"
 assert key["env"]["CACHE_ARCH"] == "${{ runner.arch }}"
@@ -193,6 +195,82 @@ esac
     subprocess.run(["bash", "-c", prepare["run"]], env=dict(transport_env, PREPARE_TAMPER="true"), check=True)
     refused = subprocess.run(["bash", "-c", validation_shell], env=prepared_env, capture_output=True, text=True)
     assert refused.returncode != 0 and "FAILED" in refused.stdout and not task.exists(), "changed engine bytes must not execute validation"
+
+    # Use the exact fetched engine and production shells: a full-plan fallback
+    # must ignore exclusions even inside a mixed group, before cache setup too.
+    if engine_path := os.environ.get("TOUCHSTONE_ENGINE_PATH"):
+        engine_bytes = Path(engine_path).read_bytes()
+        assert hashlib.sha256(engine_bytes).hexdigest() == pinned_hash
+        validator.write_bytes(engine_bytes)
+        project = directory / "eligibility"
+        project.mkdir()
+        declaration = project / ".touchstone.toml"
+        declaration.write_text('''schema = 4
+[validation]
+runtime = "bash"
+setup = "touch setup-ran"
+[[validation.targets]]
+name = "root"
+path = "."
+[[validation.tasks]]
+name = "eligible"
+target = "root"
+command = "touch eligible-ran"
+required = true
+[[validation.tasks]]
+name = "mixed-deferred"
+target = "root"
+pull_request = false
+command = "touch mixed-ran"
+required = true
+[[validation.tasks]]
+name = "queue-only"
+target = "root"
+group = "queue"
+pull_request = false
+command = "touch queue-ran"
+required = true
+''')
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(project), *args], text=True).strip()
+
+        git("init", "-q", "-b", "fixture")
+        git("config", "user.name", "fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        git("add", ".touchstone.toml")
+        git("commit", "-qm", "base")
+        base = git("rev-parse", "HEAD")
+        git("commit", "--allow-empty", "-qm", "candidate")
+        markers = [project / name for name in ("setup-ran", "eligible-ran", "mixed-ran", "queue-ran")]
+        for changed_declaration in (False, True):
+            if changed_declaration:
+                declaration.write_text(declaration.read_text() + "\n# Changed by this PR\n")
+                git("add", ".touchstone.toml")
+                git("commit", "-qm", "changed")
+            for marker in markers:
+                marker.unlink(missing_ok=True)
+            output = directory / "eligibility-output"
+            output.write_text("")
+            eligibility_env = dict(env, EVENT_NAME="pull_request", VALIDATION_BASE_SHA=base,
+                                   GITHUB_SHA=git("rev-parse", "HEAD"), RUNNER_TEMP=str(directory),
+                                   GITHUB_WORKSPACE=str(project), GITHUB_OUTPUT=str(output),
+                                   PRIVATE_PR="true", SAME_REPOSITORY_PR="true", LOCAL_SEED="false",
+                                   LINUX_LOCAL_PR_GROUPS="", LEGACY_TARGET="github")
+            subprocess.run(["bash", "-c", plan["run"]], env=eligibility_env, check=True)
+            assert not any(marker.exists() for marker in markers), "planning ran project code"
+            planned = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            entries = json.loads(planned["matrix"])["include"]
+            assert planned["validation_event"] == ("" if changed_declaration else "pull_request")
+            assert [entry["group"] for entry in entries] == (["default", "queue"] if changed_declaration else ["default"])
+            for entry in entries:
+                execution_env = dict(eligibility_env, VALIDATION_GROUP=entry["group"],
+                                     VALIDATION_EVENT=planned["validation_event"])
+                subprocess.run(["bash", "-c", prepare["run"]], env=execution_env, check=True)
+                assert markers[0].exists(), "selected preparation skipped setup"
+                subprocess.run(["bash", "-c", validate["run"]], env=execution_env, check=True)
+            assert markers[1].exists(), "default-eligible task did not run"
+            assert all(marker.exists() == changed_declaration for marker in markers[2:]), "full fallback suppressed deferred tasks"
 
     swift.rename(binary / "unused-swift")
     assert identify(PATH=str(binary)) == {}, "a missing toolchain must not enable restore/save"

@@ -32,7 +32,13 @@ assert_active_line() {
   assert_active_line_count "$1" 1 "$2" "$3"
 }
 
+
 assert_count 1 'name: validate \(ubuntu-latest\)'
+
+# shellcheck disable=SC2016
+assert_active_line "$workflow" \
+  'SAME_REPOSITORY_PR: ${{ github.event_name == '\''pull_request'\'' && github.event.pull_request.head.repo.full_name == github.repository }}' \
+  "same-repository PR provenance"
 
 # A known-invalid queue candidate must not retain running/queued build slots.
 # Author and maintenance runs still collect every shard's evidence. GitHub owns
@@ -70,26 +76,30 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   trap 'rm -rf "$plan_fixture"' EXIT HUP INT TERM
   # shellcheck disable=SC2016
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$PLANNED_CONTRACT"\n' >"$plan_fixture/touchstone-run.sh"
-  plan_script="$(awk '
-    /^      - name: Plan validation groups$/ { step = 1 }
+  step_script() {
+    awk -v name="$1" '
+    $0 == "      - name: " name { step = 1 }
     step && /^        run: \|$/ { body = 1; next }
     body && /^          / { sub(/^          /, ""); print; next }
     body && /[^[:space:]]/ { exit }
-  ' "$workflow")"
+    ' "$workflow"
+  }
+  plan_script="$(step_script 'Plan validation groups')"
   [ -n "$plan_script" ] || fail "validation planner script is missing"
   grouped_contract='{"groups":[{"name":"checks"},{"name":"swift-a"},{"name":"swift-b"}]}'
+  export SAME_REPOSITORY_PR=true
   check_plan() {
     event="$1" budget="$2" contract="$3" expected="$4" groups="$5"
     : >"$plan_fixture/outputs"
     EVENT_NAME="$event" VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$contract" \
-      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="${PLAN_PROJECT:-$plan_fixture}" GITHUB_OUTPUT="$plan_fixture/outputs" \
       bash -c "$plan_script" || fail "planner rejected event=$event budget=$budget"
     grep -Fxq "max_parallel=$expected" "$plan_fixture/outputs" || fail "incorrect parallel budget for $event/$budget"
     matrix="$(sed -n 's/^matrix=//p' "$plan_fixture/outputs")"
     [ "$(printf '%s' "$matrix" | jq '.include | length')" = "$groups" ] || fail "planner changed the declared groups"
-    if [ "$groups" = 3 ]; then
+    if [ "$contract" = "$grouped_contract" ] && [ "$groups" = 3 ]; then
       printf '%s' "$matrix" | jq -e '[.include[].group] == ["checks","swift-a","swift-b"]' >/dev/null || fail "planner lost a declared group"
-    else
+    elif [ "$groups" = 1 ]; then
       printf '%s' "$matrix" | jq -e '. == {include:[{name:"all",group:""}]}' >/dev/null || fail "planner lost its serial fallback"
     fi
   }
@@ -99,6 +109,116 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   check_plan merge_group 999999999999999999999999 "$grouped_contract" 3 3
   check_plan pull_request 3 '{}' 1 1
   for event in workflow_call workflow_dispatch push; do check_plan "$event" 3 "$grouped_contract" 1 1; done
+  check_targets() {
+    targets="$(sed -n 's/^group_targets=//p' "$plan_fixture/outputs")"
+    jq -e --argjson expected "$1" '. == $expected' <<<"$targets" >/dev/null || fail "unexpected runner targets: $targets"
+  }
+  LEGACY_TARGET=blacksmith check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"blacksmith","swift-a":"blacksmith","swift-b":"blacksmith"}'
+  for legacy_target in local blacksmith; do
+    for same_repository in false ''; do
+      SAME_REPOSITORY_PR="$same_repository" LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+      check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+    done
+    (
+      unset SAME_REPOSITORY_PR
+      LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+      check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+    )
+    # Public same-repository PRs retain their established legacy placement.
+    PRIVATE_PR=false LEGACY_TARGET="$legacy_target" check_plan pull_request 3 "$grouped_contract" 3 3
+    check_targets "{\"checks\":\"$legacy_target\",\"swift-a\":\"$legacy_target\",\"swift-b\":\"$legacy_target\"}"
+    SAME_REPOSITORY_PR=false LEGACY_TARGET="$legacy_target" check_plan merge_group 3 "$grouped_contract" 3 3
+    check_targets "{\"checks\":\"$legacy_target\",\"swift-a\":\"$legacy_target\",\"swift-b\":\"$legacy_target\"}"
+  done
+  export LINUX_LOCAL_PR_GROUPS='["checks","swift-a"]' PRIVATE_PR=true LOCAL_SEED=false LEGACY_TARGET=blacksmith
+  check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"local","swift-a":"local","swift-b":"github"}'
+  # Exercise the protected step with a current-run API stub. Only plausible
+  # grants may read the API, and only a fully matched response admits a group.
+  (
+    overflow_script="$(step_script 'Verify GitHub overflow grant')"
+    [ -n "$overflow_script" ] || fail "missing GitHub overflow grant verification"
+    export GITHUB_API_URL=https://api.github.test GITHUB_REPOSITORY=o/r GITHUB_REPOSITORY_ID=37
+    export GITHUB_RUN_NUMBER=19 GITHUB_RUN_ID=860 GH_TOKEN=fixture
+    export GITHUB_OUTPUT="$plan_fixture/group" API_READS="$plan_fixture/reads"
+    export MATRIX="$matrix" TARGETS="$targets"
+    export PATH="$plan_fixture:$PATH"
+    cat >"$plan_fixture/curl" <<'MOCK'
+#!/usr/bin/env bash
+echo read >>"$API_READS"
+[[ "${!#}" == 'https://api.github.test/repos/o/r/actions/runs/860' ]] || exit 3
+printf '%s\n' "$RUN_METADATA"
+exit "${API_STATUS:-0}"
+MOCK
+    chmod +x "$plan_fixture/curl"
+    valid="$(jq -nc '{v:1,repository_id:"37",workflow_id:42,run_number:19,event:"pull_request",group:"checks",expires_at:((now|floor)+360)}')"
+    export GRANT="$valid"
+    metadata='{"repository":{"id":37},"workflow_id":42,"id":860,"run_number":19,"run_attempt":1,"event":"pull_request","path":".github/workflows/validate.yml"}'
+    export RUN_METADATA="$metadata"
+    check_grant() {
+      : >"$GITHUB_OUTPUT"; : >"$API_READS"
+      bash -c "$overflow_script" >/dev/null || fail "grant verification interrupted validation"
+      [ "$(cat "$GITHUB_OUTPUT")" = "$1" ] && [ "$(cat "$API_READS")" = "$2" ] \
+        || fail "unexpected GitHub overflow result: $(cat "$GITHUB_OUTPUT") / $(cat "$API_READS")"
+    }
+    check_grant 'group=checks' read
+    GRANT='invalid JSON' check_grant '' ''
+    for change in '.v=2' '.repository_id="38"' '.run_number=20' '.event="merge_group"' \
+      '.group="swift-b"' '.group="CHECKS"' '.expires_at=0' '.expires_at+=601' '.provider="paid"'; do
+      GRANT="$(jq -c "$change" <<<"$valid")" check_grant '' ''
+    done
+    MATRIX="$(jq -c '.include += [{name:"CHECKS",group:"CHECKS"}]' <<<"$matrix")" check_grant '' ''
+    for change in '.id=861' '.repository.id=38' '.workflow_id=43' '.run_number=20' \
+      '.run_attempt=2' '.event="push"' '.path="other.yml"'; do
+      RUN_METADATA="$(jq -c "$change" <<<"$metadata")" check_grant '' read
+    done
+    API_STATUS=22 check_grant '' read
+
+    arm_script="$(step_script 'Select standard GitHub Arm for a qualified integration group')"
+    [ -n "$arm_script" ] || fail "missing GitHub Arm group verification"
+    check_arm() {
+      : >"$GITHUB_OUTPUT"; : >"$API_READS"
+      bash -c "$arm_script" >/dev/null || fail "Arm group selection interrupted validation"
+      [ "$(cat "$GITHUB_OUTPUT")" = "$1" ] && [ "$(cat "$API_READS")" = "$2" ] || fail "unexpected Arm placement or API read"
+    }
+    export CONFIG='{"group":"swift-b","workflow_id":42}' GITHUB_SHA=abc
+    arm_metadata='{"id":860,"repository":{"id":37},"workflow_id":42,"path":".github/workflows/validate.yml","event":"merge_group","head_sha":"abc","referenced_workflows":[]}'
+    export RUN_METADATA="$arm_metadata"
+    check_arm 'group=swift-b' read
+    for bad in '{}' 'invalid' '{"group":"checks","workflow_id":42}' '{"group":"SWIFT-B","workflow_id":42}' '{"group":"swift-b","workflow_id":"42"}'; do
+      CONFIG="$bad" check_arm '' ''
+    done
+    MATRIX="$(jq -c '.include += [{name:"SWIFT-B",group:"SWIFT-B"}]' <<<"$matrix")" check_arm '' ''
+    for change in '.id=861' '.repository.id=38' '.workflow_id=43' '.path="other"' '.event="pull_request"' '.head_sha="other"' '.referenced_workflows=[{}]' 'del(.referenced_workflows)'; do
+      RUN_METADATA="$(jq -c "$change" <<<"$arm_metadata")" check_arm '' read
+    done
+    API_STATUS=22 check_arm '' read
+  )
+  LINUX_LOCAL_PR_GROUPS='[]' check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  PRIVATE_PR=false check_plan pull_request 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  PRIVATE_PR=false check_plan merge_group 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  check_plan pull_request 2 '{"groups":[{"name":"checks"},{"name":"CHECKS"}]}' 2 2
+  jq -e 'length == 1 and (to_entries | all(.value == "github"))' <<<"$(sed -n 's/^group_targets=//p' "$plan_fixture/outputs")" >/dev/null || fail "case collision inherited a local target"
+  check_plan pull_request 3 '{}' 1 1
+  check_targets '{"all":"github"}'
+  for local_seed in true false; do
+    PRIVATE_PR=false LOCAL_SEED="$local_seed" check_plan workflow_dispatch 3 "$grouped_contract" 1 1
+    if [ "$local_seed" = true ]; then check_targets '{"all":"local"}'; else check_targets '{"all":"github"}'; fi
+  done
+  for bad_groups in 'checks' '"checks"' '[""]' '[1]' '["*"]'; do
+    : >"$plan_fixture/outputs"
+    if EVENT_NAME=pull_request VALIDATION_MAX_PARALLEL=2 PLANNED_CONTRACT="$grouped_contract" \
+      LINUX_LOCAL_PR_GROUPS="$bad_groups" RUNNER_TEMP="$plan_fixture" GITHUB_OUTPUT="$plan_fixture/outputs" \
+      GITHUB_WORKSPACE="$plan_fixture" bash -c "$plan_script" >"$plan_fixture/diagnostic" 2>&1; then
+      fail "planner accepted invalid local group list $bad_groups"
+    fi
+    [ ! -s "$plan_fixture/outputs" ] || fail "invalid local group list published a matrix"
+  done
+  unset LINUX_LOCAL_PR_GROUPS PRIVATE_PR LOCAL_SEED LEGACY_TARGET
   for budget in 0 -1 1.5 invalid; do
     : >"$plan_fixture/outputs"
     if EVENT_NAME=merge_group VALIDATION_MAX_PARALLEL="$budget" PLANNED_CONTRACT="$grouped_contract" \
@@ -107,10 +227,101 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     [ ! -s "$plan_fixture/outputs" ] || fail "invalid budget published runnable matrix outputs"
     grep -q 'VALIDATION_MAX_PARALLEL' "$plan_fixture/diagnostic" || fail "invalid budget has no diagnostic"
   done
+
+  # The validator owns eligibility; the planner admits its inventory only
+  # when the exact regular declaration is already present in the trusted base.
+  export PLAN_PROJECT="$plan_fixture/project"
+  mkdir "$PLAN_PROJECT"
+  git -C "$PLAN_PROJECT" init -q -b fixture
+  git -C "$PLAN_PROJECT" config user.name fixture
+  git -C "$PLAN_PROJECT" config user.email fixture@example.invalid
+  fixture_tasks='[{"name":"checks"},{"name":"kits-journey"},{"name":"swift-a"},{"name":"swift-b","pull_request":false},{"name":"permit-db","pull_request":false},{"name":"checks-b"}]'
+  eligibility_contract="$(jq -c '{schema:4,groups:map({name,tasks:[.name]}),pull_request_groups:map(select(.pull_request != false)|{name,tasks:[.name]})}' <<<"$fixture_tasks")"
+  {
+    printf '%s\n' 'schema = 4' '[validation]' 'runtime = "bash"' '[[validation.targets]]' 'name = "root"' 'path = "."'
+    jq -r '.[] | "[[validation.tasks]]\nname = " + (.name|@json) + "\ntarget = \"root\"\ngroup = " + (.name|@json) + "\ncommand = \"touch candidate-ran\"\nrequired = true" + (if .pull_request == false then "\npull_request = false" else "" end)' <<<"$fixture_tasks"
+  } >"$PLAN_PROJECT/.touchstone.toml"
+  git -C "$PLAN_PROJECT" add .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm base
+  VALIDATION_BASE_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  export VALIDATION_BASE_SHA
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm candidate
+  trusted_candidate="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  export GITHUB_SHA="$trusted_candidate"
+  check_event() {
+    grep -Fxq "validation_event=$1" "$plan_fixture/outputs" || fail "planner did not bind its execution event to $1"
+  }
+  check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_event pull_request
+  SAME_REPOSITORY_PR=false LEGACY_TARGET=blacksmith check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_targets '{"checks":"github","kits-journey":"github","swift-a":"github","checks-b":"github"}'
+  for event in merge_group schedule unknown; do
+    check_plan "$event" 6 "$eligibility_contract" 6 6
+    check_event ''
+  done
+  for event in push workflow_dispatch workflow_call; do
+    check_plan "$event" 6 "$eligibility_contract" 1 1
+    check_event ''
+  done
+  for change in 'del(.pull_request_groups)' '.pull_request_groups=[]' '.pull_request_groups=null' '.pull_request_groups="unknown"'; do
+    check_plan pull_request 6 "$(jq -c "$change" <<<"$eligibility_contract")" 6 6
+    check_event ''
+  done
+  for base in '' unknown 0000000000000000000000000000000000000000; do
+    VALIDATION_BASE_SHA="$base" check_plan pull_request 6 "$eligibility_contract" 6 6
+    check_event ''
+  done
+  GITHUB_SHA="$VALIDATION_BASE_SHA" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  VALIDATION_BASE_SHA="$(git -C "$PLAN_PROJECT" rev-parse "HEAD^{tree}")" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  # Worktree-only changes must not borrow the unchanged Git blobs' authority.
+  printf '\n# uncommitted change\n' >>"$PLAN_PROJECT/.touchstone.toml"
+  check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" add .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm changed-declaration
+  GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  git -C "$PLAN_PROJECT" update-index --chmod=+x .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm changed-mode
+  executable_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  GITHUB_SHA="$executable_base" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm matching-regular-executable
+  VALIDATION_BASE_SHA="$executable_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 4 4
+  check_event pull_request
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  cp "$PLAN_PROJECT/.touchstone.toml" "$PLAN_PROJECT/declaration"
+  rm "$PLAN_PROJECT/.touchstone.toml"
+  ln -s declaration "$PLAN_PROJECT/.touchstone.toml"
+  check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" add .touchstone.toml declaration
+  git -C "$PLAN_PROJECT" commit -qm symlink
+  symlink_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm matching-symlink
+  VALIDATION_BASE_SHA="$symlink_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
+  git -C "$PLAN_PROJECT" rm -q --cached .touchstone.toml
+  git -C "$PLAN_PROJECT" commit -qm worktree-only-declaration
+  missing_base="$(git -C "$PLAN_PROJECT" rev-parse HEAD)"
+  git -C "$PLAN_PROJECT" commit --allow-empty -qm still-untracked
+  VALIDATION_BASE_SHA="$missing_base" GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  [ ! -e "$PLAN_PROJECT/candidate-ran" ] || fail "planning executed candidate code"
 )
 fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}' 'trusted declaration base'
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'validation_event: ${{ steps.plan.outputs.validation_event }}' 'admitted event output'
+# shellcheck disable=SC2016
+assert_active_line_count "$workflow" 2 'VALIDATION_EVENT: ${{ needs.plan.outputs.validation_event }}' 'preparation and execution event binding'
 
 # AUT-3412: candidate code never runs where a persistent host could keep what
 # it leaves. The one self-hosted target is the linux-ephemeral fleet, whose
@@ -118,7 +329,7 @@ assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.ma
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ inputs.blacksmith && '"'"'blacksmith-4vcpu-ubuntu-2404'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[inputs.runner || (github.event_name == '"'"'merge_group'"'"' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == '"'"'pull_request'"'"' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == '"'"'true'"'"' && '"'"'blacksmith'"'"') || '"'"'github'"'"'] }}'
+runner_selector='runs-on: ${{ github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -154,16 +365,29 @@ done
 if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
   [ "$(active_count "$workflow" "$runner_selector")" -eq 1 ] \
     || fail "$workflow: only candidate execution picks a cloud"
-  # The source contract, plan, and aggregation jobs.
-  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 3 ] \
-    || fail "$workflow: the source contract, plan, and aggregation jobs must run on GitHub-hosted ubuntu-latest"
+  assert_active_line <(sed -n '/^  source-contract:/,/^  plan:/p' "$workflow") \
+    'runs-on: ubuntu-24.04' 'source contract runner with atomic mkdir'
+  [ "$(active_count "$workflow" 'runs-on: ubuntu-latest')" -eq 2 ] \
+    || fail "$workflow: the plan and aggregation jobs must run on GitHub-hosted ubuntu-latest"
   [ "$(grep -Ec '^[[:space:]]*runs-on:' "$workflow" || true)" -eq 4 ] \
-    || fail "$workflow: a job takes its runner from somewhere other than the cloud selector or ubuntu-latest"
+    || fail "$workflow: expected four runner declarations"
   for gate in "$review_gate" "$delivery_evidence"; do
     [ "$(grep -Ec '^[[:space:]]*runs-on:' "$gate" || true)" -eq 1 ] \
       || fail "$gate: a job runs somewhere other than GitHub-hosted ubuntu-latest"
   done
 fi
+# Bind each fixture flag to the corresponding GitHub trust boundary.
+# shellcheck disable=SC2016
+assert_active_line "$workflow" 'group_targets: ${{ steps.plan.outputs.group_targets }}' 'planned group targets'
+assert_active_line "$workflow" 'github_overflow_group: ${{ steps.overflow.outputs.group }}' 'verified GitHub group'
+assert_active_line "$workflow" 'github_arm_group: ${{ steps.arm.outputs.group }}' 'qualified GitHub Arm group'
+assert_active_line "$workflow" "if: github.event_name == 'merge_group' && github.event.repository.private && github.event.merge_group.base_ref == format('refs/heads/{0}', github.event.repository.default_branch) && vars.LINUX_QUEUE_ARM_GROUP != ''" 'private default-branch Arm integration'
+assert_active_line "$workflow" "if: github.run_attempt == 1 && github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_LOCAL_PR_GROUPS != '' && vars.LINUX_GITHUB_OVERFLOW != ''" 'first-attempt private same-repository overflow'
+assert_active_line "$workflow" 'GRANT: ${{ vars.LINUX_GITHUB_OVERFLOW }}' 'trusted GitHub overflow configuration'
+assert_active_line "$workflow" "PRIVATE_PR: \${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}" 'private same-repository PR'
+assert_active_line "$workflow" "LOCAL_SEED: \${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}" 'private default-branch local seed'
+assert_active_line "$workflow" "LEGACY_TARGET: \${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}" 'legacy runner precedence'
+assert_active_line "$workflow" 'LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}' 'trusted group configuration'
 # AUT-2851: explicit caller opt-in wins. The input stays false by default.
 # AUT-3412: LINUX_VALIDATION_RUNNER names the cloud and wins over
 # BLACKSMITH_LINUX; LINUX_PR_RUNNER and LINUX_QUEUE_RUNNER override it per
@@ -411,7 +635,7 @@ jq -e '
   and .validationEngine.path == "scripts/touchstone-run.sh"
   and (.validationEngine.revision | test("^[0-9a-f]{40}$"))
   and (.validationEngine.sha256 | test("^[0-9a-f]{64}$"))
-  and .validationEngine.supportedProjectSchemas == [1, 2, 3]
+  and .validationEngine.supportedProjectSchemas == [1, 2, 3, 4]
 ' "$source_contract" >/dev/null || fail "$source_contract: invalid validation-engine contract"
 manifest_engine_revision="$(jq -r '.validationEngine.revision' "$source_contract")"
 manifest_engine_sha256="$(jq -r '.validationEngine.sha256' "$source_contract")"
@@ -445,7 +669,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
     || fail "declared validation engine checksum differs from $source_contract"
 
   engine_fixture="$(mktemp -d)"
-  for schema in 1 2 3; do
+  for schema in 1 2 3 4; do
     project="$engine_fixture/schema-$schema"
     mkdir -p "$project"
     printf '%s\n' \
@@ -464,6 +688,9 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       'target = "root"' \
       'command = "true"' \
       'required = true' >"$project/.touchstone.toml"
+    if [ "$schema" -eq 4 ]; then
+      printf '%s\n' 'pull_request = true' >>"$project/.touchstone.toml"
+    fi
     if [ "$schema" -eq 2 ]; then
       printf '%s\n' \
         '' \
@@ -489,7 +716,7 @@ if [ -n "${TOUCHSTONE_ENGINE_PATH:-}" ] && [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0
       || fail "declared validation engine reported the wrong production result for project schema $schema"
   done
   rm -rf "$engine_fixture"
-  echo "  OK: declared validation engine prepares and validates project schemas 1-3"
+  echo "  OK: declared validation engine prepares and validates project schemas 1-4"
 fi
 # shellcheck disable=SC1003,SC2016
 assert_active_line "$review_gate" \
@@ -620,7 +847,12 @@ for gate in "$workflow" "$review_gate" "$delivery_evidence"; do
     jobs.each do |job_key, configuration|
       job = scalar.call(job_key, "job ID")
       fields = pairs.call(configuration, "job #{job}")
-      if fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
+      if File.basename(ARGV.fetch(0)) == "validate.yml" && job == "plan"
+        effective = pairs.call(one.call(fields, "permissions", "validation plan"), "plan permissions")
+        actual = effective.map { |key, value| [scalar.call(key, "scope"), scalar.call(value, "permission")] }
+        raise "validation plan needs only contents and actions read" unless actual.sort == [["actions","read"],["contents","read"]]
+        raise "validation jobs must inherit only contents read" unless declared_permissions == ["contents"]
+      elsif fields.any? { |key, _| scalar.call(key, "job #{job} key") == "permissions" }
         raise "job #{job} must not override permissions"
       end
     end
@@ -1203,7 +1435,7 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     rm -r "$fixture"
   done
 
-  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all; do
+  for validation_mutation in missing-pull-request quoted-empty-pr pr-closed pr-filtered merge-group-destroyed quoted-write job-write-all plan-write; do
     fixture="$(mktemp -d)"
     trap 'rm -rf "$fixture"' EXIT HUP INT TERM
     mkdir -p "$fixture/.github"
@@ -1229,6 +1461,9 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
         ;;
       quoted-write)
         sed 's/^  contents: read$/  contents: "write"/' "$fixture/$status_publisher" >"$fixture/validate.next"
+        ;;
+      plan-write)
+        sed 's/^      actions: read$/      actions: write/' "$fixture/$status_publisher" >"$fixture/validate.next"
         ;;
       job-write-all)
         sed '/^    runs-on:/i\

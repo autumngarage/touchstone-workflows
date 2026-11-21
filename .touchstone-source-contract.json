@@ -11,12 +11,13 @@
     "contractVersion": 1,
     "repository": "autumngarage/touchstone",
     "path": "scripts/touchstone-run.sh",
-    "revision": "243a9dfadef14218d5eceb02177a6294d6587af2",
-    "sha256": "60eddb8203517434a1fd80f2502434ceb95de949bca896a66221bb6a948e040a",
+    "revision": "ca988d8db3bac765031c7190d4687a6d5e302890",
+    "sha256": "dd1f44b4117d4ccb5634bec4ee6c24b6e3cef5d8eaea8b940edb74b118dbf7f4",
     "supportedProjectSchemas": [
       1,
       2,
-      3
+      3,
+      4
     ]
   },
   "requiredStatusCheck": "source contract",
