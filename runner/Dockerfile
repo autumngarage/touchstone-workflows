@@ -37,9 +37,9 @@ RUN set -eux; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
 # Docker Engine for jobs that run containers (LINUX_RUNNER_DOCKER=dind): each
-# such job starts its own daemon inside its privileged container, with storage
-# on a volume deleted with the job, so no job reaches another's containers or
-# the host's engine. Pinned by Docker's release signing key and exact versions.
+# such job starts its own daemon inside its Sysbox container, whose storage is
+# deleted with the job, so no job reaches another's containers, the VM or the
+# host's engine. Pinned by Docker's release signing key and exact versions.
 ARG DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
 ARG DOCKER_CE_VERSION=5:29.10.0-1~ubuntu.24.04~noble
 ARG CONTAINERD_VERSION=2.4.2-4~ubuntu.24.04~noble
