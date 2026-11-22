@@ -180,7 +180,7 @@ case "$1" in
   stop) rm -f "$FAKE_STATE/colima-up" ;;
   ssh)
     case "$*" in
-      *'command -v sysbox-runc'*) [ ! -f "$FAKE_STATE/no-sysbox" ] ;;
+      *'dpkg-query'*'sysbox-ce'*) [ ! -f "$FAKE_STATE/no-sysbox" ] ;;
       *'sudo sh -s'*)
         cat >"$FAKE_STATE/sysbox-install-script"
         [ ! -f "$FAKE_STATE/sysbox-install-fails" ] || exit 1

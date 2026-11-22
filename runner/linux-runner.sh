@@ -162,7 +162,7 @@ ensure_colima() {
   if [ "$JOB_DOCKER" = dind ]; then
     [ -f "$colima_config" ] || colima status >/dev/null 2>&1 || write_dind_colima_config
     grep -q 'sysbox-runc' "$colima_config" 2>/dev/null \
-      || die "the Colima VM was made without the Sysbox runtime that dind jobs run under. Delete the VM as $(id -un) ('colima delete') so it is made again"
+      || die "the Colima VM was made without the Sysbox runtime that dind jobs run under. Delete the VM as $(id -un) ('colima delete --data', which also drops the old engine's containers) so it is made again"
   fi
   if ! colima status >/dev/null 2>&1; then
     # --disk sizes a new VM only; an existing VM keeps the disk it was made with.
@@ -184,10 +184,13 @@ ensure_colima() {
   # existing VM made before the empty share is refused, not trusted.
   local shared
   shared="$(colima ssh -- cat /proc/mounts | awk '$3 ~ /^(virtiofs|9p|fuse\.sshfs)$/ {print $2}' | grep -vFx -- "$vm_share" || true)"
-  [ -z "$shared" ] || die "the Colima VM shares host folders ($(printf '%s' "$shared" | tr '\n' ' ')); a dind job could read them. Delete the VM as $(id -un) ('colima delete') so it is made again with only $vm_share"
+  [ -z "$shared" ] || die "the Colima VM shares host folders ($(printf '%s' "$shared" | tr '\n' ' ')); a dind job could read them. Delete the VM as $(id -un) ('colima delete --data') so it is made again with only $vm_share"
   # Installed over ssh once the VM is up, not by a boot-time provision script:
   # those run before the VM resolves names, and Colima ignores their failure.
-  if ! colima ssh -- sh -c 'command -v sysbox-runc' >/dev/null 2>&1; then
+  # A package whose setup failed leaves its binary behind, so the check is
+  # dpkg's own state, not the binary.
+  # shellcheck disable=SC2016
+  if ! colima ssh -- sh -c 'test "$(dpkg-query -W -f="\${db:Status-Status}" sysbox-ce 2>/dev/null)" = installed' >/dev/null 2>&1; then
     log "installing Sysbox $SYSBOX_VERSION in the Colima VM"
     sysbox_install_script | colima ssh -- sudo sh -s \
       || die "Sysbox $SYSBOX_VERSION did not install in the Colima VM; see 'colima ssh' as $(id -un)"
