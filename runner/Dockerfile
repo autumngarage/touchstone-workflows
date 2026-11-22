@@ -55,7 +55,7 @@ RUN set -eux; \
     "containerd.io=${CONTAINERD_VERSION}" "docker-buildx-plugin=${BUILDX_VERSION}"; \
   usermod -aG docker runner; \
   rm -rf /var/lib/apt/lists/*
-COPY --chmod=0755 job-entry.sh /usr/local/bin/job-entry.sh
+COPY job-entry.sh /usr/local/bin/job-entry.sh
 
 ARG NODE_VERSION=22.23.2
 ARG NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
