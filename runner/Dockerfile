@@ -55,7 +55,6 @@ RUN set -eux; \
     "containerd.io=${CONTAINERD_VERSION}" "docker-buildx-plugin=${BUILDX_VERSION}"; \
   usermod -aG docker runner; \
   rm -rf /var/lib/apt/lists/*
-COPY job-entry.sh /usr/local/bin/job-entry.sh
 
 ARG NODE_VERSION=22.23.2
 ARG NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
@@ -105,3 +104,6 @@ RUN set -eux; \
   swiftc "$probe/main.swift" -o "$probe/probe"; \
   test "$("$probe/probe")" = 'runner Swift works'; \
   rm -rf "$probe"
+# Last, so a change to the entry script rebuilds only this layer. COPY
+# writes it as root whatever USER says, and keeps its committed 0755 mode.
+COPY job-entry.sh /usr/local/bin/job-entry.sh

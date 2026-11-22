@@ -22,5 +22,8 @@ if ! as_runner docker info >/dev/null 2>&1; then
   tail -n 40 /tmp/dockerd.log >&2
   exit 1
 fi
+# setpriv changes the user, not the environment: without these, git and the
+# runner look for root's home and fail with EACCES.
+export HOME=/home/runner USER=runner LOGNAME=runner
 cd /home/runner
 exec setpriv --reuid=runner --regid=runner --init-groups ./run.sh --jitconfig "$jit"
