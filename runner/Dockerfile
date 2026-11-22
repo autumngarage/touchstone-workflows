@@ -36,6 +36,27 @@ RUN set -eux; \
     libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zip zlib1g-dev; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
+# Docker Engine for jobs that run containers (LINUX_RUNNER_DOCKER=dind): each
+# such job starts its own daemon inside its privileged container, with storage
+# on a volume deleted with the job, so no job reaches another's containers or
+# the host's engine. Pinned by Docker's release signing key and exact versions.
+ARG DOCKER_KEY_FINGERPRINT=9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+ARG DOCKER_CE_VERSION=5:29.10.0-1~ubuntu.24.04~noble
+ARG CONTAINERD_VERSION=2.4.2-4~ubuntu.24.04~noble
+ARG BUILDX_VERSION=0.39.1-1~ubuntu.24.04~noble
+RUN set -eux; \
+  install -m 0755 -d /etc/apt/keyrings; \
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc; \
+  test "$(gpg --show-keys --with-colons /etc/apt/keyrings/docker.asc | awk -F: '/^fpr/ {print $10; exit}')" = "$DOCKER_KEY_FINGERPRINT"; \
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu noble stable" > /etc/apt/sources.list.d/docker.list; \
+  apt-get update; \
+  apt-get install -y --no-install-recommends iptables \
+    "docker-ce=${DOCKER_CE_VERSION}" "docker-ce-cli=${DOCKER_CE_VERSION}" \
+    "containerd.io=${CONTAINERD_VERSION}" "docker-buildx-plugin=${BUILDX_VERSION}"; \
+  usermod -aG docker runner; \
+  rm -rf /var/lib/apt/lists/*
+COPY --chmod=0755 job-entry.sh /usr/local/bin/job-entry.sh
+
 ARG NODE_VERSION=22.23.2
 ARG NODE_SHA256_ARM64=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
 ARG NODE_SHA256_X64=d60acfe00a2932254bb0ad20e01b0d74397a0875595de719654b214f4b03f307

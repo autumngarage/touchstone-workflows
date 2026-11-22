@@ -38,6 +38,10 @@
 #                         request that forks without end exhausts its own
 #                         container, not the VM every slot shares
 #   LINUX_RUNNER_IMAGE    job image tag (linux-ephemeral-runner:local)
+#   LINUX_RUNNER_DOCKER   none (default) or dind: each job starts its own Docker
+#                         daemon in a privileged container whose storage volume
+#                         is deleted with it, for validation groups that run
+#                         containers. Use only in a VM dedicated to these jobs.
 #   LINUX_RUNNER_ENGINE   docker: use the Docker engine already running (Docker
 #                         Desktop in a login session); colima: start this
 #                         user's Colima VM first, which needs no login session
@@ -83,6 +87,7 @@ MEMORY="${LINUX_RUNNER_MEMORY:-6g}"
 CPUS="${LINUX_RUNNER_CPUS:-4}"
 PIDS="${LINUX_RUNNER_PIDS:-4096}"
 IMAGE="${LINUX_RUNNER_IMAGE:-linux-ephemeral-runner:local}"
+JOB_DOCKER="${LINUX_RUNNER_DOCKER:-none}"
 ENGINE="${LINUX_RUNNER_ENGINE:-docker}"
 VM_CPUS="${LINUX_RUNNER_VM_CPUS:-8}"
 VM_MEMORY="${LINUX_RUNNER_VM_MEMORY:-16}"
@@ -107,6 +112,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/jit.sh"
 
 state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
+vm_share="$HOME/.linux-runner-vm-share"
 host="$(hostname -s 2>/dev/null || hostname)"
 prefix="$LABEL-$host"
 
@@ -119,6 +125,7 @@ case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative 
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$VM_DISK" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_VM_DISK must be a positive integer of GiB, not '$VM_DISK'" ;; esac
 case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker or colima, not '$ENGINE'" ;; esac
+case "$JOB_DOCKER" in none | dind) ;; *) die "LINUX_RUNNER_DOCKER must be none or dind, not '$JOB_DOCKER'" ;; esac
 
 # The Docker engine the slots run containers on. Docker Desktop lives in a
 # login session, so a host with nobody logged in uses this user's Colima VM,
@@ -138,9 +145,19 @@ ensure_engine() {
   if ! colima status >/dev/null 2>&1; then
     # --disk sizes a new VM only; an existing VM keeps the disk it was made with.
     log "starting the Colima VM (aarch64, $VM_CPUS CPUs, ${VM_MEMORY} GiB memory, ${VM_DISK} GiB disk for a new VM)"
+    # Colima shares the user's home into a new VM unless told otherwise, and
+    # the registration token lives there. The VM gets one empty folder instead.
+    mkdir -p "$vm_share"
     colima start --vm-type vz --arch aarch64 --cpu "$VM_CPUS" --memory "$VM_MEMORY" --disk "$VM_DISK" \
+      --mount "$vm_share" \
       || die "colima could not start its VM; see 'colima start' as $(id -un)"
   fi
+  [ "$JOB_DOCKER" = dind ] || return 0
+  # A privileged job controls the whole VM, so the VM must hold nothing of the
+  # host's: an existing VM made before the empty share is refused, not trusted.
+  local shared
+  shared="$(colima ssh -- cat /proc/mounts | awk '$3 ~ /^(virtiofs|9p|fuse\.sshfs)$/ {print $2}' | grep -vFx -- "$vm_share" || true)"
+  [ -z "$shared" ] || die "the Colima VM shares host folders ($(printf '%s' "$shared" | tr '\n' ' ')); a dind job could read them. Delete the VM as $(id -un) ('colima delete') so it is made again with only $vm_share"
 }
 
 # engine_lost: whether this user's Colima engine stopped answering. A container that fails at
@@ -223,11 +240,18 @@ run_slot() {
     # <config>` would hand the runner credential to that runner's jobs for as
     # long as this job ran. Inside the container it becomes run.sh's argument,
     # visible only in the container's own VM.
-    printf '%s\n' "$jit" | docker run --init -i --name "$name" \
-      --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
-      "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+    if [ "$JOB_DOCKER" = dind ]; then
+      printf '%s\n' "$jit" | docker run --init -i --name "$name" \
+        --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
+        --privileged --user root --mount type=volume,dst=/var/lib/docker \
+        "$IMAGE" /usr/local/bin/job-entry.sh || rc=$?
+    else
+      printf '%s\n' "$jit" | docker run --init -i --name "$name" \
+        --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
+        "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+    fi
     forget_runner "$id"
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
     log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
@@ -297,7 +321,7 @@ stop_slots() {
   for file in "$state_dir"/slot-*; do
     [ -f "$file" ] || continue
     read -r id name _ <"$file" || true
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true
     forget_runner "$id"
     rm -f "$file"
   done
@@ -354,7 +378,7 @@ cmd_run() {
   # What a supervisor that was killed left: its jobs' containers, its slot
   # records and lock, and its registrations.
   docker ps -aq --filter "name=^$prefix-" | while read -r leftover; do
-    docker rm -f "$leftover" >/dev/null 2>&1 || true
+    docker rm -f -v "$leftover" >/dev/null 2>&1 || true
   done
   rm -f "$state_dir"/slot-* "$state_dir/draining" "$state_dir/engine-lost"
   rmdir "$state_dir/register.lock" 2>/dev/null || true
@@ -454,6 +478,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
+    <key>LINUX_RUNNER_DOCKER</key><string>$JOB_DOCKER</string>
     <key>LINUX_RUNNER_LOG_FILE</key><string>$log_file</string>
   </dict>
   <key>RunAtLoad</key><true/>

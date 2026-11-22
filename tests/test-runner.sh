@@ -173,6 +173,13 @@ case "$1" in
   status) [ -f "$FAKE_STATE/colima-up" ] ;;
   start) [ ! -f "$FAKE_STATE/colima-fails" ] ;;
   stop) rm -f "$FAKE_STATE/colima-up" ;;
+  ssh)
+    # /proc/mounts inside the VM: only the empty share, unless a test says
+    # the VM was made with Colima's default home share.
+    printf 'none /proc proc rw 0 0\n'
+    printf 'mount0 %s/.linux-runner-vm-share virtiofs ro 0 0\n' "$FAKE_HOME"
+    if [ -f "$FAKE_STATE/vm-shares-home" ]; then printf 'mount1 %s virtiofs rw 0 0\n' "$FAKE_HOME"; fi
+    ;;
 esac
 EOF
 # id: root unless the not-root flag is set; the user and group names the
@@ -219,6 +226,7 @@ runner() {
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
     LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=none \
     LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" LINUX_RUNNER_LOG_FILE="${LOG_FILE:-}" \
+    LINUX_RUNNER_DOCKER="${JOB_DOCKER:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
   rc=$?
   set -e
@@ -260,9 +268,28 @@ case "$run_line" in *SINGLE-USE-CONFIG*) fail "the single-use configuration is a
 has 'docker-stdin SINGLE-USE-CONFIG' "the configuration arrives on the container's stdin"
 ok "the container gets the single-use configuration, on stdin, and nothing else"
 has '-X DELETE orgs/autumngarage/actions/runners/4242' "cleanup"
-has 'docker rm -f linux-ephemeral-testhost-1-' "the finished job's container is removed"
+has 'docker rm -f -v linux-ephemeral-testhost-1-' "the finished job's container and its anonymous volumes are removed"
 [ -z "$(ls "$tmp/state")" ] || fail "a finished slot left state behind: $(ls "$tmp/state")"
 ok "the registration is forgotten and the slot's state removed after the job"
+echo "==> dind: a job that runs containers gets its own daemon and nothing of the host's"
+JOB_DOCKER=dind runner run
+[ "$rc" -eq 0 ] || fail "a dind run exited $rc: $(cat "$tmp/out")"
+run_line="$(grep '^docker run ' "$tmp/calls")"
+for arg in '--privileged' '--user root' '--mount type=volume,dst=/var/lib/docker' '--memory 6g' '--pids-limit 4096' '--pull never' 'linux-ephemeral-runner:local /usr/local/bin/job-entry.sh'; do
+  case "$run_line" in *"$arg"*) ;; *) fail "dind container is missing '$arg': $run_line" ;; esac
+done
+# The daemon's storage is an anonymous volume, removed with the container:
+# no host path, no shared engine socket, no credential reaches the job.
+for forbidden in ' -v ' '--volume' 'docker.sock' 'src=' 'source=' ' -e ' '--env' 'GH_TOKEN' 'SINGLE-USE-CONFIG'; do
+  case "$run_line" in *"$forbidden"*) fail "dind container must not get '$forbidden': $run_line" ;; esac
+done
+has 'docker-stdin SINGLE-USE-CONFIG' "the dind job's configuration arrives on stdin"
+has 'docker rm -f -v linux-ephemeral-testhost-1-' "the dind job's storage volume is deleted with its container"
+ok "a dind job gets a private daemon whose storage is deleted with it"
+JOB_DOCKER=docker-sock runner run
+[ "$rc" -ne 0 ] || fail "an unknown LINUX_RUNNER_DOCKER value was accepted"
+lacks '^docker run ' "an unknown LINUX_RUNNER_DOCKER value started a job"
+ok "an unknown LINUX_RUNNER_DOCKER value stops before any job"
 SLOTS=3 runner run
 [ "$rc" -eq 0 ] || fail "a three-slot run exited $rc: $(cat "$tmp/out")"
 for slot in 1 2 3; do
@@ -305,7 +332,7 @@ mkdir -p "$tmp/fake"
 printf 'abc123\n' >"$tmp/fake/leftovers"
 KEEP_FAKE=1 runner run
 has 'docker ps -aq --filter name=^linux-ephemeral-testhost-' "leftovers are looked for"
-has 'docker rm -f abc123' "a leftover container is removed"
+has 'docker rm -f -v abc123' "a leftover container and its volumes are removed"
 ok "a restart removes the containers a killed supervisor left"
 FLAGS='stale-runner delete-ok' runner run
 [ "$rc" -eq 0 ] || fail "a run with a stale registration exited $rc: $(cat "$tmp/out")"
@@ -485,6 +512,8 @@ echo "==> a headless host starts its own Colima VM"
 ENGINE=colima runner run
 [ "$rc" -eq 0 ] || fail "a colima run exited $rc: $(cat "$tmp/out")"
 has 'colima start --vm-type vz --arch aarch64 --cpu 8 --memory 16 --disk 60' "a stopped VM starts native, with its disk size"
+has "--mount $tmp/home/.linux-runner-vm-share" "a new VM shares one empty folder, not the home that holds the token"
+[ -d "$tmp/home/.linux-runner-vm-share" ] || fail "the empty share was not created"
 has 'docker run ' "colima run"
 LINUX_RUNNER_VM_DISK=120 ENGINE=colima runner run
 has '--disk 120' "LINUX_RUNNER_VM_DISK"
@@ -493,6 +522,16 @@ refused 'LINUX_RUNNER_VM_DISK must be a positive integer' "a zero disk"
 FLAGS=colima-up ENGINE=colima runner run
 lacks '^colima start' "a running VM"
 ok "the VM is started when it is down, with --arch aarch64 and --disk, and left alone when it is up"
+JOB_DOCKER=dind ENGINE=colima runner run
+[ "$rc" -eq 0 ] || fail "a dind colima run with only the empty share exited $rc: $(cat "$tmp/out")"
+has 'docker run ' "a dind job on a VM holding nothing of the host's"
+FLAGS='colima-up vm-shares-home' JOB_DOCKER=dind ENGINE=colima runner run
+refused 'the Colima VM shares host folders' "a dind VM made with the home share"
+lacks '^docker run ' "a dind job on a VM that shares the home"
+lacks 'generate-jitconfig' "a dind registration on a VM that shares the home"
+FLAGS='colima-up vm-shares-home' ENGINE=colima runner run
+[ "$rc" -eq 0 ] || fail "a no-Docker job was refused for the VM's shares: $(cat "$tmp/out")"
+ok "a dind job runs only in a VM that shares nothing but the empty folder"
 FLAGS=colima-fails ENGINE=colima runner run
 refused 'colima could not start its VM' "a VM that will not start"
 lacks 'generate-jitconfig' "no VM"
