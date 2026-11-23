@@ -35,7 +35,11 @@ RUN_AS=linuxci
 RUN_AS_HOME=/Users/linuxci
 RUN_AS_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 COLIMA=/opt/homebrew/bin/colima
-VM_DISK=60
+# The VM's data disk holds the job image and every job's build and inner
+# Docker. Three full hesperus validations filled 60 GiB on 2026-11-23
+# (4.8 GiB left, queue run for #4183); a job peaks near 18 GiB. The disk is
+# sparse and the VM trims hourly, so the Mac holds only what is in use.
+VM_DISK=90
 # Memory the VM keeps for its own engine and kernel, outside every job's limit.
 VM_RESERVED_GIB=3
 
