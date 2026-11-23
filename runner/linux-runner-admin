@@ -1,0 +1,170 @@
+#!/bin/bash
+# linux-runner-admin: the one root command henry may run without a password
+# (/etc/sudoers.d/ci-studio-linux-runner). It reconfigures ci-studio's Linux
+# runner daemon and nothing else.
+#
+#   sudo -n linux-runner-admin status
+#   sudo -n linux-runner-admin apply SLOTS QUEUE_SLOTS
+#   sudo -n linux-runner-admin rebuild [VM_CPUS VM_MEMORY_GIB]
+#   sudo -n linux-runner-admin update-code SHA
+#   sudo -n linux-runner-admin update-self
+#
+# Root runs only files root owns: this script, and a root-owned clone of
+# touchstone-workflows checked out at a commit on its main branch, which takes
+# changes only through reviewed pull requests. update-code moves that clone
+# forward only, never to an older commit; update-self installs this script
+# from that clone, so the script also changes only through review. Every
+# argument is checked against fixed bounds; the environment sudo passes is
+# ignored.
+#
+# Installed by hand once:
+#   sudo install -o root -g wheel -m 0755 runner/linux-runner-admin \
+#     /usr/local/libexec/ci-studio/linux-runner-admin
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+umask 022
+
+BASE=/usr/local/libexec/ci-studio
+SELF="$BASE/linux-runner-admin"
+TW="$BASE/touchstone-workflows"
+CONF="$BASE/linux-runner.conf"
+LOG=/var/log/ci-studio-linux-runner-admin.log
+SERVICE=system/com.autumngarage.linux-ephemeral-runner
+RUN_AS=linuxci
+RUN_AS_HOME=/Users/linuxci
+RUN_AS_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+COLIMA=/opt/homebrew/bin/colima
+VM_DISK=60
+# Memory the VM keeps for its own engine and kernel, outside every job's limit.
+VM_RESERVED_GIB=3
+
+die() { echo "linux-runner-admin: $*" >&2; note "refused: $*"; exit 1; }
+note() { printf '%s %s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "${SUDO_USER:-root}" "$*" >>"$LOG" 2>/dev/null || true; }
+[ "$(id -u)" -eq 0 ] || { echo "linux-runner-admin: run it with sudo" >&2; exit 1; }
+for path in "$BASE" "$TW" "$SELF"; do
+  [ "$(stat -f %u "$path")" = 0 ] || die "$path must belong to root"
+done
+
+int_in() { # VALUE MIN MAX NAME
+  case "$1" in '' | *[!0-9]*) die "$4 must be a whole number, not '$1'" ;; esac
+  [ "$1" -ge "$2" ] && [ "$1" -le "$3" ] || die "$4 must be between $2 and $3, not $1"
+}
+
+# The current configuration: SLOTS QUEUE_SLOTS VM_CPUS VM_MEMORY.
+read_conf() {
+  SLOTS=3 QUEUE_SLOTS=0 VM_CPUS=12 VM_MEMORY=24
+  [ -f "$CONF" ] && read -r SLOTS QUEUE_SLOTS VM_CPUS VM_MEMORY <"$CONF"
+  return 0
+}
+
+git_tw() { git -C "$TW" -c core.hooksPath=/dev/null "$@"; }
+
+# The fleet's settings, as the runner script reads them. Every job runs with
+# its own Docker engine under Sysbox, and the VM is split evenly between the
+# slots.
+fleet_env() { # SLOTS
+  local job_memory=$(((VM_MEMORY - VM_RESERVED_GIB) / $1))
+  [ "$job_memory" -ge 4 ] || die "$1 slots in a ${VM_MEMORY} GiB VM leave ${job_memory} GiB a job; rebuild with more memory or apply fewer slots"
+  printf '%s\n' LINUX_RUNNER_ENGINE=colima LINUX_RUNNER_DOCKER=dind \
+    "LINUX_RUNNER_SLOTS=$1" "LINUX_RUNNER_CPUS=$((VM_CPUS / $1))" "LINUX_RUNNER_MEMORY=${job_memory}g" \
+    "LINUX_RUNNER_VM_CPUS=$VM_CPUS" "LINUX_RUNNER_VM_MEMORY=$VM_MEMORY" "LINUX_RUNNER_VM_DISK=$VM_DISK"
+}
+
+# As the fleet's own user, as the daemon itself runs Colima.
+as_run_user() {
+  local settings
+  settings="$(fleet_env "$SLOTS")"
+  # shellcheck disable=SC2046
+  sudo -u "$RUN_AS" -H env -i PATH="$RUN_AS_PATH" HOME="$RUN_AS_HOME" $(printf '%s\n' "$settings") "$@"
+}
+
+install_daemon() { # SLOTS QUEUE_SLOTS
+  local settings
+  settings="$(fleet_env "$1")"
+  # shellcheck disable=SC2046
+  env -i PATH="$PATH" HOME=/var/root LINUX_RUNNER_QUEUE_SLOTS="$2" $(printf '%s\n' "$settings") \
+    /bin/bash "$TW/runner/linux-runner.sh" install-daemon "$RUN_AS"
+  printf '%s %s %s %s\n' "$1" "$2" "$VM_CPUS" "$VM_MEMORY" >"$CONF"
+}
+
+cmd_status() {
+  read_conf
+  echo "slots=$SLOTS queue_slots=$QUEUE_SLOTS vm_cpus=$VM_CPUS vm_memory=${VM_MEMORY}GiB"
+  echo "runner code: touchstone-workflows $(git_tw rev-parse HEAD)"
+  launchctl print "$SERVICE" 2>/dev/null | grep -E '^\s*(state|pid) =' | head -2 || echo "daemon: not loaded"
+}
+
+# The daemon again with new slot counts, on the VM and image it has.
+cmd_apply() {
+  [ "$#" -eq 2 ] || die "usage: apply SLOTS QUEUE_SLOTS (a new VM size is a rebuild)"
+  local slots="$1" queue="$2"
+  int_in "$slots" 1 4 SLOTS
+  int_in "$queue" 0 $((slots - 1)) QUEUE_SLOTS
+  read_conf
+  note "apply slots=$slots queue_slots=$queue code=$(git_tw rev-parse HEAD)"
+  # install-daemon replaces the running daemon after its jobs finish.
+  install_daemon "$slots" "$queue"
+  note "applied"
+}
+
+# A new VM, at the given size or the current one, with a job image built from
+# the installed code, then the daemon. The old VM goes with its engine's data:
+# Sysbox refuses to install beside containers it did not make.
+cmd_rebuild() {
+  [ "$#" -eq 0 ] || [ "$#" -eq 2 ] || die "usage: rebuild [VM_CPUS VM_MEMORY_GIB]"
+  read_conf
+  if [ "$#" -eq 2 ]; then
+    int_in "$1" 4 16 VM_CPUS
+    int_in "$2" 8 40 VM_MEMORY_GIB
+    VM_CPUS="$1" VM_MEMORY="$2"
+  fi
+  fleet_env "$SLOTS" >/dev/null
+  note "rebuild vm=$VM_CPUS/$VM_MEMORY slots=$SLOTS code=$(git_tw rev-parse HEAD)"
+  # Running jobs finish, up to the daemon's exit timeout, before their VM goes.
+  env -i PATH="$PATH" HOME=/var/root /bin/bash "$TW/runner/linux-runner.sh" stop-daemon
+  # Colima reports an error for a VM that is already gone; what counts is that
+  # neither the VM nor its data disk is left.
+  as_run_user "$COLIMA" delete --force --data || true
+  for path in "$RUN_AS_HOME/.colima/_lima/colima" "$RUN_AS_HOME/.colima/_lima/_disks/colima"; do
+    [ ! -e "$path" ] || die "colima delete --data left $path; the daemon stays stopped"
+  done
+  as_run_user /bin/bash "$TW/runner/linux-runner.sh" build || die "the job image did not build; the daemon stays stopped"
+  install_daemon "$SLOTS" "$QUEUE_SLOTS"
+  note "rebuilt"
+}
+
+cmd_update_code() {
+  [ "$#" -eq 1 ] || die "usage: update-code SHA"
+  local sha="$1" current
+  case "$sha" in *[!0-9a-f]* | '') die "SHA must be a full 40-character commit id" ;; esac
+  [ "${#sha}" -eq 40 ] || die "SHA must be a full 40-character commit id"
+  current="$(git_tw rev-parse HEAD)"
+  git_tw fetch --quiet origin main || die "could not fetch touchstone-workflows"
+  git_tw merge-base --is-ancestor "$sha" origin/main || die "$sha is not on touchstone-workflows main"
+  git_tw merge-base --is-ancestor "$current" "$sha" || die "$sha is older than the installed $current; update-code only moves forward"
+  git_tw -c advice.detachedHead=false checkout --quiet --detach "$sha"
+  note "update-code $current -> $sha (takes effect at the next apply or rebuild)"
+  echo "runner code now at $sha; run apply, or rebuild when the job image changed"
+}
+
+cmd_update_self() {
+  [ "$#" -eq 0 ] || die "usage: update-self"
+  local source="$TW/runner/linux-runner-admin"
+  [ -f "$source" ] || die "the installed code has no runner/linux-runner-admin"
+  /bin/bash -n "$source" || die "$source does not parse"
+  install -o root -g wheel -m 0755 "$source" "$SELF"
+  note "update-self from $(git_tw rev-parse HEAD)"
+  echo "linux-runner-admin now matches touchstone-workflows $(git_tw rev-parse HEAD)"
+}
+
+verb="${1:-}"
+[ "$#" -gt 0 ] && shift
+case "$verb" in
+  status) cmd_status ;;
+  apply) cmd_apply "$@" ;;
+  rebuild) cmd_rebuild "$@" ;;
+  update-code) cmd_update_code "$@" ;;
+  update-self) cmd_update_self "$@" ;;
+  *) die "usage: status | apply SLOTS QUEUE_SLOTS | rebuild [VM_CPUS VM_MEMORY_GIB] | update-code SHA | update-self" ;;
+esac

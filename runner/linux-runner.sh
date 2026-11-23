@@ -9,6 +9,8 @@
 #   sudo bash runner/linux-runner.sh install-daemon USER
 #                                           run them at boot as USER from a
 #                                           LaunchDaemon, with no login session
+#   sudo bash runner/linux-runner.sh stop-daemon
+#                                           stop the LaunchDaemon once its jobs finish
 #   sudo bash runner/linux-runner.sh uninstall-daemon
 #                                           stop and remove the LaunchDaemon
 #   bash runner/linux-runner.sh status      show the daemon, containers, and registrations
@@ -38,6 +40,14 @@
 #                         request that forks without end exhausts its own
 #                         container, not the VM every slot shares
 #   LINUX_RUNNER_IMAGE    job image tag (linux-ephemeral-runner:local)
+#   LINUX_RUNNER_DOCKER   none (default) or dind: each job starts its own Docker
+#                         daemon, for validation groups that run containers.
+#                         The job container runs under Sysbox, not --privileged:
+#                         its daemon and anything it starts, privileged or not,
+#                         stay inside the job's user namespace and cannot reach
+#                         the VM or the other slots. The engine must offer the
+#                         sysbox-runc runtime; on Colima this script installs a
+#                         pinned Sysbox and owns the VM's configuration.
 #   LINUX_RUNNER_ENGINE   docker: use the Docker engine already running (Docker
 #                         Desktop in a login session); colima: start this
 #                         user's Colima VM first, which needs no login session
@@ -83,6 +93,11 @@ MEMORY="${LINUX_RUNNER_MEMORY:-6g}"
 CPUS="${LINUX_RUNNER_CPUS:-4}"
 PIDS="${LINUX_RUNNER_PIDS:-4096}"
 IMAGE="${LINUX_RUNNER_IMAGE:-linux-ephemeral-runner:local}"
+JOB_DOCKER="${LINUX_RUNNER_DOCKER:-none}"
+# The Sysbox release a dind Colima VM installs, and its arm64 package digest
+# from https://github.com/nestybox/sysbox/releases/tag/v0.7.1.
+SYSBOX_VERSION=0.7.1
+SYSBOX_SHA256=04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b
 ENGINE="${LINUX_RUNNER_ENGINE:-docker}"
 VM_CPUS="${LINUX_RUNNER_VM_CPUS:-8}"
 VM_MEMORY="${LINUX_RUNNER_VM_MEMORY:-16}"
@@ -107,6 +122,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$here/jit.sh"
 
 state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
+vm_share="$HOME/.linux-runner-vm-share"
+colima_config="$HOME/.colima/default/colima.yaml"
 host="$(hostname -s 2>/dev/null || hostname)"
 prefix="$LABEL-$host"
 
@@ -119,6 +136,7 @@ case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative 
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$VM_DISK" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_VM_DISK must be a positive integer of GiB, not '$VM_DISK'" ;; esac
 case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker or colima, not '$ENGINE'" ;; esac
+case "$JOB_DOCKER" in none | dind) ;; *) die "LINUX_RUNNER_DOCKER must be none or dind, not '$JOB_DOCKER'" ;; esac
 
 # The Docker engine the slots run containers on. Docker Desktop lives in a
 # login session, so a host with nobody logged in uses this user's Colima VM,
@@ -126,7 +144,12 @@ case "$ENGINE" in docker | colima) ;; *) die "LINUX_RUNNER_ENGINE must be docker
 # docker context another tool set can redirect the slots.
 ensure_engine() {
   need docker "install Docker Desktop, or the Docker CLI and Colima (brew install docker colima)"
-  [ "$ENGINE" = colima ] || return 0
+  if [ "$ENGINE" = colima ]; then ensure_colima; fi
+  [ "$JOB_DOCKER" = dind ] || return 0
+  require_sysbox
+}
+
+ensure_colima() {
   need colima "install Colima (brew install colima)"
   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
   # A VM that runs but whose engine does not answer is stopped first: the supervisor starts with
@@ -135,12 +158,91 @@ ensure_engine() {
     log "the Colima VM runs but its engine does not answer; stopping it to start it again"
     colima stop --force || log "colima could not stop its VM; starting it anyway"
   fi
+  # Colima rewrites Docker's daemon.json from its own configuration at every
+  # start, so a dind VM's Sysbox runtime is declared there. A VM made without
+  # it is refused, not patched: its next restart would drop the runtime.
+  if [ "$JOB_DOCKER" = dind ]; then
+    [ -f "$colima_config" ] || colima status >/dev/null 2>&1 || write_dind_colima_config
+    grep -q 'sysbox-runc' "$colima_config" 2>/dev/null \
+      || die "the Colima VM was made without the Sysbox runtime that dind jobs run under. Delete the VM as $(id -un) ('colima delete --data', which also drops the old engine's containers) so it is made again"
+  fi
   if ! colima status >/dev/null 2>&1; then
     # --disk sizes a new VM only; an existing VM keeps the disk it was made with.
     log "starting the Colima VM (aarch64, $VM_CPUS CPUs, ${VM_MEMORY} GiB memory, ${VM_DISK} GiB disk for a new VM)"
-    colima start --vm-type vz --arch aarch64 --cpu "$VM_CPUS" --memory "$VM_MEMORY" --disk "$VM_DISK" \
-      || die "colima could not start its VM; see 'colima start' as $(id -un)"
+    # Colima shares the user's home into a new VM unless told otherwise, and
+    # the registration token lives there. The VM gets one empty folder instead.
+    mkdir -p "$vm_share"
+    if [ "$JOB_DOCKER" = dind ]; then
+      # Flags would make Colima rewrite the configuration without the runtime.
+      colima start || die "colima could not start its VM; see 'colima start' as $(id -un)"
+    else
+      colima start --vm-type vz --arch aarch64 --cpu "$VM_CPUS" --memory "$VM_MEMORY" --disk "$VM_DISK" \
+        --mount "$vm_share" \
+        || die "colima could not start its VM; see 'colima start' as $(id -un)"
+    fi
   fi
+  [ "$JOB_DOCKER" = dind ] || return 0
+  # The VM holds nothing of the host's, as a second boundary behind Sysbox: an
+  # existing VM made before the empty share is refused, not trusted.
+  local shared
+  shared="$(colima ssh -- cat /proc/mounts | awk '$3 ~ /^(virtiofs|9p|fuse\.sshfs)$/ {print $2}' | grep -vFx -- "$vm_share" || true)"
+  [ -z "$shared" ] || die "the Colima VM shares host folders ($(printf '%s' "$shared" | tr '\n' ' ')); a dind job could read them. Delete the VM as $(id -un) ('colima delete --data') so it is made again with only $vm_share"
+  # Installed over ssh once the VM is up, not by a boot-time provision script:
+  # those run before the VM resolves names, and Colima ignores their failure.
+  # A package whose setup failed leaves its binary behind, so the check is
+  # dpkg's own state, not the binary.
+  # shellcheck disable=SC2016
+  if ! colima ssh -- sh -c 'test "$(dpkg-query -W -f="\${db:Status-Status}" sysbox-ce 2>/dev/null)" = installed' >/dev/null 2>&1; then
+    log "installing Sysbox $SYSBOX_VERSION in the Colima VM"
+    sysbox_install_script | colima ssh -- sudo sh -s \
+      || die "Sysbox $SYSBOX_VERSION did not install in the Colima VM; see 'colima ssh' as $(id -un)"
+    # Its package restarts the VM's Docker engine to add the runtime.
+    local _
+    for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
+  fi
+}
+
+# write_dind_colima_config: the whole configuration of a new dind VM. Colima
+# fills every other setting with its defaults.
+write_dind_colima_config() {
+  mkdir -p "$(dirname "$colima_config")"
+  cat >"$colima_config" <<YAML
+# Written by linux-runner.sh for LINUX_RUNNER_DOCKER=dind. Started without
+# flags, which would make Colima rewrite it without the Sysbox runtime.
+cpu: $VM_CPUS
+memory: $VM_MEMORY
+disk: $VM_DISK
+arch: aarch64
+vmType: vz
+runtime: docker
+mounts:
+  - location: $vm_share
+    writable: false
+docker:
+  runtimes:
+    sysbox-runc:
+      path: /usr/bin/sysbox-runc
+YAML
+}
+
+# sysbox_install_script: run as root in the VM; the package is verified before
+# it is installed.
+sysbox_install_script() {
+  cat <<SH
+set -eu
+deb=/tmp/sysbox-ce_${SYSBOX_VERSION}.linux_arm64.deb
+curl -fsSL --retry 5 --retry-connrefused -o "\$deb" https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}.linux_arm64.deb
+echo "${SYSBOX_SHA256}  \$deb" | sha256sum -c -
+apt-get update -qq
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "\$deb"
+SH
+}
+
+# require_sysbox: a dind job never starts on an engine that would run it
+# without Sysbox, where --runtime would fail or, worse, need --privileged.
+require_sysbox() {
+  docker info --format '{{range $name, $_ := .Runtimes}}{{$name}} {{end}}' 2>/dev/null | tr ' ' '\n' | grep -qx sysbox-runc \
+    || die "the Docker engine offers no sysbox-runc runtime, which dind jobs run under; install Sysbox $SYSBOX_VERSION (https://github.com/nestybox/sysbox) for this engine"
 }
 
 # engine_lost: whether this user's Colima engine stopped answering. A container that fails at
@@ -223,11 +325,18 @@ run_slot() {
     # <config>` would hand the runner credential to that runner's jobs for as
     # long as this job ran. Inside the container it becomes run.sh's argument,
     # visible only in the container's own VM.
-    printf '%s\n' "$jit" | docker run --init -i --name "$name" \
-      --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
-      "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+    if [ "$JOB_DOCKER" = dind ]; then
+      printf '%s\n' "$jit" | docker run --init -i --name "$name" \
+        --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
+        --runtime sysbox-runc --user root \
+        "$IMAGE" /usr/local/bin/job-entry.sh || rc=$?
+    else
+      printf '%s\n' "$jit" | docker run --init -i --name "$name" \
+        --memory "$MEMORY" --cpus "$CPUS" --pids-limit "$PIDS" --pull never \
+        "$IMAGE" bash -c 'IFS= read -r jit && exec ./run.sh --jitconfig "$jit"' || rc=$?
+    fi
     forget_runner "$id"
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
     log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
@@ -297,7 +406,7 @@ stop_slots() {
   for file in "$state_dir"/slot-*; do
     [ -f "$file" ] || continue
     read -r id name _ <"$file" || true
-    docker rm -f "$name" >/dev/null 2>&1 || true
+    docker rm -f -v "$name" >/dev/null 2>&1 || true
     forget_runner "$id"
     rm -f "$file"
   done
@@ -354,7 +463,7 @@ cmd_run() {
   # What a supervisor that was killed left: its jobs' containers, its slot
   # records and lock, and its registrations.
   docker ps -aq --filter "name=^$prefix-" | while read -r leftover; do
-    docker rm -f "$leftover" >/dev/null 2>&1 || true
+    docker rm -f -v "$leftover" >/dev/null 2>&1 || true
   done
   rm -f "$state_dir"/slot-* "$state_dir/draining" "$state_dir/engine-lost"
   rmdir "$state_dir/register.lock" 2>/dev/null || true
@@ -454,6 +563,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>
     <key>LINUX_RUNNER_IMAGE</key><string>$IMAGE</string>
+    <key>LINUX_RUNNER_DOCKER</key><string>$JOB_DOCKER</string>
     <key>LINUX_RUNNER_LOG_FILE</key><string>$log_file</string>
   </dict>
   <key>RunAtLoad</key><true/>
@@ -479,10 +589,18 @@ EOF
   log "installed $AGENT_ID as $user; logs in $log_file, rotated by $rotation"
 }
 
+# The daemon stopped, its running jobs first allowed to finish, and left
+# installed: the fleet's rebuild runs this before it deletes the VM.
+cmd_stop_daemon() {
+  need launchctl "stop-daemon needs macOS launchd"
+  [ "$(id -u)" -eq 0 ] || die "stop-daemon stops a LaunchDaemon; run it with sudo"
+  stop_service system "$AGENT_ID" "$(daemon_plist_path)"
+}
+
 cmd_uninstall_daemon() {
   need launchctl "uninstall-daemon needs macOS launchd"
   [ "$(id -u)" -eq 0 ] || die "uninstall-daemon removes a LaunchDaemon; run it with sudo"
-  launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
+  stop_service system "$AGENT_ID" "$(daemon_plist_path)"
   rm -f "$(daemon_plist_path)" "$(newsyslog_path)"
   log "removed $AGENT_ID from $DAEMON_DIR and its log rotation"
 }
@@ -501,6 +619,7 @@ case "${1:-}" in
   build) cmd_build ;;
   run) cmd_run ;;
   install-daemon) cmd_install_daemon "${2:-}" ;;
+  stop-daemon) cmd_stop_daemon ;;
   uninstall-daemon) cmd_uninstall_daemon ;;
   status) cmd_status ;;
   *)
