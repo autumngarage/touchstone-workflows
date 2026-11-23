@@ -40,6 +40,18 @@ RUN set -eux; \
     libatk-bridge2.0-0t64 libdrm2 libxkbcommon0 libcups2t64 libsecret-1-0; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
+# amd64 emulation on an arm64 host. Consumers build amd64-only images (hesperus's
+# worker image carries Blender's x64 release) with `--platform linux/amd64`.
+# Sysbox gives each job its own empty binfmt_misc, so the VM's handler does not
+# reach a job; job-entry.sh registers this static interpreter in the job's own.
+RUN set -eux; \
+  if [ "$(dpkg --print-architecture)" = arm64 ]; then \
+    apt-get update; \
+    apt-get install -y --no-install-recommends qemu-user-static; \
+    test -x /usr/bin/qemu-x86_64-static; \
+    rm -rf /var/lib/apt/lists/*; \
+  fi
+
 # Docker Engine for jobs that run containers (LINUX_RUNNER_DOCKER=dind): each
 # such job starts its own daemon inside its Sysbox container, whose storage is
 # deleted with the job, so no job reaches another's containers, the VM or the

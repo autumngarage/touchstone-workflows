@@ -11,6 +11,14 @@ if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
   xargs -rn1 </sys/fs/cgroup/cgroup.procs >/sys/fs/cgroup/init/cgroup.procs 2>/dev/null || :
   sed -e 's/ / +/g' -e 's/^/+/' </sys/fs/cgroup/cgroup.controllers >/sys/fs/cgroup/cgroup.subtree_control
 fi
+# On an arm64 host, register amd64 emulation in this job's own binfmt_misc
+# (see the Dockerfile). F opens the interpreter now, so a build container
+# without it can still run amd64 binaries.
+if [ "$(uname -m)" = aarch64 ] && [ ! -e /proc/sys/fs/binfmt_misc/qemu-x86_64 ]; then
+  printf '%s' ':qemu-x86_64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-x86_64-static:FPC' \
+    >/proc/sys/fs/binfmt_misc/register \
+    || { echo "job-entry: amd64 emulation could not be registered in this job's binfmt_misc" >&2; exit 1; }
+fi
 dockerd --host=unix:///var/run/docker.sock --group=docker >/tmp/dockerd.log 2>&1 &
 as_runner() { setpriv --reuid=runner --regid=runner --init-groups "$@"; }
 for _ in $(seq 1 60); do
