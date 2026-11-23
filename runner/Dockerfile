@@ -10,6 +10,8 @@
 #   - Node 22 LTS with npm (vesper's site validation);
 #   - Swift's system dependencies, libsqlite3-dev, and a Swift toolchain,
 #     which hesperus's validate builds with.
+#   - xvfb, xauth and Electron's runtime libraries, which hesperus's desktop
+#     startup check launches its Electron app under (`xvfb-run -a electron`).
 # Rebuild it with `bash runner/linux-runner.sh build`.
 #
 # Pinned: the base by digest, gh and Node by release checksums, and Swift by
@@ -33,7 +35,9 @@ RUN set -eux; \
   apt-get install -y --no-install-recommends /tmp/gh.deb \
     binutils gawk gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
     libncurses-dev libpython3-dev libsqlite3-0 libsqlite3-dev libstdc++-13-dev \
-    libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zip zlib1g-dev; \
+    libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zip zlib1g-dev \
+    xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
+    libatk-bridge2.0-0t64 libdrm2 libxkbcommon0 libcups2t64 libsecret-1-0; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
 # Docker Engine for jobs that run containers (LINUX_RUNNER_DOCKER=dind): each
