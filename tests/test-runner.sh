@@ -181,6 +181,8 @@ case "$1" in
   ssh)
     case "$*" in
       *'dpkg-query'*'sysbox-ce'*) [ ! -f "$FAKE_STATE/no-sysbox" ] ;;
+      # sysbox-old-data-root: a VM whose Sysbox keeps job data on its root disk.
+      *'-C sysbox-mgr'*) [ ! -f "$FAKE_STATE/sysbox-old-data-root" ] ;;
       *'sudo sh -s'*)
         cat >"$FAKE_STATE/sysbox-install-script"
         [ ! -f "$FAKE_STATE/sysbox-install-fails" ] || exit 1
@@ -558,6 +560,13 @@ grep -Fq 'sysbox-ce_0.7.1.linux_arm64.deb' "$install_script" || fail "Sysbox is 
 [ "$(grep -n 'sha256sum -c' "$install_script" | cut -d: -f1)" -lt "$(grep -n 'apt-get install' "$install_script" | cut -d: -f1)" ] \
   || fail "the Sysbox package is installed before its digest is checked: $(cat "$install_script")"
 grep -Fq '04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b' "$install_script" || fail "the Sysbox digest is not pinned"
+# Each job's inner Docker lives under Sysbox's data root, which belongs on the
+# VM's data disk at /var/lib/docker, not the small root disk, and is set
+# before the package starts sysbox-mgr. Freed space returns to the Mac hourly.
+grep -Fq 'ExecStart=/usr/bin/sysbox-mgr --data-root /var/lib/docker/sysbox' "$install_script" || fail "Sysbox keeps job data on the VM's root disk: $(cat "$install_script")"
+[ "$(grep -n 'sysbox-mgr.service.d/10-data-root.conf' "$install_script" | cut -d: -f1)" -lt "$(grep -n 'apt-get install' "$install_script" | cut -d: -f1)" ] \
+  || fail "sysbox-mgr starts before its data root is set: $(cat "$install_script")"
+grep -Fq 'OnCalendar=hourly' "$install_script" || fail "the VM does not trim its disk hourly: $(cat "$install_script")"
 has 'docker run ' "a dind job on a VM holding nothing of the host's"
 ok "a new dind VM gets a configuration with the Sysbox runtime, a read-only empty share and a verified Sysbox"
 FLAGS='colima-up' JOB_DOCKER=dind ENGINE=colima runner run
@@ -566,7 +575,10 @@ lacks '^docker run ' "a dind job on a VM made without the runtime"
 FLAGS='no-sysbox sysbox-install-fails' JOB_DOCKER=dind ENGINE=colima runner run
 refused 'did not install in the Colima VM' "a dind VM whose Sysbox install failed"
 lacks 'generate-jitconfig' "a dind registration after a failed Sysbox install"
-ok "a dind VM without the runtime in its configuration, or whose install failed, runs nothing"
+KEEP_HOME=1 FLAGS='colima-up sysbox-old-data-root' JOB_DOCKER=dind ENGINE=colima runner run
+refused "keeps job data outside /var/lib/docker/sysbox" "a dind VM whose Sysbox keeps job data on its root disk"
+lacks 'generate-jitconfig' "a dind registration on a VM whose Sysbox keeps job data on its root disk"
+ok "a dind VM without the runtime in its configuration, whose install failed, or whose Sysbox keeps job data on its root disk runs nothing"
 JOB_DOCKER=dind ENGINE=colima runner run
 [ "$rc" -eq 0 ] || fail "a dind colima run with only the empty share exited $rc: $(cat "$tmp/out")"
 # A running VM made before the empty share, with the runtime in its configuration.
