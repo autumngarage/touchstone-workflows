@@ -784,3 +784,9 @@ assert 'swiftc "$probe/main.swift" -o "$probe/probe"' in install
 assert 'test "$("$probe/probe")" = \'runner Swift works\'' in install
 PY
 ok 'Swift source is pinned and verified before extraction; the nonroot build compiles and runs it'
+# hesperus's desktop startup check runs `xvfb-run -a electron`, as GitHub's
+# image allows; without these the job image fails it with "needs xvfb-run".
+for pkg in xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1; do
+  grep -Eq "(^| )$pkg( |;|$)" "$root/runner/Dockerfile" || fail "the job image lacks $pkg, which an Electron startup check under xvfb needs"
+done
+ok 'the job image carries xvfb and the libraries Electron starts with'
