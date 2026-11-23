@@ -98,6 +98,8 @@ JOB_DOCKER="${LINUX_RUNNER_DOCKER:-none}"
 # from https://github.com/nestybox/sysbox/releases/tag/v0.7.1.
 SYSBOX_VERSION=0.7.1
 SYSBOX_SHA256=04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b
+# On the VM data disk Colima mounts at /var/lib/docker; see sysbox_install_script.
+SYSBOX_DATA_ROOT=/var/lib/docker/sysbox
 ENGINE="${LINUX_RUNNER_ENGINE:-docker}"
 VM_CPUS="${LINUX_RUNNER_VM_CPUS:-8}"
 VM_MEMORY="${LINUX_RUNNER_VM_MEMORY:-16}"
@@ -200,6 +202,10 @@ ensure_colima() {
     local _
     for _ in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done
   fi
+  # A VM whose Sysbox predates the data root would put every job's inner
+  # Docker on its small root disk; it is refused, not patched.
+  colima ssh -- sh -c "ps -o args= -C sysbox-mgr | grep -qF -- '--data-root $SYSBOX_DATA_ROOT'" >/dev/null 2>&1 \
+    || die "Sysbox in the Colima VM keeps job data outside $SYSBOX_DATA_ROOT, on the VM's root disk. Delete the VM as $(id -un) ('colima delete --data') so it is made again"
 }
 
 # write_dind_colima_config: the whole configuration of a new dind VM. Colima
@@ -227,9 +233,24 @@ YAML
 
 # sysbox_install_script: run as root in the VM; the package is verified before
 # it is installed.
+#
+# Sysbox keeps each job's inner /var/lib/docker under its data root, which
+# defaults to /var/lib/sysbox on the VM's 19 GiB root disk. Colima mounts the
+# VM's data disk (VM_DISK) at /var/lib/docker, so the data root goes there,
+# beside the outer engine's data, and three jobs' image builds share the disk
+# sized for them. The drop-in is written before the package, whose setup
+# starts sysbox-mgr.
+#
+# Space a job frees inside the VM returns to the Mac's disk only when the VM
+# trims it, and Ubuntu's fstrim.timer runs weekly, so it runs hourly.
 sysbox_install_script() {
   cat <<SH
 set -eu
+mkdir -p $SYSBOX_DATA_ROOT /etc/systemd/system/sysbox-mgr.service.d /etc/systemd/system/fstrim.timer.d
+printf '[Service]\\nExecStart=\\nExecStart=/usr/bin/sysbox-mgr --data-root $SYSBOX_DATA_ROOT\\n' >/etc/systemd/system/sysbox-mgr.service.d/10-data-root.conf
+printf '[Timer]\\nOnCalendar=\\nOnCalendar=hourly\\nRandomizedDelaySec=0\\n' >/etc/systemd/system/fstrim.timer.d/10-hourly.conf
+systemctl daemon-reload
+systemctl restart fstrim.timer
 deb=/tmp/sysbox-ce_${SYSBOX_VERSION}.linux_arm64.deb
 curl -fsSL --retry 5 --retry-connrefused -o "\$deb" https://github.com/nestybox/sysbox/releases/download/v${SYSBOX_VERSION}/sysbox-ce_${SYSBOX_VERSION}.linux_arm64.deb
 echo "${SYSBOX_SHA256}  \$deb" | sha256sum -c -
