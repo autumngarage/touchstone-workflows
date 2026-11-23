@@ -103,7 +103,7 @@ cmd_apply() {
   int_in "$queue" 0 $((slots - 1)) QUEUE_SLOTS
   read_conf
   note "apply slots=$slots queue_slots=$queue code=$(git_tw rev-parse HEAD)"
-  launchctl bootout "$SERVICE" 2>/dev/null || true
+  # install-daemon replaces the running daemon after its jobs finish.
   install_daemon "$slots" "$queue"
   note "applied"
 }
@@ -121,8 +121,8 @@ cmd_rebuild() {
   fi
   fleet_env "$SLOTS" >/dev/null
   note "rebuild vm=$VM_CPUS/$VM_MEMORY slots=$SLOTS code=$(git_tw rev-parse HEAD)"
-  # Running jobs get the daemon's exit timeout to finish.
-  launchctl bootout "$SERVICE" 2>/dev/null || true
+  # Running jobs finish, up to the daemon's exit timeout, before their VM goes.
+  env -i PATH="$PATH" HOME=/var/root /bin/bash "$TW/runner/linux-runner.sh" stop-daemon
   # Colima reports an error for a VM that is already gone; what counts is that
   # neither the VM nor its data disk is left.
   as_run_user "$COLIMA" delete --force --data || true

@@ -30,17 +30,10 @@ service_pid() {
 # leave launchd and for the new one to load.
 REPLACE_WAIT=60
 
-# replace_service DOMAIN LABEL PLIST WHAT: loads PLIST as DOMAIN/LABEL in
-# place of whatever is loaded there. DOMAIN is `system` or `gui/<uid>`; WHAT
-# names what the service runs ("the pool"), for the message.
-#
-# launchd may still be ending the old service when bootout returns: a
-# supervisor's TERM handler stops each slot and deregisters each runner
-# first. A bootstrap in that window fails with the old service already gone,
-# which on 2026-10-05 left the macOS pool stopped until a person loaded it by
-# hand (AUT-2258). So this waits for the service to leave, then loads the new
-# one, trying again for REPLACE_WAIT seconds in all, and if it still will not
-# load says what does.
+# stop_service DOMAIN LABEL PLIST: stops DOMAIN/LABEL, letting a draining
+# supervisor's running jobs finish first. replace_service uses it, and so
+# does a caller that stops the service without loading another, as the
+# fleet's rebuild does before it deletes the VM.
 #
 # A supervisor that drains (it lets its running jobs finish when told to stop)
 # is stopped first with its own signal, not by bootout: launchd kills a
@@ -50,10 +43,8 @@ REPLACE_WAIT=60
 # left. A supervisor that drained exits 0 and, with KeepAlive's
 # SuccessfulExit false, stays down; one that launchd starts again in that
 # window is new and has no job yet, so the bootout costs it nothing.
-replace_service() {
-  local domain="$1" label="$2" plist="$3" what="$4" waited=0 why load pid limit
-  load="launchctl bootstrap $domain '$plist'"
-  [ "$domain" != system ] || load="sudo $load"
+stop_service() {
+  local domain="$1" label="$2" plist="$3" waited=0 pid limit
   pid="$(service_pid "$domain/$label")"
   if [ -n "$pid" ]; then
     # The installers write the key on one line; launchd's default is 20 s.
@@ -67,9 +58,26 @@ replace_service() {
     done
     [ "$(service_pid "$domain/$label")" != "$pid" ] \
       || log "the supervisor was still running after ${limit}s; launchd ends it now"
-    waited=0
   fi
   launchctl bootout "$domain/$label" >/dev/null 2>&1 || true
+}
+
+# replace_service DOMAIN LABEL PLIST WHAT: loads PLIST as DOMAIN/LABEL in
+# place of whatever is loaded there. DOMAIN is `system` or `gui/<uid>`; WHAT
+# names what the service runs ("the pool"), for the message.
+#
+# launchd may still be ending the old service when bootout returns: a
+# supervisor's TERM handler stops each slot and deregisters each runner
+# first. A bootstrap in that window fails with the old service already gone,
+# which on 2026-10-05 left the macOS pool stopped until a person loaded it by
+# hand (AUT-2258). So this waits for the service to leave, then loads the new
+# one, trying again for REPLACE_WAIT seconds in all, and if it still will not
+# load says what does.
+replace_service() {
+  local domain="$1" label="$2" plist="$3" what="$4" waited=0 why load
+  load="launchctl bootstrap $domain '$plist'"
+  [ "$domain" != system ] || load="sudo $load"
+  stop_service "$domain" "$label" "$plist"
   # Nothing is loaded over an old service that has not left: launchd would
   # refuse it, and the service still listed would be the one about to exit.
   while launchctl print "$domain/$label" >/dev/null 2>&1; do

@@ -724,6 +724,20 @@ has 'launchctl bootout system/com.autumngarage.linux-ephemeral-runner' "uninstal
 [ ! -e "$dplist" ] || fail "uninstall-daemon left the LaunchDaemon"
 [ ! -e "$rule" ] || fail "uninstall-daemon left the newsyslog rule"
 ok "uninstall-daemon boots the daemon out and removes its plist and log rotation"
+# The fleet helper's apply and rebuild stop a running fleet only through the
+# drain above: rebuild by stop-daemon before it deletes the VM, apply through
+# install-daemon's replace_service. A bare bootout would cut jobs off.
+seed_token
+KEEP_HOME=1 runner install-daemon "$real_user"
+FLAGS=service-draining KEEP_DAEMONS=1 runner stop-daemon
+[ "$rc" -eq 0 ] || fail "stop-daemon over a draining fleet exited $rc: $(cat "$tmp/out")"
+[ "$(line_of 'launchctl kill TERM')" -lt "$(line_of 'launchctl bootout system')" ] || fail "stop-daemon booted the fleet out before it was asked to drain: $(cat "$tmp/calls")"
+[ "$(sed -n "$(line_of 'launchctl kill TERM'),$(line_of 'launchctl bootout system')p" "$tmp/calls" | grep -c '^sleep 5$')" -ge 30 ] \
+  || fail "stop-daemon did not wait out a drain longer than launchd's 60 s: $(cat "$tmp/calls")"
+[ -f "$dplist" ] || fail "stop-daemon removed the LaunchDaemon it only had to stop"
+! grep -n 'launchctl bootout' "$root/runner/linux-runner-admin" || fail "the fleet helper boots the daemon out itself instead of letting its jobs drain"
+grep -q 'linux-runner.sh" stop-daemon' "$root/runner/linux-runner-admin" || fail "rebuild does not stop the fleet through stop-daemon before deleting its VM"
+ok "stop-daemon and the fleet helper let running jobs finish before the fleet stops"
 
 echo "==> the log survives rotation: run reopens it for every line"
 log_path="$tmp/logs/fleet.log"

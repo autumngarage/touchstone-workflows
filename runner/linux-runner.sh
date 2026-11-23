@@ -9,6 +9,8 @@
 #   sudo bash runner/linux-runner.sh install-daemon USER
 #                                           run them at boot as USER from a
 #                                           LaunchDaemon, with no login session
+#   sudo bash runner/linux-runner.sh stop-daemon
+#                                           stop the LaunchDaemon once its jobs finish
 #   sudo bash runner/linux-runner.sh uninstall-daemon
 #                                           stop and remove the LaunchDaemon
 #   bash runner/linux-runner.sh status      show the daemon, containers, and registrations
@@ -587,10 +589,18 @@ EOF
   log "installed $AGENT_ID as $user; logs in $log_file, rotated by $rotation"
 }
 
+# The daemon stopped, its running jobs first allowed to finish, and left
+# installed: the fleet's rebuild runs this before it deletes the VM.
+cmd_stop_daemon() {
+  need launchctl "stop-daemon needs macOS launchd"
+  [ "$(id -u)" -eq 0 ] || die "stop-daemon stops a LaunchDaemon; run it with sudo"
+  stop_service system "$AGENT_ID" "$(daemon_plist_path)"
+}
+
 cmd_uninstall_daemon() {
   need launchctl "uninstall-daemon needs macOS launchd"
   [ "$(id -u)" -eq 0 ] || die "uninstall-daemon removes a LaunchDaemon; run it with sudo"
-  launchctl bootout "system/$AGENT_ID" >/dev/null 2>&1 || true
+  stop_service system "$AGENT_ID" "$(daemon_plist_path)"
   rm -f "$(daemon_plist_path)" "$(newsyslog_path)"
   log "removed $AGENT_ID from $DAEMON_DIR and its log rotation"
 }
@@ -609,6 +619,7 @@ case "${1:-}" in
   build) cmd_build ;;
   run) cmd_run ;;
   install-daemon) cmd_install_daemon "${2:-}" ;;
+  stop-daemon) cmd_stop_daemon ;;
   uninstall-daemon) cmd_uninstall_daemon ;;
   status) cmd_status ;;
   *)
