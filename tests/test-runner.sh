@@ -790,3 +790,14 @@ for pkg in xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1; do
   grep -Eq "(^| )$pkg( |;|$)" "$root/runner/Dockerfile" || fail "the job image lacks $pkg, which an Electron startup check under xvfb needs"
 done
 ok 'the job image carries xvfb and the libraries Electron starts with'
+# An arm64 fleet job builds amd64-only images (hesperus's worker image) under
+# emulation; Sysbox hides the VM's handler, so the job registers its own.
+grep -q 'apt-get install -y --no-install-recommends qemu-user-static' "$root/runner/Dockerfile" \
+  || fail "the arm64 job image lacks qemu-user-static, so amd64 image builds fail with 'exec format error'"
+grep -q '/usr/bin/qemu-x86_64-static:FPC' "$root/runner/job-entry.sh" \
+  || fail "job-entry.sh does not register amd64 emulation with the F flag in the job's binfmt_misc"
+register_line="$(grep -n 'binfmt_misc/register' "$root/runner/job-entry.sh" | head -n1 | cut -d: -f1)"
+dockerd_line="$(grep -n '^dockerd --host' "$root/runner/job-entry.sh" | cut -d: -f1)"
+[ -n "$register_line" ] && [ -n "$dockerd_line" ] && [ "$register_line" -lt "$dockerd_line" ] \
+  || fail "job-entry.sh must register amd64 emulation before the job's Docker daemon starts"
+ok 'an arm64 job registers amd64 emulation before its Docker daemon starts'
