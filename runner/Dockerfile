@@ -44,13 +44,15 @@ RUN set -eux; \
 # worker image carries Blender's x64 release) with `--platform linux/amd64`.
 # Sysbox gives each job its own empty binfmt_misc, so the VM's handler does not
 # reach a job; job-entry.sh registers this static interpreter in the job's own.
+# Docker's binfmt build, not Ubuntu's: noble's qemu-user-static 8.2.2 dies with
+# "QEMU internal SIGSEGV" running amd64 grep, which apt setup scripts call.
+COPY --from=tonistiigi/binfmt:qemu-v10.2.3@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0 /usr/bin/ /tmp/binfmt/
 RUN set -eux; \
   if [ "$(dpkg --print-architecture)" = arm64 ]; then \
-    apt-get update; \
-    apt-get install -y --no-install-recommends qemu-user-static; \
-    test -x /usr/bin/qemu-x86_64-static; \
-    rm -rf /var/lib/apt/lists/*; \
-  fi
+    install -m 0755 /tmp/binfmt/qemu-x86_64 /usr/local/bin/qemu-x86_64-static; \
+    /usr/local/bin/qemu-x86_64-static --version | grep -q 'version 10.2.3'; \
+  fi; \
+  rm -rf /tmp/binfmt
 
 # Docker Engine for jobs that run containers (LINUX_RUNNER_DOCKER=dind): each
 # such job starts its own daemon inside its Sysbox container, whose storage is
