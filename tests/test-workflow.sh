@@ -131,6 +131,22 @@ if [ "${TOUCHSTONE_CONTRACT_SELF_TEST:-0}" != 1 ]; then
     SAME_REPOSITORY_PR=false LEGACY_TARGET="$legacy_target" check_plan merge_group 3 "$grouped_contract" 3 3
     check_targets "{\"checks\":\"$legacy_target\",\"swift-a\":\"$legacy_target\",\"swift-b\":\"$legacy_target\"}"
   done
+  # A group named in LINUX_LOCAL_X64_GROUPS moves from the fleet to its
+  # x86-64 runners; a group bound elsewhere keeps its target, and a malformed
+  # list stops the plan instead of placing a group by accident.
+  LINUX_LOCAL_X64_GROUPS='["swift-b"]' LEGACY_TARGET=local PRIVATE_PR=false check_plan merge_group 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"local","swift-a":"local","swift-b":"local-x64"}'
+  LINUX_LOCAL_X64_GROUPS='["swift-b"]' LEGACY_TARGET=github check_plan merge_group 3 "$grouped_contract" 3 3
+  check_targets '{"checks":"github","swift-a":"github","swift-b":"github"}'
+  for malformed in '"swift-b"' '[3]' '["swift b"]' 'not JSON'; do
+    : >"$plan_fixture/outputs"
+    if LINUX_LOCAL_X64_GROUPS="$malformed" LEGACY_TARGET=local EVENT_NAME=merge_group VALIDATION_MAX_PARALLEL=3 \
+      PLANNED_CONTRACT="$grouped_contract" RUNNER_TEMP="$plan_fixture" GITHUB_WORKSPACE="$plan_fixture" \
+      GITHUB_OUTPUT="$plan_fixture/outputs" bash -c "$plan_script" >/dev/null 2>&1; then
+      fail "planner accepted LINUX_LOCAL_X64_GROUPS=$malformed"
+    fi
+    ! grep -q '^group_targets=' "$plan_fixture/outputs" || fail "planner placed groups under LINUX_LOCAL_X64_GROUPS=$malformed"
+  done
   export LINUX_LOCAL_PR_GROUPS='["checks","swift-a"]' PRIVATE_PR=true LOCAL_SEED=false LEGACY_TARGET=blacksmith
   check_plan pull_request 3 "$grouped_contract" 3 3
   check_targets '{"checks":"local","swift-a":"local","swift-b":"github"}'
@@ -329,7 +345,7 @@ assert_active_line_count "$workflow" 2 'VALIDATION_EVENT: ${{ needs.plan.outputs
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
+runner_selector='runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
