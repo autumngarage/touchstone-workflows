@@ -109,6 +109,7 @@ case "$1" in
     [ ! -f "$FAKE_STATE/docker-down" ] || exit 1
     { [ -f "$FAKE_STATE/engine-dies" ] && [ -f "$FAKE_STATE/started" ]; } && exit 1
     case "$*" in
+      *Architecture*) echo "${FAKE_ENGINE_ARCH:-aarch64}" ;;
       *Runtimes*)
         if [ -f "$FAKE_STATE/no-sysbox-runtime" ] || [ -f "$FAKE_STATE/no-sysbox" ]; then echo 'io.containerd.runc.v2 runc '; else echo 'io.containerd.runc.v2 runc sysbox-runc '; fi
         ;;
@@ -176,7 +177,8 @@ cat >"$bin/colima" <<'EOF'
 printf 'colima %s\n' "$*" >>"$FAKE_CALLS"
 case "$1" in
   status) [ -f "$FAKE_STATE/colima-up" ] ;;
-  start) [ ! -f "$FAKE_STATE/colima-fails" ] ;;
+  # A VM that starts brings its engine back.
+  start) [ ! -f "$FAKE_STATE/colima-fails" ] && rm -f "$FAKE_STATE/docker-down" ;;
   stop) rm -f "$FAKE_STATE/colima-up" ;;
   ssh)
     case "$*" in
@@ -256,17 +258,18 @@ runner run
 [ "$rc" -eq 0 ] || fail "a clean one-job run exited $rc: $(cat "$tmp/out")"
 has 'generate-jitconfig' "registration"
 has 'runner_group_id=7' "registration binds the runner group"
-# validate.yml selects ["self-hosted","linux-ephemeral"]. A just-in-time
-# runner carries only the labels it is registered with, so it gets exactly
-# those two: no role label, so every slot takes every job routed here.
+# validate.yml selects ["self-hosted","linux-ephemeral"], adding linux-x64
+# for a group that needs an x86-64 engine. A just-in-time runner carries only
+# the labels it is registered with, so it gets exactly those and its engine's
+# architecture: no role label, so every slot takes every job routed here.
 jit_line="$(grep 'generate-jitconfig' "$tmp/calls")"
 case "$jit_line" in
-  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f work_folder=_work') ;;
-  *) fail "a runner must register with exactly self-hosted and linux-ephemeral: $jit_line" ;;
+  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f labels[]=linux-arm64 -f work_folder=_work') ;;
+  *) fail "an arm64 runner must register with exactly self-hosted, linux-ephemeral and linux-arm64: $jit_line" ;;
 esac
-[ "$(printf '%s\n' "$jit_line" | grep -o 'labels\[\]=' | grep -c .)" -eq 2 ] \
-  || fail "a runner registered with labels beyond the two validate selects: $jit_line"
-ok "every runner registers with the labels self-hosted and linux-ephemeral, and no other"
+[ "$(printf '%s\n' "$jit_line" | grep -o 'labels\[\]=' | grep -c .)" -eq 3 ] \
+  || fail "a runner registered with labels beyond the three it needs: $jit_line"
+ok "every runner registers with the labels self-hosted, linux-ephemeral and its engine's architecture, and no other"
 run_line="$(grep '^docker run ' "$tmp/calls")"
 # --pids-limit keeps a pull request that forks without end inside its own
 # container instead of exhausting the VM every slot shares.
@@ -328,6 +331,25 @@ done
 lacks '-shared' "identical slots"
 grep -Fq 'supervising 3 identical slot(s)' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
 ok "N slots register N identical runners"
+FAKE_ENGINE_ARCH=x86_64 runner run
+[ "$rc" -eq 0 ] || fail "an x86-64 engine's run exited $rc: $(cat "$tmp/out")"
+case "$(grep 'generate-jitconfig' "$tmp/calls")" in
+  *'-f labels[]=linux-ephemeral -f labels[]=linux-x64 -f work_folder=_work') ;;
+  *) fail "an x86-64 runner must register linux-x64: $(grep 'generate-jitconfig' "$tmp/calls")" ;;
+esac
+FAKE_ENGINE_ARCH=riscv64 runner run
+[ "$rc" -ne 0 ] || fail "an engine with no architecture label was accepted"
+lacks 'generate-jitconfig' "an engine with no architecture label"
+ok "a runner's architecture label is its engine's, and an unknown architecture registers nothing"
+LINUX_RUNNER_NAME=ci-linux-01-validation runner run
+[ "$rc" -eq 0 ] || fail "a named supervisor's run exited $rc: $(cat "$tmp/out")"
+has 'name=linux-ephemeral-ci-linux-01-validation-1-' "a named supervisor's runner"
+has 'docker ps -aq --filter name=^linux-ephemeral-ci-linux-01-validation-' "a named supervisor's leftovers"
+lacks 'name=linux-ephemeral-testhost-' "a named supervisor touching the host's default name"
+LINUX_RUNNER_NAME='bad_name' runner run
+[ "$rc" -ne 0 ] || fail "a LINUX_RUNNER_NAME with an underscore was accepted"
+lacks '^docker ' "a refused LINUX_RUNNER_NAME"
+ok "a second supervisor on one host names its runners and leftovers apart from the first"
 
 echo "==> retired settings an installed wrapper still passes"
 for value in '' 0; do

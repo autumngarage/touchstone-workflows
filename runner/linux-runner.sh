@@ -16,8 +16,9 @@
 #   bash runner/linux-runner.sh status      show the daemon, containers, and registrations
 #
 # The model is deliberately simple: N identical slots, one job each. Every
-# runner registers with the same labels (self-hosted, linux-ephemeral), so any
-# slot takes any job routed here. Routing is static: validate.yml selects
+# runner registers with the same labels (self-hosted, linux-ephemeral) plus
+# its engine's architecture (linux-x64 or linux-arm64), so any slot takes any
+# job routed here, and a group that needs an x86-64 engine can ask for one. Routing is static: validate.yml selects
 # ["self-hosted","linux-ephemeral"] when a repository's LINUX_PR_RUNNER or
 # LINUX_QUEUE_RUNNER variable says `local` (see "Runner" in README.md). There
 # are no slot roles, no watcher, no overflow, and no cache images.
@@ -33,6 +34,11 @@
 # Configuration, from the environment (defaults in parentheses):
 #   LINUX_RUNNER_ORG      organization (autumngarage)
 #   LINUX_RUNNER_GROUP    runner group, restricted to the private consumers (linux-ephemeral)
+#   LINUX_RUNNER_NAME     the name this supervisor's runners and containers
+#                         start with, after linux-ephemeral- (the short host
+#                         name). A second supervisor on one host needs its own:
+#                         each one removes the leftover containers and offline
+#                         registrations that carry its name
 #   LINUX_RUNNER_SLOTS    jobs run at once (2)
 #   LINUX_RUNNER_MEMORY   memory limit per job container (6g)
 #   LINUX_RUNNER_CPUS     CPU limit per job container (4)
@@ -126,8 +132,15 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
 vm_share="$HOME/.linux-runner-vm-share"
 colima_config="$HOME/.colima/default/colima.yaml"
-host="$(hostname -s 2>/dev/null || hostname)"
+if [ -n "${LINUX_RUNNER_NAME:-}" ]; then
+  case "$LINUX_RUNNER_NAME" in *[!A-Za-z0-9-]*) die "LINUX_RUNNER_NAME must be letters, digits and hyphens, not '$LINUX_RUNNER_NAME'" ;; esac
+  host="$LINUX_RUNNER_NAME"
+else
+  host="$(hostname -s 2>/dev/null || hostname)"
+fi
 prefix="$LABEL-$host"
+# The engine's architecture label, set by cmd_run once the engine answers.
+arch_label=""
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
 case "${LINUX_RUNNER_QUEUE_SLOTS:-0}" in
@@ -149,6 +162,18 @@ ensure_engine() {
   if [ "$ENGINE" = colima ]; then ensure_colima; fi
   [ "$JOB_DOCKER" = dind ] || return 0
   require_sysbox
+}
+
+# engine_arch_label: the label for the architecture the job containers run on,
+# read from the engine rather than the host: a Mac's Colima VM is arm64 Linux.
+engine_arch_label() {
+  local arch
+  arch="$(docker info --format '{{.Architecture}}' 2>/dev/null)" || die "the Docker engine does not answer"
+  case "$arch" in
+    x86_64 | amd64) echo linux-x64 ;;
+    aarch64 | arm64) echo linux-arm64 ;;
+    *) die "the Docker engine runs on '$arch', which has no runner label" ;;
+  esac
 }
 
 ensure_colima() {
@@ -289,7 +314,7 @@ register_runner() {
     rmdir "$lock"
     return 2
   fi
-  if ! response="$(request_jit "$name" "$gid")"; then
+  if ! response="$(request_jit "$name" "$gid" "$arch_label")"; then
     err="could not register a runner ($response)"
     rmdir "$lock"
     return 1
@@ -474,6 +499,7 @@ cmd_run() {
     log "LINUX_RUNNER_CACHE_SEED is retired and ignored; every job starts from $IMAGE"
   fi
   ensure_engine
+  arch_label="$(engine_arch_label)"
   need gh "install the GitHub CLI and log in with admin:org"
   need jq "install jq"
   load_token

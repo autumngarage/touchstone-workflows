@@ -152,6 +152,7 @@ jobs:
           INPUT_RUNNER: ${{ inputs.runner }}
           LEGACY_TARGET: ${{ inputs.blacksmith && 'blacksmith' || inputs.runner || (github.event_name == 'merge_group' && vars.LINUX_QUEUE_RUNNER) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && vars.LINUX_PR_RUNNER) || vars.LINUX_VALIDATION_RUNNER || (vars.BLACKSMITH_LINUX == 'true' && 'blacksmith') || 'github' }}
           LINUX_LOCAL_PR_GROUPS: ${{ vars.LINUX_LOCAL_PR_GROUPS }}
+          LINUX_LOCAL_X64_GROUPS: ${{ vars.LINUX_LOCAL_X64_GROUPS }}
           PRIVATE_PR: ${{ github.event_name == 'pull_request' && github.event.repository.private && github.event.pull_request.head.repo.full_name == github.repository }}
           SAME_REPOSITORY_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
           LOCAL_SEED: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event.repository.private && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && inputs.runner == 'local' && !inputs.blacksmith }}
@@ -252,6 +253,15 @@ jobs:
                     elif $private_pr == "true" and all(.[]; .group as $g | $local_groups | index($g) != null) then "local"
                     else "github" end)})
               | from_entries' <<<"$matrix")"
+          fi
+          # A group whose work needs an x86-64 engine (an amd64-only image)
+          # runs only on the fleet's x86-64 runners, which carry linux-x64.
+          if [ -n "${LINUX_LOCAL_X64_GROUPS:-}" ]; then
+            targets="$(jq -ce --argjson x64 "$LINUX_LOCAL_X64_GROUPS" '
+              if ($x64 | type != "array" or any(.[]; type != "string" or (test("^[A-Za-z0-9._-]+\\z") | not)))
+              then error("LINUX_LOCAL_X64_GROUPS must be a JSON array of named groups") else . end
+              | with_entries(if .value == "local" and (.key as $k | $x64 | index($k)) != null then .value = "local-x64" else . end)
+            ' <<<"$targets")"
           fi
           {
             printf 'group_targets=%s\n' "$targets"
@@ -373,7 +383,7 @@ jobs:
     # matrix values (its group name) to the job ID in the check list.
     # Only the protected planner can select one of these targets for a candidate group.
     # A failed-job rerun can reuse the first attempt's plan outputs.
-    runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
+    runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
