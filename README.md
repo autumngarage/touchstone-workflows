@@ -79,18 +79,21 @@ increase their resources. Changing a consumer's setting or adopting a new
 required-workflow pin requires that consumer's normal approval and rollout;
 source delivery alone does not change its live scheduling.
 
-## Pull request task eligibility
+## Pull request and merge-queue task eligibility
 
 The engine's [schema-4 task declaration](https://github.com/autumngarage/touchstone/blob/main/docs/validation-contract.md#schema-4--pull-request-eligibility)
-can exclude a task from PR validation with `pull_request = false`. New tasks
-remain eligible by default. The engine derives the PR inventory from those
-same declarations: a mixed group keeps its eligible tasks; an entirely
-deferred group needs no PR runner.
+can exclude a task from PR validation with `pull_request = false`, and from a
+merge-queue candidate's validation with `merge_group = false`. New tasks
+remain eligible for both by default. The engine derives each event's
+inventory from those same declarations: a mixed group keeps its eligible
+tasks; an entirely deferred group needs no runner for that event. Other
+events, including scheduled validation, run every task.
 
 The protected planner admits that reduction only when the GitHub candidate
 matches the checkout and the declaration is an identical regular Git blob at
-both the event's base commit and candidate commit. The actual checkout bytes
-must match too. It validates the complete contract without running project
+both the event's base commit and candidate commit: the pull request's base,
+or the merge group's `base_sha`. The actual checkout bytes must match too.
+It validates the complete contract without running project
 code before building the matrix. Changed, symlinked, untracked or unverifiable
 declarations retain the full plan. Missing eligibility metadata or an empty
 reduced inventory also retains the full plan.

@@ -144,7 +144,7 @@ jobs:
         id: plan
         env:
           EVENT_NAME: ${{ github.event_name }}
-          VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           VALIDATION_MAX_PARALLEL: ${{ vars.VALIDATION_MAX_PARALLEL }}
           LINUX_VALIDATION_RUNNER: ${{ vars.LINUX_VALIDATION_RUNNER }}
           LINUX_PR_RUNNER: ${{ vars.LINUX_PR_RUNNER }}
@@ -198,14 +198,21 @@ jobs:
           }
           planned_groups="$(jq -c '.groups // []' <<<"$contract")"
           validation_event=''
-          if [ "$EVENT_NAME" = pull_request ] && jq -e '(.pull_request_groups | type == "array" and length > 0)' <<<"$contract" >/dev/null; then
-            if unchanged_declaration; then
-              planned_groups="$(jq -c '.pull_request_groups' <<<"$contract")"
-              validation_event=pull_request
-            else
-              echo 'PR declaration provenance changed or unavailable; retaining full validation.' >&2
-            fi
-          fi
+          # A pull request and a merge-queue candidate plan only the groups
+          # their event keeps, when the engine names them and the declaration
+          # is the base's own; anything else keeps full validation.
+          case "$EVENT_NAME" in
+            pull_request | merge_group)
+              if jq -e --arg key "${EVENT_NAME}_groups" '(.[$key] | type == "array" and length > 0)' <<<"$contract" >/dev/null; then
+                if unchanged_declaration; then
+                  planned_groups="$(jq -c --arg key "${EVENT_NAME}_groups" '.[$key]' <<<"$contract")"
+                  validation_event="$EVENT_NAME"
+                else
+                  echo "$EVENT_NAME declaration provenance changed or unavailable; retaining full validation." >&2
+                fi
+              fi
+              ;;
+          esac
           # Cache seeds stay one serial run: the saved build products must
           # come from a single complete validation. An engine whose
           # contract carries no groups inventory also runs serially, so
@@ -431,9 +438,9 @@ jobs:
           if [ -n "$VALIDATION_GROUP" ]; then
             selection_args+=(--group "$VALIDATION_GROUP")
           fi
-          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
-            selection_args+=(--event pull_request)
-          fi
+          case "${VALIDATION_EVENT:-}" in
+            pull_request | merge_group) selection_args+=(--event "$VALIDATION_EVENT") ;;
+          esac
           bash "$RUNNER_TEMP/touchstone-run.sh" prepare \
             --project "$GITHUB_WORKSPACE" \
             ${selection_args[@]+"${selection_args[@]}"} \
@@ -504,9 +511,9 @@ jobs:
           if [ -n "$VALIDATION_GROUP" ]; then
             selection_args+=(--group "$VALIDATION_GROUP")
           fi
-          if [ "${VALIDATION_EVENT:-}" = pull_request ]; then
-            selection_args+=(--event pull_request)
-          fi
+          case "${VALIDATION_EVENT:-}" in
+            pull_request | merge_group) selection_args+=(--event "$VALIDATION_EVENT") ;;
+          esac
           bash "$RUNNER_TEMP/touchstone-run.sh" validate \
             --project "$GITHUB_WORKSPACE" \
             ${selection_args[@]+"${selection_args[@]}"} \
