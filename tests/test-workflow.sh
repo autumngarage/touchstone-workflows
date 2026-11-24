@@ -251,11 +251,11 @@ MOCK
   git -C "$PLAN_PROJECT" init -q -b fixture
   git -C "$PLAN_PROJECT" config user.name fixture
   git -C "$PLAN_PROJECT" config user.email fixture@example.invalid
-  fixture_tasks='[{"name":"checks"},{"name":"kits-journey"},{"name":"swift-a"},{"name":"swift-b","pull_request":false},{"name":"permit-db","pull_request":false},{"name":"checks-b"}]'
-  eligibility_contract="$(jq -c '{schema:4,groups:map({name,tasks:[.name]}),pull_request_groups:map(select(.pull_request != false)|{name,tasks:[.name]})}' <<<"$fixture_tasks")"
+  fixture_tasks='[{"name":"checks"},{"name":"kits-journey"},{"name":"swift-a","merge_group":false},{"name":"swift-b","pull_request":false,"merge_group":false},{"name":"permit-db","pull_request":false,"merge_group":false},{"name":"checks-b"}]'
+  eligibility_contract="$(jq -c '{schema:4,groups:map({name,tasks:[.name]}),pull_request_groups:map(select(.pull_request != false)|{name,tasks:[.name]}),merge_group_groups:map(select(.merge_group != false)|{name,tasks:[.name]})}' <<<"$fixture_tasks")"
   {
     printf '%s\n' 'schema = 4' '[validation]' 'runtime = "bash"' '[[validation.targets]]' 'name = "root"' 'path = "."'
-    jq -r '.[] | "[[validation.tasks]]\nname = " + (.name|@json) + "\ntarget = \"root\"\ngroup = " + (.name|@json) + "\ncommand = \"touch candidate-ran\"\nrequired = true" + (if .pull_request == false then "\npull_request = false" else "" end)' <<<"$fixture_tasks"
+    jq -r '.[] | "[[validation.tasks]]\nname = " + (.name|@json) + "\ntarget = \"root\"\ngroup = " + (.name|@json) + "\ncommand = \"touch candidate-ran\"\nrequired = true" + (if .pull_request == false then "\npull_request = false" else "" end) + (if .merge_group == false then "\nmerge_group = false" else "" end)' <<<"$fixture_tasks"
   } >"$PLAN_PROJECT/.touchstone.toml"
   git -C "$PLAN_PROJECT" add .touchstone.toml
   git -C "$PLAN_PROJECT" commit -qm base
@@ -271,8 +271,22 @@ MOCK
   check_event pull_request
   SAME_REPOSITORY_PR=false LEGACY_TARGET=blacksmith check_plan pull_request 6 "$eligibility_contract" 4 4
   check_targets '{"checks":"github","kits-journey":"github","swift-a":"github","checks-b":"github"}'
-  for event in merge_group schedule unknown; do
+  # A merge-queue candidate plans the groups its event keeps, under the same
+  # provenance rule; a pull request's inventory never stands in for it.
+  check_plan merge_group 6 "$eligibility_contract" 3 3
+  check_event merge_group
+  printf '%s' "$matrix" | jq -e '[.include[].group] == ["checks","kits-journey","checks-b"]' >/dev/null \
+    || fail "planner did not keep exactly the merge group's groups"
+  for event in schedule unknown; do
     check_plan "$event" 6 "$eligibility_contract" 6 6
+    check_event ''
+  done
+  for change in 'del(.merge_group_groups)' '.merge_group_groups=[]' '.merge_group_groups=null' '.merge_group_groups="unknown"'; do
+    check_plan merge_group 6 "$(jq -c "$change" <<<"$eligibility_contract")" 6 6
+    check_event ''
+  done
+  for base in '' unknown 0000000000000000000000000000000000000000; do
+    VALIDATION_BASE_SHA="$base" check_plan merge_group 6 "$eligibility_contract" 6 6
     check_event ''
   done
   for event in push workflow_dispatch workflow_call; do
@@ -298,6 +312,8 @@ MOCK
   git -C "$PLAN_PROJECT" add .touchstone.toml
   git -C "$PLAN_PROJECT" commit -qm changed-declaration
   GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan pull_request 6 "$eligibility_contract" 6 6
+  check_event ''
+  GITHUB_SHA="$(git -C "$PLAN_PROJECT" rev-parse HEAD)" check_plan merge_group 6 "$eligibility_contract" 6 6
   check_event ''
   git -C "$PLAN_PROJECT" reset --hard -q "$trusted_candidate"
   git -C "$PLAN_PROJECT" update-index --chmod=+x .touchstone.toml
@@ -333,7 +349,9 @@ fi
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'max-parallel: ${{ fromJSON(needs.plan.outputs.max_parallel) }}' 'planned parallel budget'
 # shellcheck disable=SC2016
-assert_active_line "$workflow" 'VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha }}' 'trusted declaration base'
+assert_active_line "$workflow" 'VALIDATION_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}' 'trusted declaration base'
+# shellcheck disable=SC2016
+assert_active_line_count "$workflow" 2 'pull_request | merge_group) selection_args+=(--event "$VALIDATION_EVENT") ;;' 'preparation and execution pass the admitted event'
 # shellcheck disable=SC2016
 assert_active_line "$workflow" 'validation_event: ${{ steps.plan.outputs.validation_event }}' 'admitted event output'
 # shellcheck disable=SC2016
