@@ -363,8 +363,10 @@ established, always use GitHub-hosted Ubuntu even when a global target is set.
   itself, from the release's checksum-verified package; the supervisor
   refuses to start them on an engine without the `sysbox-runc` runtime. A
   second supervisor on the same host, such as one for a different runner
-  group, sets its own `LINUX_RUNNER_NAME`: each supervisor removes the
-  leftover containers and offline registrations that carry its name.
+  group, sets its own `LINUX_RUNNER_NAME`. It then keeps its own slot records
+  and drain marker, and each supervisor removes only the leftover containers
+  and offline registrations whose whole name, `linux-ephemeral-NAME-SLOT-EPOCH`,
+  is its own.
 - `blacksmith` is Blacksmith's 4-vCPU Ubuntu 24.04 runner, and `github` is
   GitHub-hosted `ubuntu-latest`.
 - Unset settings fall through: the per-event setting, then

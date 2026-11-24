@@ -62,8 +62,13 @@ case "$*" in
   *"-X DELETE"*) [ -f "$FAKE_STATE/delete-ok" ] && exit 0; exit 1 ;;
   # The janitor's list: the real jq selects this host's offline runners;
   # stale-runner is one a killed supervisor left.
+  # Beside it are a busy runner of this host's and an offline one of a second
+  # supervisor whose name extends this host's.
   *"actions/runners --jq"*)
-    [ ! -f "$FAKE_STATE/stale-runner" ] || echo 999
+    while [ "$#" -gt 0 ] && [ "$1" != --jq ]; do shift; done
+    runners='{"id":555,"name":"linux-ephemeral-testhost-validate-1-100","status":"offline"},{"id":556,"name":"linux-ephemeral-testhost-2-100","status":"online"}'
+    [ ! -f "$FAKE_STATE/stale-runner" ] || runners="$runners"',{"id":999,"name":"linux-ephemeral-testhost-1-100","status":"offline"}'
+    jq -r "$2" <<<"{\"runners\":[$runners]}"
     exit 0
     ;;
   # A registered runner that has not taken its job, while the supervisor drains.
@@ -238,7 +243,7 @@ runner() {
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
   set +e
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
-    LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
+    LINUX_RUNNER_STATE_DIR="${STATE_DIR-$tmp/state}" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
     LINUX_RUNNER_QUEUE_SLOTS="${QUEUE_SLOTS:-}" \
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
@@ -344,8 +349,13 @@ ok "a runner's architecture label is its engine's, and an unknown architecture r
 LINUX_RUNNER_NAME=ci-linux-01-validation runner run
 [ "$rc" -eq 0 ] || fail "a named supervisor's run exited $rc: $(cat "$tmp/out")"
 has 'name=linux-ephemeral-ci-linux-01-validation-1-' "a named supervisor's runner"
-has 'docker ps -aq --filter name=^linux-ephemeral-ci-linux-01-validation-' "a named supervisor's leftovers"
+has 'docker ps -aq --filter name=^linux-ephemeral-ci-linux-01-validation-[0-9]+-[0-9]+$' "a named supervisor's leftovers"
 lacks 'name=linux-ephemeral-testhost-' "a named supervisor touching the host's default name"
+STATE_DIR='' LINUX_RUNNER_NAME=ci-linux-01-validation runner run
+[ "$rc" -eq 0 ] || fail "a named supervisor with the default state directory exited $rc: $(cat "$tmp/out")"
+[ -d "$tmp/home/Library/Application Support/linux-ephemeral-runner-ci-linux-01-validation" ] \
+  && [ ! -e "$tmp/home/Library/Application Support/linux-ephemeral-runner" ] \
+  || fail "a named supervisor shares the default supervisor's slot records: $(ls -R "$tmp/home" 2>&1)"
 LINUX_RUNNER_NAME='bad_name' runner run
 [ "$rc" -ne 0 ] || fail "a LINUX_RUNNER_NAME with an underscore was accepted"
 lacks '^docker ' "a refused LINUX_RUNNER_NAME"
@@ -378,13 +388,13 @@ echo "==> a restart clears what a killed supervisor left"
 mkdir -p "$tmp/fake"
 printf 'abc123\n' >"$tmp/fake/leftovers"
 KEEP_FAKE=1 runner run
-has 'docker ps -aq --filter name=^linux-ephemeral-testhost-' "leftovers are looked for"
+has 'docker ps -aq --filter name=^linux-ephemeral-testhost-[0-9]+-[0-9]+$' "leftovers are looked for by this supervisor's whole names"
 has 'docker rm -f -v abc123' "a leftover container and its volumes are removed"
 ok "a restart removes the containers a killed supervisor left"
 FLAGS='stale-runner delete-ok' runner run
 [ "$rc" -eq 0 ] || fail "a run with a stale registration exited $rc: $(cat "$tmp/out")"
-has 'select(.status == "offline" and (.name | startswith("linux-ephemeral-testhost-")))' "the janitor asks only for this host's offline runners"
 has '-X DELETE orgs/autumngarage/actions/runners/999' "the stale registration is removed"
+lacks 'runners/55[56]' "the janitor removing a busy runner or another supervisor's"
 line_of() { grep -nF -- "$1" "$tmp/calls" | head -1 | cut -d: -f1; }
 [ "$(line_of 'runners/999')" -lt "$(line_of 'generate-jitconfig')" ] \
   || fail "the janitor ran after a slot registered, when an offline runner may be this supervisor's own: $(cat "$tmp/calls")"

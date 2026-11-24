@@ -37,8 +37,9 @@
 #   LINUX_RUNNER_NAME     the name this supervisor's runners and containers
 #                         start with, after linux-ephemeral- (the short host
 #                         name). A second supervisor on one host needs its own:
-#                         each one removes the leftover containers and offline
-#                         registrations that carry its name
+#                         a named supervisor keeps its own state directory, and
+#                         each one removes only the leftover containers and
+#                         offline registrations whose whole name is its own
 #   LINUX_RUNNER_SLOTS    jobs run at once (2)
 #   LINUX_RUNNER_MEMORY   memory limit per job container (6g)
 #   LINUX_RUNNER_CPUS     CPU limit per job container (4)
@@ -129,16 +130,22 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=runner/jit.sh
 . "$here/jit.sh"
 
-state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
 vm_share="$HOME/.linux-runner-vm-share"
 colima_config="$HOME/.colima/default/colima.yaml"
+# A named supervisor keeps its slot records and drain marker apart from the
+# host's default one, so stopping one never drains the other.
 if [ -n "${LINUX_RUNNER_NAME:-}" ]; then
   case "$LINUX_RUNNER_NAME" in *[!A-Za-z0-9-]*) die "LINUX_RUNNER_NAME must be letters, digits and hyphens, not '$LINUX_RUNNER_NAME'" ;; esac
   host="$LINUX_RUNNER_NAME"
+  state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner-$LINUX_RUNNER_NAME}"
 else
   host="$(hostname -s 2>/dev/null || hostname)"
+  state_dir="${LINUX_RUNNER_STATE_DIR:-$HOME/Library/Application Support/linux-ephemeral-runner}"
 fi
 prefix="$LABEL-$host"
+# This supervisor's runner and container names, whole: PREFIX-SLOT-EPOCH. A
+# prefix match alone would also take a supervisor named PREFIX-something.
+own_names="^$prefix-[0-9]+-[0-9]+\$"
 # The engine's architecture label, set by cmd_run once the engine answers.
 arch_label=""
 
@@ -465,7 +472,7 @@ stop_slots() {
 forget_stale_runners() {
   local ids id
   if ! ids="$(gh api --paginate "orgs/$ORG/actions/runners" \
-    --jq ".runners[] | select(.status == \"offline\" and (.name | startswith(\"$prefix-\"))) | .id")"; then
+    --jq ".runners[] | select(.status == \"offline\" and (.name | test(\"$own_names\"))) | .id")"; then
     log "could not list $ORG's runners; stale registrations of $prefix stay until GitHub expires them"
     return 0
   fi
@@ -509,7 +516,7 @@ cmd_run() {
   mkdir -p "$state_dir"
   # What a supervisor that was killed left: its jobs' containers, its slot
   # records and lock, and its registrations.
-  docker ps -aq --filter "name=^$prefix-" | while read -r leftover; do
+  docker ps -aq --filter "name=$own_names" | while read -r leftover; do
     docker rm -f -v "$leftover" >/dev/null 2>&1 || true
   done
   rm -f "$state_dir"/slot-* "$state_dir/draining" "$state_dir/engine-lost"
@@ -657,7 +664,7 @@ cmd_status() {
     launchctl print "system/$AGENT_ID" 2>/dev/null | grep -E '^\s*(state|pid|last exit code) =' \
       || echo "the daemon $AGENT_ID is not loaded"
   fi
-  docker ps --filter "name=$prefix-" --format '{{.Names}}  {{.Status}}'
+  docker ps --filter "name=$own_names" --format '{{.Names}}  {{.Status}}'
   gh api --paginate "orgs/$ORG/actions/runners" \
     --jq ".runners[] | select(any(.labels[]; .name == \"$LABEL\")) | \"\(.name)  \(.status)  busy=\(.busy)\""
 }
