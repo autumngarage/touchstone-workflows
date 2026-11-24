@@ -133,7 +133,7 @@ jobs:
         run: |
           set -euo pipefail
           touchstone_revision="57de06355543296be8faf03ecdb24390bcab0a02"
-          touchstone_sha256="707436c53f27fb9417e646bac4778b2b4981d8dabd8e5f787f7c4bda00099ca5"
+          touchstone_sha256="27d1780d8c81f1817f493890e548a22f810016fdfd99125fa951ea9d5a007bc5"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -420,7 +420,7 @@ jobs:
         run: |
           set -euo pipefail
           touchstone_revision="57de06355543296be8faf03ecdb24390bcab0a02"
-          touchstone_sha256="707436c53f27fb9417e646bac4778b2b4981d8dabd8e5f787f7c4bda00099ca5"
+          touchstone_sha256="27d1780d8c81f1817f493890e548a22f810016fdfd99125fa951ea9d5a007bc5"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           curl --fail --silent --show-error --location \
             "https://raw.githubusercontent.com/autumngarage/touchstone/${touchstone_revision}/scripts/touchstone-run.sh" \
@@ -504,7 +504,7 @@ jobs:
           TOUCHSTONE_SWIFT_CACHE_RESTORED_KEY: ${{ steps.restore-swift-cache.outputs.cache-matched-key }}
         run: |
           set -euo pipefail
-          touchstone_sha256="707436c53f27fb9417e646bac4778b2b4981d8dabd8e5f787f7c4bda00099ca5"
+          touchstone_sha256="27d1780d8c81f1817f493890e548a22f810016fdfd99125fa951ea9d5a007bc5"
           validator="$RUNNER_TEMP/touchstone-run.sh"
           printf '%s  %s\n' "$touchstone_sha256" "$validator" | sha256sum --check --strict
           selection_args=()
