@@ -792,9 +792,11 @@ done
 ok 'the job image carries xvfb and the libraries Electron starts with'
 # An arm64 fleet job builds amd64-only images (hesperus's worker image) under
 # emulation; Sysbox hides the VM's handler, so the job registers its own.
-grep -q 'apt-get install -y --no-install-recommends qemu-user-static' "$root/runner/Dockerfile" \
-  || fail "the arm64 job image lacks qemu-user-static, so amd64 image builds fail with 'exec format error'"
-grep -q '/usr/bin/qemu-x86_64-static:FPC' "$root/runner/job-entry.sh" \
+grep -Eq '^COPY --from=tonistiigi/binfmt:qemu-v[0-9.]+@sha256:[0-9a-f]{64} /usr/bin/ /tmp/binfmt/$' "$root/runner/Dockerfile" \
+  || fail "the arm64 job image lacks a digest-pinned qemu-x86_64, so amd64 image builds fail with 'exec format error'"
+! grep -q 'install -y --no-install-recommends qemu-user-static' "$root/runner/Dockerfile" \
+  || fail "noble's qemu-user-static 8.2.2 crashes running amd64 grep; take qemu from Docker's binfmt image"
+grep -q ':/usr/local/bin/qemu-x86_64-static:FPC' "$root/runner/job-entry.sh" \
   || fail "job-entry.sh does not register amd64 emulation with the F flag in the job's binfmt_misc"
 register_line="$(grep -n 'binfmt_misc/register' "$root/runner/job-entry.sh" | head -n1 | cut -d: -f1)"
 dockerd_line="$(grep -n '^dockerd --host' "$root/runner/job-entry.sh" | cut -d: -f1)"
