@@ -2,7 +2,11 @@
 # Queue/shared registration policy for the Mac pool supervisor.
 # shellcheck disable=SC2034,SC2154
 # Callers provide ORG, LABEL, SLOTS, QUEUE_SLOTS, state_dir, JANITOR_INTERVAL
-# and the credential/group/JIT helpers from jit.sh. Bash 3.2 compatible.
+# and the credential/group/JIT helpers from jit.sh. Optional, for a fleet whose
+# runners differ by architecture (Linux): RUNNER_EXTRA_LABEL, a label every
+# registration carries, and DEMAND_SKIP_LABEL, a label of jobs this host's
+# runners cannot take, which are then no demand. REGISTER_LOCK names the lock
+# directory in state_dir (roles.lock). Bash 3.2 compatible.
 
 # The role of a new runner: "queue" (queue-only) or "shared". A merge-queue
 # job requires LABEL alone and every other job also LABEL-shared, so the labels
@@ -24,7 +28,7 @@ waiting_jobs() {
     runs="$(printf '%s\n' "$runs" | sort -u)"
     for run in $runs; do
       more="$(gh api --paginate "repos/$repo/actions/runs/$run/jobs?per_page=100" \
-        --jq ".jobs[] | select(.status == \"queued\") | select(any(.labels[]; . == \"$LABEL\")) | if any(.labels[]; . == \"$LABEL-shared\") then \"pr\" else \"queue\" end")" || return 1
+        --jq ".jobs[] | select(.status == \"queued\") | select(any(.labels[]; . == \"$LABEL\")) | select(\"${DEMAND_SKIP_LABEL:-}\" == \"\" or all(.labels[]; . != \"${DEMAND_SKIP_LABEL:-}\")) | if any(.labels[]; . == \"$LABEL-shared\") then \"pr\" else \"queue\" end")" || return 1
       jobs="$jobs$more
 "
     done
@@ -133,7 +137,7 @@ janitor() {
 # the caller; on failure sets err and returns 1, and returns 2 when the
 # supervisor is draining, registering nothing.
 register_runner() {
-  local slot="$1" gid="$2" name="$3" lock="$state_dir/roles.lock" extra="" response
+  local slot="$1" gid="$2" name="$3" lock="$state_dir/${REGISTER_LOCK:-roles.lock}" extra=() response
   role=shared jit="" id="" err=""
   until mkdir "$lock" 2>/dev/null; do sleep 1; done
   if [ -e "$state_dir/draining" ]; then
@@ -141,8 +145,9 @@ register_runner() {
     return 2
   fi
   if [ "$QUEUE_SLOTS" -gt 0 ]; then role="$(choose_role "$slot" "$gid")"; fi
-  if [ "$role" = shared ]; then extra="$LABEL-shared"; fi
-  if ! response="$(request_jit "$name" "$gid" "$extra")"; then
+  extra=("${RUNNER_EXTRA_LABEL:-}")
+  if [ "$role" = shared ]; then extra+=("$LABEL-shared"); fi
+  if ! response="$(request_jit "$name" "$gid" "${extra[@]}")"; then
     err="could not register a runner ($response)"
     rmdir "$lock"
     return 1

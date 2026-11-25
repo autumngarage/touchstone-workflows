@@ -73,6 +73,23 @@ case "$*" in
     ;;
   # A registered runner that has not taken its job, while the supervisor drains.
   *"orgs/autumngarage/actions/runners/"*"--jq .busy"*) echo false ;;
+  # What waits for a runner (runner/queue.sh): one queued run holding the jobs
+  # in $FAKE_STATE/jobs.json, listed through the production jq expression.
+  *"actions/runs?per_page=1"*)
+    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
+    exit 0
+    ;;
+  *"actions/runs?status=queued"*)
+    [ ! -f "$FAKE_STATE/runs-fail" ] || exit 1
+    echo 101
+    exit 0
+    ;;
+  *"actions/runs?status=in_progress"*) exit 0 ;;
+  *"actions/runs/101/jobs"*)
+    while [ "$#" -gt 0 ] && [ "$1" != --jq ]; do shift; done
+    jq -r "$2" <<<"{\"jobs\":$(cat "$FAKE_STATE/jobs.json" 2>/dev/null || echo '[]')}"
+    exit 0
+    ;;
 esac
 EOF
 cat >"$bin/docker" <<'EOF'
@@ -241,6 +258,7 @@ runner() {
   mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
   : >"$tmp/calls"
   for flag in ${FLAGS:-}; do touch "$tmp/fake/$flag"; done
+  printf '%b' "${JOBS_JSON:-[]}" >"$tmp/fake/jobs.json"
   set +e
   PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
     LINUX_RUNNER_STATE_DIR="${STATE_DIR-$tmp/state}" LINUX_RUNNER_SLOTS="${SLOTS:-1}" \
@@ -248,7 +266,8 @@ runner() {
     LINUX_RUNNER_MAX_JOBS="${JOBS:-1}" FAKE_DOCKER_RC="${DOCKER_RC:-0}" \
     LINUX_RUNNER_ENGINE="${ENGINE:-docker}" LINUX_RUNNER_TOKEN_FILE="${TOKEN_FILE:-}" \
     LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
-    LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=none \
+    LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=4242 \
+    LINUX_RUNNER_JANITOR_INTERVAL=4242 \
     LINUX_RUNNER_CACHE_SEED="${CACHE_SEED:-}" LINUX_RUNNER_LOG_FILE="${LOG_FILE:-}" \
     LINUX_RUNNER_DOCKER="${JOB_DOCKER:-}" \
     bash "$script" "$@" >"$tmp/out" 2>&1
@@ -264,17 +283,19 @@ runner run
 has 'generate-jitconfig' "registration"
 has 'runner_group_id=7' "registration binds the runner group"
 # validate.yml selects ["self-hosted","linux-ephemeral"], adding linux-x64
-# for a group that needs an x86-64 engine. A just-in-time runner carries only
-# the labels it is registered with, so it gets exactly those and its engine's
-# architecture: no role label, so every slot takes every job routed here.
+# for a group that needs an x86-64 engine and linux-ephemeral-shared outside
+# merge_group when a consumer opts in. A just-in-time runner carries only the
+# labels it is registered with: a shared one carries the shared label.
 jit_line="$(grep 'generate-jitconfig' "$tmp/calls")"
 case "$jit_line" in
-  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f labels[]=linux-arm64 -f work_folder=_work') ;;
-  *) fail "an arm64 runner must register with exactly self-hosted, linux-ephemeral and linux-arm64: $jit_line" ;;
+  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f labels[]=linux-arm64 -f labels[]=linux-ephemeral-shared -f work_folder=_work') ;;
+  *) fail "a shared arm64 runner must register with exactly self-hosted, linux-ephemeral, linux-arm64 and linux-ephemeral-shared: $jit_line" ;;
 esac
-[ "$(printf '%s\n' "$jit_line" | grep -o 'labels\[\]=' | grep -c .)" -eq 3 ] \
-  || fail "a runner registered with labels beyond the three it needs: $jit_line"
-ok "every runner registers with the labels self-hosted, linux-ephemeral and its engine's architecture, and no other"
+[ "$(printf '%s\n' "$jit_line" | grep -o 'labels\[\]=' | grep -c .)" -eq 4 ] \
+  || fail "a runner registered with labels beyond the four it needs: $jit_line"
+ok "with no queue reservation every runner is shared: its base labels, its engine's architecture and linux-ephemeral-shared"
+lacks 'actions/runs' "no queue reservation reading the workflow runs"
+ok "with no queue reservation no demand is read"
 run_line="$(grep '^docker run ' "$tmp/calls")"
 # --pids-limit keeps a pull request that forks without end inside its own
 # container instead of exhausting the VM every slot shares.
@@ -333,13 +354,12 @@ $(cat "$tmp/out")
 Fake calls
 $(cat "$tmp/calls")"
 done
-lacks '-shared' "identical slots"
-grep -Fq 'supervising 3 identical slot(s)' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
+grep -Fq 'supervising 3 slot(s), 0 kept ready for the merge queue' "$tmp/out" || fail "the slot count is not logged: $(cat "$tmp/out")"
 ok "N slots register N identical runners"
 FAKE_ENGINE_ARCH=x86_64 runner run
 [ "$rc" -eq 0 ] || fail "an x86-64 engine's run exited $rc: $(cat "$tmp/out")"
 case "$(grep 'generate-jitconfig' "$tmp/calls")" in
-  *'-f labels[]=linux-ephemeral -f labels[]=linux-x64 -f work_folder=_work') ;;
+  *'-f labels[]=linux-ephemeral -f labels[]=linux-x64 -f labels[]=linux-ephemeral-shared -f work_folder=_work') ;;
   *) fail "an x86-64 runner must register linux-x64: $(grep 'generate-jitconfig' "$tmp/calls")" ;;
 esac
 FAKE_ENGINE_ARCH=riscv64 runner run
@@ -361,19 +381,65 @@ LINUX_RUNNER_NAME='bad_name' runner run
 lacks '^docker ' "a refused LINUX_RUNNER_NAME"
 ok "a second supervisor on one host names its runners and leftovers apart from the first"
 
-echo "==> retired settings an installed wrapper still passes"
+echo "==> queue priority: a role chosen from what waits (AUT-2813)"
 for value in '' 0; do
   QUEUE_SLOTS=$value runner run
   [ "$rc" -eq 0 ] || fail "LINUX_RUNNER_QUEUE_SLOTS='$value' was refused: $(cat "$tmp/out")"
 done
 ok "LINUX_RUNNER_QUEUE_SLOTS unset or 0 is accepted"
-for value in 1 3 x; do
+for value in 3 4 x -1; do
   SLOTS=3 QUEUE_SLOTS=$value runner run
   [ "$rc" -ne 0 ] || fail "LINUX_RUNNER_QUEUE_SLOTS=$value was accepted"
-  grep -Fq 'LINUX_RUNNER_QUEUE_SLOTS is retired' "$tmp/out" || fail "QUEUE_SLOTS=$value: the refusal does not say why: $(cat "$tmp/out")"
+  grep -Eq 'must be (fewer than|a non-negative)' "$tmp/out" || fail "QUEUE_SLOTS=$value: the refusal does not say why: $(cat "$tmp/out")"
   lacks 'generate-jitconfig' "QUEUE_SLOTS=$value"
 done
-ok "a nonzero LINUX_RUNNER_QUEUE_SLOTS registers nothing and says the roles are retired"
+ok "a reservation that leaves no shared slot, or is not a number, registers nothing"
+# The role of each registration, from its labels: a queue-only runner has no -shared.
+queue_only_count() { grep 'generate-jitconfig' "$tmp/calls" | grep -vc 'linux-ephemeral-shared' || true; }
+shared_count() { grep 'generate-jitconfig' "$tmp/calls" | grep -c 'linux-ephemeral-shared' || true; }
+queue_job='{"status":"queued","labels":["self-hosted","linux-ephemeral"]}'
+pr_job='{"status":"queued","labels":["self-hosted","linux-ephemeral","linux-ephemeral-shared"]}'
+x64_queue_job='{"status":"queued","labels":["self-hosted","linux-ephemeral","linux-x64"]}'
+# A job holds its container for 2 s, so all three slots register before any ends.
+roles() { FAKE_DOCKER_HOLD=2 SLOTS=3 QUEUE_SLOTS="${QUEUE_SLOTS_UNDER_TEST:-1}" runner run; [ "$rc" -eq 0 ] || fail "a three-slot queue run exited $rc: $(cat "$tmp/out")"; }
+JOBS_JSON="[$queue_job,$pr_job]" roles
+[ "$(queue_only_count)" -eq 1 ] && [ "$(shared_count)" -eq 2 ] || fail "one waiting queue job did not get exactly one queue-only runner: $(grep generate-jitconfig "$tmp/calls")"
+case "$(grep 'generate-jitconfig' "$tmp/calls" | grep -v 'linux-ephemeral-shared')" in
+  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f labels[]=linux-arm64 -f work_folder=_work') ;;
+  *) fail "a queue-only runner must carry the base labels and its architecture only: $(grep generate-jitconfig "$tmp/calls")" ;;
+esac
+grep -Fq 'is waiting for a job (queue)' "$tmp/out" || fail "the queue-only role is not logged: $(cat "$tmp/out")"
+ok "a waiting merge-queue job gets one queue-only runner with only the base labels; the others stay shared"
+JOBS_JSON="[$queue_job,$queue_job,$queue_job,$pr_job]" roles
+[ "$(queue_only_count)" -eq 2 ] && [ "$(shared_count)" -eq 1 ] || fail "sustained queue demand did not leave one shared runner: $(grep generate-jitconfig "$tmp/calls")"
+ok "sustained queue demand still leaves one shared runner for pull requests"
+JOBS_JSON="[$pr_job]" roles
+[ "$(queue_only_count)" -eq 0 ] || fail "an empty queue withheld a runner from pull requests: $(grep generate-jitconfig "$tmp/calls")"
+JOBS_JSON="[]" roles
+[ "$(queue_only_count)" -eq 1 ] || fail "an idle queue did not keep one slot ready: $(grep generate-jitconfig "$tmp/calls")"
+ok "queue-only runners are not made while pull requests wait, and one slot stays ready while nothing waits"
+# This Mac's runners are arm64: a queue job that requires linux-x64 cannot use them.
+JOBS_JSON="[$x64_queue_job,$pr_job]" roles
+[ "$(queue_only_count)" -eq 0 ] || fail "an x64-only queue job reserved an arm64 runner: $(grep generate-jitconfig "$tmp/calls")"
+FAKE_ENGINE_ARCH=x86_64 JOBS_JSON="[$x64_queue_job,$pr_job]" roles
+[ "$(queue_only_count)" -eq 1 ] || fail "an x64 queue job did not reserve an x64 runner: $(grep generate-jitconfig "$tmp/calls")"
+case "$(grep 'generate-jitconfig' "$tmp/calls" | grep -v 'linux-ephemeral-shared')" in
+  *'-f labels[]=self-hosted -f labels[]=linux-ephemeral -f labels[]=linux-x64 -f work_folder=_work') ;;
+  *) fail "an x64 queue-only runner must carry linux-x64 and no shared label: $(grep generate-jitconfig "$tmp/calls")" ;;
+esac
+case "$(grep 'generate-jitconfig' "$tmp/calls" | grep 'linux-ephemeral-shared' | head -1)" in
+  *'-f labels[]=linux-x64 -f labels[]=linux-ephemeral-shared -f work_folder=_work') ;;
+  *) fail "an x64 shared runner must keep linux-x64 beside the shared label: $(grep generate-jitconfig "$tmp/calls")" ;;
+esac
+ok "only the demand this host's architecture can serve counts; an x64 shared runner keeps linux-x64"
+FLAGS=runs-fail roles
+[ "$(queue_only_count)" -eq 1 ] || fail "unreadable demand did not keep the fixed reservation: $(grep generate-jitconfig "$tmp/calls")"
+grep -Fq 'cannot read the workflow runs' "$tmp/out" || fail "an unreadable token is not reported: $(cat "$tmp/out")"
+ok "demand the token cannot read falls back to the fixed reservation, and says so"
+# merge-routing.py admits slots under this lock, so the registration takes it.
+JOBS_JSON="[$queue_job]" roles
+[ ! -e "$tmp/state/register.lock" ] && [ ! -e "$tmp/state/roles.lock" ] || fail "a finished run left a registration lock: $(ls "$tmp/state")"
+ok "registration serializes on register.lock, the lock merge-routing.py shares, and releases it"
 CACHE_SEED=autumngarage/hesperus:swift-cache.yml runner run
 [ "$rc" -eq 0 ] || fail "a run with the retired cache seed exited $rc: $(cat "$tmp/out")"
 [ "$(grep -c 'LINUX_RUNNER_CACHE_SEED is retired and ignored' "$tmp/out")" -eq 1 ] \
@@ -654,8 +720,8 @@ seed_token() {
   chmod "${1:-600}" "$user_state/github-token"
 }
 seed_token
-# What the installed wrapper passes: the retired settings, set to their off values.
-QUEUE_SLOTS=0 CACHE_SEED=autumngarage/hesperus:swift-cache.yml KEEP_HOME=1 runner install-daemon "$real_user"
+# What the installed wrapper passes: the queue reservation, and the retired cache seed.
+QUEUE_SLOTS=1 SLOTS=3 CACHE_SEED=autumngarage/hesperus:swift-cache.yml KEEP_HOME=1 runner install-daemon "$real_user"
 [ "$rc" -eq 0 ] || fail "install-daemon exited $rc: $(cat "$tmp/out")"
 dplist="$tmp/daemons/com.autumngarage.linux-ephemeral-runner.plist"
 [ -f "$dplist" ] || fail "install-daemon wrote no LaunchDaemon"
@@ -666,17 +732,19 @@ grep -Fq "<key>LINUX_RUNNER_TOKEN_FILE</key><string>$user_state/github-token</st
 grep -Fq "<string>$user_state/linux-runner.sh</string>" "$dplist" || fail "the daemon does not run the installed copy"
 grep -Fq "<key>HOME</key><string>$tmp/home</string>" "$dplist" || fail "the daemon's HOME is not the user's"
 grep -Fq 'ghp_DAEMON' "$dplist" && fail "the token was written into the plist"
-grep -Eq 'QUEUE_SLOTS|CACHE_SEED|LINUX_RUNNER_LABEL' "$dplist" && fail "the daemon carries a retired setting: $(cat "$dplist")"
+grep -Fq '<key>LINUX_RUNNER_QUEUE_SLOTS</key><string>1</string>' "$dplist" || fail "the daemon does not carry the queue reservation: $(cat "$dplist")"
+grep -Eq 'CACHE_SEED|LINUX_RUNNER_LABEL' "$dplist" && fail "the daemon carries a retired setting: $(cat "$dplist")"
 [ -f "$user_state/linux-runner.sh" ] || fail "install-daemon did not copy the supervisor"
 # The copy sources jit.sh from its own directory, so it must travel with it.
 cmp -s "$user_state/jit.sh" "$root/runner/jit.sh" || fail "install-daemon did not copy runner/jit.sh beside the supervisor"
+cmp -s "$user_state/queue.sh" "$root/runner/queue.sh" || fail "install-daemon did not copy runner/queue.sh beside the supervisor"
 grep -Fq "<key>LINUX_RUNNER_LOG_FILE</key><string>$tmp/home/Library/Logs/linux-ephemeral-runner.log</string>" "$dplist" \
   || fail "the daemon does not name the log run reopens: $(grep -A1 LOG_FILE "$dplist")"
 grep -Fq "<key>StandardOutPath</key><string>$tmp/home/Library/Logs/linux-ephemeral-runner.log</string>" "$dplist" \
   && fail "launchd holds the rotated log open, so rotation would strand the daemon's writes"
 grep -Fq '<key>ExitTimeOut</key><integer>5400</integer>' "$dplist" || fail "the daemon is not given time to drain before the service manager kills it"
 has 'launchctl bootstrap system' "install-daemon"
-has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh" "the installed copies belong to the fleet's user"
+has "chown $real_user:$real_group $user_state/linux-runner.sh $user_state/jit.sh $user_state/queue.sh" "the installed copies belong to the fleet's user"
 ok "the LaunchDaemon runs a copy as the fleet's user, on Colima, with its private token and no retired setting"
 rule="$tmp/newsyslog/linux-ephemeral-runner.conf"
 expected_rule="$tmp/home/Library/Logs/linux-ephemeral-runner.log $real_user:staff 644 5 10240 * NJ"

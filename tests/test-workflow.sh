@@ -363,7 +363,7 @@ assert_active_line_count "$workflow" 2 'VALIDATION_EVENT: ${{ needs.plan.outputs
 # execution may select it, through static per-event switches; every other job
 # runs on GitHub-hosted Linux. The retired dynamic routing variables stay gone.
 # shellcheck disable=SC2016
-runner_selector='runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}'"'"')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}'
+runner_selector='runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && '"'"'ubuntu-latest'"'"' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && '"'"'ubuntu-24.04-arm'"'"' || fromJSON('"'"'{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"local-shared":["self-hosted","linux-ephemeral","linux-ephemeral-shared"],"local-x64-shared":["self-hosted","linux-ephemeral","linux-x64","linux-ephemeral-shared"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest","blacksmith-shared":"blacksmith-4vcpu-ubuntu-2404","github-shared":"ubuntu-latest"}'"'"')[format('"'"'{0}{1}'"'"', fromJSON(needs.plan.outputs.group_targets)[matrix.name], github.event_name != '"'"'merge_group'"'"' && vars.LINUX_QUEUE_PRIORITY == '"'"'true'"'"' && '"'"'-shared'"'"' || '"'"''"'"')] }}'
 # shellcheck disable=SC2016
 active_count() {
   sed '/^[[:space:]]*#/d; s/^[[:space:]]*//' "$1" | grep -Fxc -- "$2" || true
@@ -2089,6 +2089,9 @@ if [ -z "${TOUCHSTONE_CONTRACT_SELF_TEST:-}" ]; then
     || fail "cross-step shell scope check failed"
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-queue.sh" \
     || fail "runner queue demand check failed"
+  # Which labels a local Linux job requires, by event and opt-in.
+  python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-linux-labels.py" \
+    || fail "Linux runner label selection check failed"
   # The single-use runner supervisor is validate's boundary for `local`.
   bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/test-runner.sh" \
     || fail "runner supervisor check failed"

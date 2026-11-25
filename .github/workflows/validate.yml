@@ -390,7 +390,12 @@ jobs:
     # matrix values (its group name) to the job ID in the check list.
     # Only the protected planner can select one of these targets for a candidate group.
     # A failed-job rerun can reuse the first attempt's plan outputs.
-    runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest"}')[fromJSON(needs.plan.outputs.group_targets)[matrix.name]] }}
+    # Queue priority (AUT-2813): with the repository variable
+    # LINUX_QUEUE_PRIORITY=true, a local job outside merge_group also requires
+    # linux-ephemeral-shared, so a merge_group job (base labels) can use a
+    # queue-only runner no pull request can take. Set it only once every
+    # runner of the group advertises that label.
+    runs-on: ${{ needs.plan.outputs.local_merge_attempt == github.run_attempt && needs.plan.outputs.local_merge_group && needs.plan.outputs.local_merge_group == matrix.name && fromJSON(needs.plan.outputs.local_merge_labels) || github.run_attempt == 1 && needs.plan.outputs.github_overflow_group && needs.plan.outputs.github_overflow_group == matrix.name && 'ubuntu-latest' || needs.plan.outputs.github_arm_group && needs.plan.outputs.github_arm_group == matrix.name && 'ubuntu-24.04-arm' || fromJSON('{"local":["self-hosted","linux-ephemeral"],"local-x64":["self-hosted","linux-ephemeral","linux-x64"],"local-shared":["self-hosted","linux-ephemeral","linux-ephemeral-shared"],"local-x64-shared":["self-hosted","linux-ephemeral","linux-x64","linux-ephemeral-shared"],"blacksmith":"blacksmith-4vcpu-ubuntu-2404","github":"ubuntu-latest","blacksmith-shared":"blacksmith-4vcpu-ubuntu-2404","github-shared":"ubuntu-latest"}')[format('{0}{1}', fromJSON(needs.plan.outputs.group_targets)[matrix.name], github.event_name != 'merge_group' && vars.LINUX_QUEUE_PRIORITY == 'true' && '-shared' || '')] }}
     # Cloud Swift builds can spend 20 minutes compiling before tests. Allow a
     # bounded cold run; non-Swift jobs retain 30 minutes.
     timeout-minutes: ${{ inputs.timeout_minutes || (vars.SWIFT_BUILD_CACHE == 'true' && 60 || 30) }}
