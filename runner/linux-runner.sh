@@ -15,13 +15,18 @@
 #                                           stop and remove the LaunchDaemon
 #   bash runner/linux-runner.sh status      show the daemon, containers, and registrations
 #
-# The model is deliberately simple: N identical slots, one job each. Every
-# runner registers with the same labels (self-hosted, linux-ephemeral) plus
-# its engine's architecture (linux-x64 or linux-arm64), so any slot takes any
-# job routed here, and a group that needs an x86-64 engine can ask for one. Routing is static: validate.yml selects
+# The model is deliberately simple: N slots, one job each. Every runner
+# registers with self-hosted, linux-ephemeral and its engine's architecture
+# (linux-x64 or linux-arm64), so a group that needs an x86-64 engine can ask
+# for one. Routing is static: validate.yml selects
 # ["self-hosted","linux-ephemeral"] when a repository's LINUX_PR_RUNNER or
 # LINUX_QUEUE_RUNNER variable says `local` (see "Runner" in README.md). There
-# are no slot roles, no watcher, no overflow, and no cache images.
+# is no watcher, no overflow, and no cache image.
+#
+# The one policy beyond that is runner/queue.sh's, shared with the Mac pool
+# (AUT-2813): each runner's role is chosen when it registers, from what waits
+# (see LINUX_RUNNER_QUEUE_SLOTS below). A shared runner also carries
+# linux-ephemeral-shared; a queue-only one carries the base labels alone.
 #
 # Each slot asks GitHub for a just-in-time runner configuration, which
 # registers a runner for exactly one job, starts a fresh container from the
@@ -72,9 +77,27 @@
 #                         every line so newsyslog can rotate it (unset:
 #                         stdout). install-daemon sets it
 #
-# Retired, still accepted because an installed wrapper may pass them:
-#   LINUX_RUNNER_QUEUE_SLOTS  merge-queue slot roles. 0 or unset is accepted;
-#                         any other value is refused, since no slot has a role
+#   LINUX_RUNNER_QUEUE_SLOTS  queue priority (0: every runner is shared). GitHub
+#                         hands a freed runner to whichever job asks first, not
+#                         the one that waited longest, so a burst of pull-request
+#                         jobs can starve merge-queue jobs past the queue's
+#                         check timeout. Above 0, each runner's role is chosen
+#                         when it registers, from the jobs waiting for this
+#                         label (runner/queue.sh): queue-only when queue jobs
+#                         wait beyond the idle queue-only runners, else one of
+#                         the first QUEUE_SLOTS slots while no pull-request job
+#                         waits, else shared. At most SLOTS-1 runners are
+#                         queue-only. A merge-queue job selects the base labels
+#                         and takes either role; every other job selects
+#                         linux-ephemeral-shared (validate.yml, opt-in with
+#                         LINUX_QUEUE_PRIORITY). Must be fewer than SLOTS. It
+#                         needs Actions read access to every repository of the
+#                         group; without it the first QUEUE_SLOTS slots are
+#                         queue-only, fixed. Demand needs no API call at 0.
+#   LINUX_RUNNER_JANITOR_INTERVAL  seconds between looks for idle queue-only
+#                         runners no queue job needs (120)
+#
+# Retired, still accepted because an installed wrapper may pass it:
 #   LINUX_RUNNER_CACHE_SEED   the job-image Swift cache. Ignored, with a note in
 #                         the log; every job starts from the base image
 #
@@ -96,6 +119,11 @@ GROUP="${LINUX_RUNNER_GROUP:-linux-ephemeral}"
 # The one label validate.yml selects, literally; jit.sh registers it.
 LABEL=linux-ephemeral
 SLOTS="${LINUX_RUNNER_SLOTS:-2}"
+QUEUE_SLOTS="${LINUX_RUNNER_QUEUE_SLOTS:-0}"
+# Every GitHub read counts against the quota every agent on this Mac shares.
+JANITOR_INTERVAL="${LINUX_RUNNER_JANITOR_INTERVAL:-120}"
+# The lock merge-routing.py also takes: one registration or admission at a time.
+REGISTER_LOCK=register.lock
 MEMORY="${LINUX_RUNNER_MEMORY:-6g}"
 CPUS="${LINUX_RUNNER_CPUS:-4}"
 PIDS="${LINUX_RUNNER_PIDS:-4096}"
@@ -129,6 +157,10 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # registration, shared with runner/macos-runner.sh.
 # shellcheck source=runner/jit.sh
 . "$here/jit.sh"
+[ -f "$here/queue.sh" ] || die "queue.sh must sit beside linux-runner.sh (copy it with jit.sh)"
+# The role policy, shared with runner/macos-runner.sh.
+# shellcheck source=runner/queue.sh
+. "$here/queue.sh"
 
 vm_share="$HOME/.linux-runner-vm-share"
 colima_config="$HOME/.colima/default/colima.yaml"
@@ -150,10 +182,9 @@ own_names="^$prefix-[0-9]+-[0-9]+\$"
 arch_label=""
 
 case "$SLOTS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_SLOTS must be a positive integer, not '$SLOTS'" ;; esac
-case "${LINUX_RUNNER_QUEUE_SLOTS:-0}" in
-  0) ;;
-  *) die "LINUX_RUNNER_QUEUE_SLOTS is retired: every slot is identical and takes any job. Set it to 0 or unset it, not '$LINUX_RUNNER_QUEUE_SLOTS'" ;;
-esac
+case "$QUEUE_SLOTS" in '' | *[!0-9]*) die "LINUX_RUNNER_QUEUE_SLOTS must be a non-negative integer, not '$QUEUE_SLOTS'" ;; esac
+[ "$QUEUE_SLOTS" -lt "$SLOTS" ] || die "LINUX_RUNNER_QUEUE_SLOTS ($QUEUE_SLOTS) must be fewer than LINUX_RUNNER_SLOTS ($SLOTS), or no pull request could run"
+case "$JANITOR_INTERVAL" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_JANITOR_INTERVAL must be a positive integer of seconds, not '$JANITOR_INTERVAL'" ;; esac
 case "$MAX_JOBS" in *[!0-9]*) die "LINUX_RUNNER_MAX_JOBS must be a non-negative integer, not '$MAX_JOBS'" ;; esac
 case "$PIDS" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_PIDS must be a positive integer, not '$PIDS'" ;; esac
 case "$VM_DISK" in '' | *[!0-9]* | 0) die "LINUX_RUNNER_VM_DISK must be a positive integer of GiB, not '$VM_DISK'" ;; esac
@@ -307,39 +338,9 @@ engine_lost() {
   ! docker info >/dev/null 2>&1
 }
 
-# register_runner SLOT GID NAME: register runner NAME for one job and write the
-# slot's state file, under the lock the drain takes to set its marker, so a
-# slot either registers before the drain and the drain sees its runner, or
-# sees the marker and registers nothing. Sets jit and id in the caller; on
-# failure sets err and returns 1, and returns 2 when the supervisor is
-# draining.
-register_runner() {
-  local slot="$1" gid="$2" name="$3" lock="$state_dir/register.lock" response
-  jit="" id="" err=""
-  until mkdir "$lock" 2>/dev/null; do sleep 1; done
-  if [ -e "$state_dir/draining" ]; then
-    rmdir "$lock"
-    return 2
-  fi
-  if ! response="$(request_jit "$name" "$gid" "$arch_label")"; then
-    err="could not register a runner ($response)"
-    rmdir "$lock"
-    return 1
-  fi
-  jit="$(printf '%s' "$response" | jq -r '.encoded_jit_config // empty')"
-  id="$(printf '%s' "$response" | jq -r '.runner.id // empty')"
-  if [ -z "$jit" ] || [ -z "$id" ]; then
-    err="GitHub returned no runner configuration"
-    rmdir "$lock"
-    return 1
-  fi
-  printf '%s %s\n' "$id" "$name" >"$state_dir/slot-$slot"
-  rmdir "$lock"
-}
-
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
-  local gid name jit id err started rc
+  local gid name jit id err role started rc
   while :; do
     if [ -n "$MAX_JOBS" ] && [ "$jobs" -ge "$MAX_JOBS" ]; then
       return 0
@@ -369,7 +370,7 @@ run_slot() {
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
-    log "slot $slot: runner $name ($id) is waiting for a job"
+    log "slot $slot: runner $name ($id) is waiting for a job ($role)"
     started="$(date +%s)"
     rc=0
     # The single-use configuration goes in on stdin, never as an argument:
@@ -486,7 +487,7 @@ forget_stale_runners() {
 }
 
 cmd_run() {
-  local gid slot pid pids drain_pid=""
+  local gid slot pid pids drain_pid="" janitor_pid=""
   # The process a slot stops when the engine is gone; $$ is the supervisor in every slot.
   supervisor=$$
   if [ -n "$LOG_FILE" ]; then
@@ -507,6 +508,11 @@ cmd_run() {
   fi
   ensure_engine
   arch_label="$(engine_arch_label)"
+  # Every registration carries its architecture; jobs that need the other one
+  # are no demand for this host's roles.
+  RUNNER_EXTRA_LABEL="$arch_label"
+  DEMAND_SKIP_LABEL=""
+  [ "$arch_label" = linux-x64 ] || DEMAND_SKIP_LABEL=linux-x64
   need gh "install the GitHub CLI and log in with admin:org"
   need jq "install jq"
   load_token
@@ -523,7 +529,8 @@ cmd_run() {
   rmdir "$state_dir/register.lock" 2>/dev/null || true
   forget_stale_runners
   trap drain_slots INT TERM
-  log "supervising $SLOTS identical slot(s) for label $LABEL in $ORG runner group $GROUP ($gid)"
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then can_read_runs "$gid"; fi
+  log "supervising $SLOTS slot(s), $QUEUE_SLOTS kept ready for the merge queue, for label $LABEL in $ORG runner group $GROUP ($gid)"
   slot=1
   pids=""
   while [ "$slot" -le "$SLOTS" ]; do
@@ -531,12 +538,21 @@ cmd_run() {
     pids="$pids $!"
     slot=$((slot + 1))
   done
+  if [ "$QUEUE_SLOTS" -gt 0 ]; then
+    janitor "$gid" &
+    janitor_pid=$!
+  fi
   # A trapped signal ends a wait early; the slots are done when their
   # processes are.
   for pid in $pids; do
     while kill -0 "$pid" 2>/dev/null; do wait "$pid" || true; done
   done
   if [ -n "$drain_pid" ]; then kill "$drain_pid" 2>/dev/null || true; fi
+  if [ -n "$janitor_pid" ]; then
+    pkill -P "$janitor_pid" 2>/dev/null || true
+    kill "$janitor_pid" 2>/dev/null || true
+    wait "$janitor_pid" 2>/dev/null || true
+  fi
   rm -f "$state_dir/draining"
 }
 
@@ -573,8 +589,8 @@ cmd_install_daemon() {
   # A copy, so a checkout that later switches branches cannot change what runs.
   installed="$user_state/linux-runner.sh"
   cp "$here/linux-runner.sh" "$installed"
-  cp "$here/jit.sh" "$user_state/"
-  chown "$user:$group" "$installed" "$user_state/jit.sh"
+  cp "$here/jit.sh" "$here/queue.sh" "$user_state/"
+  chown "$user:$group" "$installed" "$user_state/jit.sh" "$user_state/queue.sh"
   log_dir="$home/Library/Logs"
   mkdir -p "$log_dir"
   chown "$user:$group" "$log_dir"
@@ -613,6 +629,7 @@ cmd_install_daemon() {
     <key>LINUX_RUNNER_ORG</key><string>$ORG</string>
     <key>LINUX_RUNNER_GROUP</key><string>$GROUP</string>
     <key>LINUX_RUNNER_SLOTS</key><string>$SLOTS</string>
+    <key>LINUX_RUNNER_QUEUE_SLOTS</key><string>$QUEUE_SLOTS</string>
     <key>LINUX_RUNNER_MEMORY</key><string>$MEMORY</string>
     <key>LINUX_RUNNER_CPUS</key><string>$CPUS</string>
     <key>LINUX_RUNNER_PIDS</key><string>$PIDS</string>

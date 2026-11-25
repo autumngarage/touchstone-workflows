@@ -350,11 +350,33 @@ established, always use GitHub-hosted Ubuntu even when a global target is set.
 - `local` is the single-use `linux-ephemeral` fleet: each runner takes one job
   in a fresh container with no mounts or credentials, then exits. Its supervisor is
   `runner/linux-runner.sh`, run at boot by
-  `sudo bash runner/linux-runner.sh install-daemon <user>`: N identical
-  single-use slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled
-  `linux-ephemeral` for one job, with no slot roles or cache images. Installing
+  `sudo bash runner/linux-runner.sh install-daemon <user>`: N single-use
+  slots (`LINUX_RUNNER_SLOTS`), each registering a runner labeled
+  `linux-ephemeral` for one job, with no cache images. Installing
   again replaces a running fleet without cutting a job: its running jobs
   finish first, for up to the daemon's `ExitTimeOut` (90 minutes).
+- **Queue priority (AUT-2813).** GitHub hands a freed runner to whichever job
+  asks first, so a burst of pull-request jobs can keep merge-queue jobs
+  waiting past the queue's check timeout. `LINUX_RUNNER_QUEUE_SLOTS=N`
+  (default `0`, less than `LINUX_RUNNER_SLOTS`) gives the fleet the Mac pool's
+  policy, the same `runner/queue.sh`: each runner's role is chosen when it
+  registers, from the jobs waiting for `linux-ephemeral` that this host's
+  architecture can take (see the Mac pool's "Queue priority" for the rule).
+  A queue-only runner advertises the base labels alone. Every other runner is
+  shared and also advertises `linux-ephemeral-shared`, as does every runner
+  at `0`. A repository opts in with the variable
+  `LINUX_QUEUE_PRIORITY=true`: its local jobs outside `merge_group` then
+  require `linux-ephemeral-shared` (x64 groups keep `linux-x64`), and its
+  `merge_group` jobs keep the base labels and use either role. Unset, every
+  job selects the base labels. The token needs Actions read access to every
+  repository of the group; unreadable demand logs a warning and uses the fixed
+  reservation. The supervisor reads GitHub no more than once per registration
+  and once per `LINUX_RUNNER_JANITOR_INTERVAL` (120 s), and reads nothing at `0`.
+  Roll out in order: install the supervisor on every host of the group (the
+  directory it runs from must also hold `queue.sh`) and check that the
+  registrations advertise `linux-ephemeral-shared`; set `LINUX_QUEUE_PRIORITY`
+  on the consumers; then set a reservation. Rollback: set `LINUX_QUEUE_PRIORITY`
+  to anything but `true`, or the reservation to `0`.
 - Each fleet runner also carries its engine's architecture, `linux-x64` or
   `linux-arm64`. A repository that sets `LINUX_LOCAL_X64_GROUPS` to a JSON
   array of group names sends those groups, when they run `local`, only to
