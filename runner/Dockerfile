@@ -113,10 +113,10 @@ RUN set -eux; \
   tar -xzf /tmp/swift.tar.gz -C /opt/swift --strip-components=1 --no-same-owner; \
   chmod -R a+rX /opt/swift; \
   rm -rf "$GNUPGHOME" /tmp/swift.tar.gz /tmp/swift.tar.gz.sig
-ENV PATH=/opt/swift/usr/bin:$PATH
 # Hesperus's scripts/ci-setup-swift.sh fails, rather than installs, when a package is
 # missing on this image.
 ENV HESPERUS_RUNNER_IMAGE=validation
+ENV PATH=/opt/swift/usr/bin:$PATH
 USER runner
 # The same nonroot user that runs CI can compile and execute, not just print
 # a version. This also detects missing runtime libraries after installation.
