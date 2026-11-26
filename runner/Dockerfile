@@ -10,6 +10,8 @@
 #   - Node 22 LTS with npm (vesper's site validation);
 #   - Swift's system dependencies, libsqlite3-dev, and a Swift toolchain,
 #     which hesperus's validate builds with.
+#   - make, gdb and libvips-tools, which hesperus's validation groups use, so no
+#     job installs a package at runtime (an Ubuntu mirror mid-sync fails it);
 #   - xvfb, xauth and Electron's runtime libraries, which hesperus's desktop
 #     startup check launches its Electron app under (`xvfb-run -a electron`).
 # Rebuild it with `bash runner/linux-runner.sh build`.
@@ -36,7 +38,7 @@ RUN set -eux; \
     binutils gawk gcc gnupg2 libc6-dev libcurl4-openssl-dev libedit2 libgcc-13-dev \
     libncurses-dev libpython3-dev libsqlite3-0 libsqlite3-dev libstdc++-13-dev \
     libxml2-dev libz3-dev pipx pkg-config tzdata xz-utils zip zlib1g-dev \
-    xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
+    make gdb libvips-tools xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libxss1 libxtst6 \
     libatk-bridge2.0-0t64 libdrm2 libxkbcommon0 libcups2t64 libsecret-1-0; \
   rm -rf /tmp/gh.deb /var/lib/apt/lists/*
 
@@ -112,6 +114,9 @@ RUN set -eux; \
   chmod -R a+rX /opt/swift; \
   rm -rf "$GNUPGHOME" /tmp/swift.tar.gz /tmp/swift.tar.gz.sig
 ENV PATH=/opt/swift/usr/bin:$PATH
+# Hesperus's scripts/ci-setup-swift.sh fails, rather than installs, when a package is
+# missing on this image.
+ENV HESPERUS_RUNNER_IMAGE=validation
 USER runner
 # The same nonroot user that runs CI can compile and execute, not just print
 # a version. This also detects missing runtime libraries after installation.
