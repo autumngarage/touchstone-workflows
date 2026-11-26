@@ -890,6 +890,13 @@ for pkg in xvfb xauth libgtk-3-0t64 libnss3 libasound2t64 libgbm1; do
   grep -Eq "(^| )$pkg( |;|$)" "$root/runner/Dockerfile" || fail "the job image lacks $pkg, which an Electron startup check under xvfb needs"
 done
 ok 'the job image carries xvfb and the libraries Electron starts with'
+# hesperus's validation setup (scripts/ci-setup-swift.sh) fails on this image instead of
+# installing, so a package missing here would otherwise fail a job on an Ubuntu mirror's sync.
+for pkg in make gdb zip libvips-tools libsqlite3-dev libcurl4-openssl-dev; do
+  grep -Eq "(^| )$pkg( |;|$)" "$root/runner/Dockerfile" || fail "the job image lacks $pkg, which hesperus's validation setup would install at runtime"
+done
+grep -Eq '^ENV HESPERUS_RUNNER_IMAGE=validation$' "$root/runner/Dockerfile" || fail "the job image does not mark itself, so hesperus's setup would install at runtime"
+ok 'the job image carries the packages hesperus validation needs and marks itself'
 # An arm64 fleet job builds amd64-only images (hesperus's worker image) under
 # emulation; Sysbox hides the VM's handler, so the job registers its own.
 grep -Eq '^COPY --from=tonistiigi/binfmt:qemu-v[0-9.]+@sha256:[0-9a-f]{64} /usr/bin/ /tmp/binfmt/$' "$root/runner/Dockerfile" \
