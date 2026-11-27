@@ -147,6 +147,18 @@ printf 'sleep %s\n' "$*" >>"$FAKE_CALLS"
 # A test that needs a real wait names its length.
 [ "$1" != "${FAKE_REAL_SLEEP_FOR:-}" ] || exec /bin/sleep "$1"
 EOF
+# The Mac's free space, in KiB: the first line of host-free-seq each time, the last for good;
+# 200 GiB when a test names none.
+cat >"$bin/df" <<'EOF'
+#!/usr/bin/env bash
+seq_file="$FAKE_STATE/host-free-seq"
+kib=209715200
+if [ -s "$seq_file" ]; then
+  kib="$(head -n 1 "$seq_file")"
+  if [ "$(wc -l <"$seq_file")" -gt 1 ]; then sed -i.bak 1d "$seq_file"; fi
+fi
+printf 'Filesystem 1K-blocks Used Available Capacity\nfake 0 0 %s 0%%\n' "$kib"
+EOF
 cat >"$bin/hostname" <<'EOF'
 #!/usr/bin/env bash
 echo testhost
@@ -207,6 +219,18 @@ case "$1" in
       *'dpkg-query'*'sysbox-ce'*) [ ! -f "$FAKE_STATE/no-sysbox" ] ;;
       # sysbox-old-data-root: a VM whose Sysbox keeps job data on its root disk.
       *'-C sysbox-mgr'*) [ ! -f "$FAKE_STATE/sysbox-old-data-root" ] ;;
+      # The free space the VM reports, in KiB: the first line of vm-free-seq each time, the
+      # rest after it, the last one for good; 200 GiB when a test names none.
+      *'df -k'*)
+        seq_file="$FAKE_STATE/vm-free-seq"
+        kib=209715200
+        if [ -s "$seq_file" ]; then
+          kib="$(head -n 1 "$seq_file")"
+          if [ "$(wc -l <"$seq_file")" -gt 1 ]; then sed -i.bak 1d "$seq_file"; fi
+        fi
+        printf 'Avail\n%s\n' "$kib"
+        ;;
+      *'sysbox/docker'*) printf 'sysbox-sweep\n' >>"$FAKE_CALLS.sweeps" ;;
       *'fstrim'*)
         printf 'fstrim\n' >>"$FAKE_CALLS.trims"
         [ ! -f "$FAKE_STATE/trim-fails" ] || { echo "fstrim: /var/lib/docker: FITRIM failed" >&2; exit 1; }
@@ -658,6 +682,53 @@ grep -Fq 'FITRIM failed' "$tmp/out" || fail "a failed trim's output is not logge
 FLAGS= ENGINE=docker runner run
 lacks 'fstrim' "a plain Docker host"
 ok "a job's end trims the VM's Docker disk once, a failing trim leaves the slot running, and a plain host is left alone"
+echo "==> a finished job's space is reclaimed; too little space holds new jobs until it frees"
+rm -f "$tmp/calls.trims" "$tmp/calls.sweeps"
+FLAGS=colima-up ENGINE=colima runner run
+has 'docker image prune -f' "dangling images are removed after a job"
+has 'docker builder prune -f' "the build cache is pruned after a job"
+has 'status=exited' "stopped job containers are listed for removal"
+[ -s "$tmp/calls.sweeps" ] || fail "Sysbox data of absent containers is not swept after a job: $(cat "$tmp/calls")"
+grep -Fq 'GiB free for jobs' "$tmp/out" || fail "a job's end does not say how much space is free: $(cat "$tmp/out")"
+lacks 'sleep 60' "a roomy disk"
+ok "a job's end removes stopped containers, dangling images, build cache and orphaned Sysbox data, trims, and says the free space"
+# space_run VM_KIB_READINGS...: one slot, one job, a Colima VM reporting these free-space
+# readings in turn (the last for good), and the Mac reporting the HOST_SEQ readings.
+space_run() {
+  rm -rf "${tmp:?}/state" "${tmp:?}/fake" "${tmp:?}/home"
+  mkdir -p "$tmp/state" "$tmp/fake" "$tmp/home"
+  : >"$tmp/calls"
+  touch "$tmp/fake/colima-up"
+  printf '%s\n' "$@" >"$tmp/fake/vm-free-seq"
+  [ -z "${HOST_SEQ:-}" ] || printf '%s\n' $HOST_SEQ >"$tmp/fake/host-free-seq"
+  printf '[]' >"$tmp/fake/jobs.json"
+  set +e
+  PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+    LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=1 LINUX_RUNNER_MAX_JOBS=1 \
+    LINUX_RUNNER_ENGINE=colima LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" FAKE_HOME="$tmp/home" \
+    LINUX_RUNNER_NEWSYSLOG_DIR="$tmp/newsyslog" FAKE_REAL_SLEEP_FOR=4242 \
+    LINUX_RUNNER_JANITOR_INTERVAL=4242 \
+    bash "$script" run >"$tmp/out" 2>&1
+  rc=$?
+  set -e
+}
+# 20 GiB free: room for one slot's 18 GiB peak, so no wait and no reclaim before registering.
+space_run 20971520
+[ "$rc" -eq 0 ] || fail "a run with room exited $rc: $(cat "$tmp/out")"
+lacks 'sleep 60' "20 GiB free for one slot"
+# 10 GiB, 10 GiB, then 100 GiB: reclaim first, wait while under one peak, then run.
+space_run 10485760 10485760 104857600
+[ "$rc" -eq 0 ] || fail "a run that waited for space exited $rc: $(cat "$tmp/out")"
+has 'sleep 60' "a slot waits when under a job's peak"
+grep -Fq "less than a job's 18 GiB peak" "$tmp/out" || fail "waiting for space is not said in the log: $(cat "$tmp/out")"
+[ "$(grep -n 'docker image prune' "$tmp/calls" | head -1 | cut -d: -f1)" -lt "$(grep -n 'generate-jitconfig' "$tmp/calls" | head -1 | cut -d: -f1)" ] \
+  || fail "space was not reclaimed before the slot registered: $(cat "$tmp/calls")"
+[ "$(grep -c '^docker run ' "$tmp/calls")" -eq 1 ] || fail "the job did not run once space freed: $(cat "$tmp/calls")"
+# The Mac under the sparse VM disk bounds what jobs can write, whatever the VM reports: the
+# Mac has 5 GiB for a while, the VM 100.
+HOST_SEQ='5242880 5242880 104857600' space_run 104857600
+grep -Fq "less than a job's 18 GiB peak" "$tmp/out" || fail "a full Mac was not taken for a full disk: $(cat "$tmp/out")"
+ok "below a job's peak, on the VM or on the Mac under it, a slot reclaims and waits saying why; above it, it runs at once"
 DOCKER_RC=125 ENGINE=colima FLAGS='colima-up' runner run
 has 'sleep 15' "an immediate failure with the engine answering"
 ! grep -Fq 'stopped answering' "$tmp/out" || fail "a container's own failure was taken for a lost engine: $(cat "$tmp/out")"
@@ -910,6 +981,9 @@ FLAGS=service-draining KEEP_DAEMONS=1 runner stop-daemon
 [ -f "$dplist" ] || fail "stop-daemon removed the LaunchDaemon it only had to stop"
 ! grep -n 'launchctl bootout' "$root/runner/linux-runner-admin" || fail "the fleet helper boots the daemon out itself instead of letting its jobs drain"
 grep -q 'linux-runner.sh" stop-daemon' "$root/runner/linux-runner-admin" || fail "rebuild does not stop the fleet through stop-daemon before deleting its VM"
+grep -q 'engine_disk_line$' "$root/runner/linux-runner-admin" && grep -q 'WARNING: engine disk space is under' "$root/runner/linux-runner-admin" \
+  || fail "status does not report the engine disk's free space with a warning below every slot's job peak"
+ok "status reports the engine disk and the Mac under it, warning below every slot's job peak"
 ok "stop-daemon and the fleet helper let running jobs finish before the fleet stops"
 
 echo "==> the log survives rotation: run reopens it for every line"

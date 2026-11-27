@@ -135,6 +135,10 @@ SYSBOX_VERSION=0.7.1
 SYSBOX_SHA256=04ca894ae0b53f0fa54eaacc173ce40363c9a95ea5450f773716a84ef650a69b
 # On the VM data disk Colima mounts at /var/lib/docker; see sysbox_install_script.
 SYSBOX_DATA_ROOT=/var/lib/docker/sysbox
+# A job's writable layers peak near 18 GiB (three full hesperus jobs held 55 GiB,
+# 2026-11-27). Below SLOTS peaks of free space the slots reclaim what no job uses; below one
+# peak a slot starts no new job, so a job never begins on a disk it would fill.
+JOB_PEAK_GIB=18
 ENGINE="${LINUX_RUNNER_ENGINE:-docker}"
 VM_CPUS="${LINUX_RUNNER_VM_CPUS:-8}"
 VM_MEMORY="${LINUX_RUNNER_VM_MEMORY:-16}"
@@ -147,6 +151,8 @@ LOG_FILE="${LINUX_RUNNER_LOG_FILE:-}"
 # (the default) means forever.
 MAX_JOBS="${LINUX_RUNNER_MAX_JOBS:-}"
 BACKOFF_START=15
+# How long a slot waits between looks at free space while it has too little to start a job.
+SPACE_WAIT="${LINUX_RUNNER_SPACE_WAIT:-60}"
 # How often a draining supervisor removes the runners that have no job.
 DRAIN_INTERVAL="${LINUX_RUNNER_DRAIN_INTERVAL:-5}"
 BACKOFF_MAX=300
@@ -338,16 +344,72 @@ engine_lost() {
   ! docker info >/dev/null 2>&1
 }
 
-# trim_engine_disk: hand the space a finished job freed back to the Mac. The VM's data disk
-# is a sparse file on the Mac that grows with every job's writes and shrinks only when the VM
-# trims the freed blocks; three slots write more than 50 GB an hour, so waiting for the hourly
-# fstrim.timer let the file fill the Mac's disk. A plain Linux host frees its disk at once and
-# has nothing to return. A failed trim is logged and never fails the slot.
-trim_engine_disk() {
+# engine_free_gib: the space a job can still write, in GiB: the VM's data disk or, when the
+# Mac has less, the Mac's own free space, because the VM disk is a sparse file that fails
+# writes (corrupting the image store) once the Mac under it is full. Prints nothing when the
+# engine is not a Colima VM or a reading fails; callers then do not gate on space.
+engine_free_gib() {
   [ "$ENGINE" = colima ] || return 0
-  local out
+  local vm host
+  vm="$(colima ssh -- df -k --output=avail /var/lib/docker 2>/dev/null | tail -n 1 | tr -d ' ')"
+  host="$(df -k "$HOME" 2>/dev/null | awk 'NR == 2 {print $4}')"
+  case "$vm$host" in '' | *[!0-9]*) return 0 ;; esac
+  [ -n "$vm" ] && [ -n "$host" ] || return 0
+  [ "$vm" -le "$host" ] || vm="$host"
+  echo $((vm / 1048576))
+}
+
+# reclaim_engine_space: remove what no job uses and hand the freed blocks back to the Mac. The
+# VM's data disk is a sparse file that grows with every job's writes and shrinks only when the
+# VM trims them; three slots write more than 50 GB an hour, so waiting for the hourly
+# fstrim.timer let the file fill the Mac's disk. What is removed:
+#   - this host's stopped job containers (their writable layers and volumes);
+#   - Sysbox's per-container data for a container that no longer exists. The directory list is
+#     read before the container list, so a directory with no container is one whose container
+#     was removed; a mounted one is never touched;
+#   - dangling images and build cache, which nothing runs from (the job image is tagged).
+# A plain Linux host frees its disk at once and has nothing to return. A failed step is
+# logged and never fails the slot.
+reclaim_engine_space() {
+  [ "$ENGINE" = colima ] || return 0
+  local out leftover
+  docker ps -aq --filter "name=$own_names" --filter status=exited --filter status=dead --filter status=created |
+    while read -r leftover; do docker rm -f -v "$leftover" >/dev/null 2>&1 || true; done
+  docker image prune -f >/dev/null 2>&1 || log "slot $1: pruning dangling images failed"
+  docker builder prune -f >/dev/null 2>&1 || log "slot $1: pruning the build cache failed"
+  out="$(colima ssh -- sudo sh -c 'cd '"$SYSBOX_DATA_ROOT"'/docker 2>/dev/null || exit 0
+    dirs=$(ls); ids=$(docker ps -aq --no-trunc)
+    for d in $dirs; do
+      case "$ids" in *"$d"*) continue ;; esac
+      grep -qF "/$d" /proc/mounts && continue
+      rm -rf "$d" && echo "removed Sysbox data of absent container $d"
+    done' 2>&1)" || log "slot $1: removing Sysbox data of absent containers failed: $out"
+  [ -z "$out" ] || log "slot $1: $out"
   out="$(colima ssh -- sudo fstrim -v /var/lib/docker 2>&1)" \
     || log "slot $1: trimming the VM's /var/lib/docker failed (the hourly fstrim.timer still returns the space): $out"
+}
+
+# free_note: " (N GiB free)" for a job's closing log line, empty when unknown.
+free_note() {
+  local free
+  free="$(engine_free_gib)"
+  [ -z "$free" ] || printf ' (%s GiB free for jobs)' "$free"
+}
+
+# wait_for_engine_space: a slot starts no job on less than one job's peak. It reclaims first
+# when there is less than every slot's peak; space that stays short is said in the log, and
+# running jobs ending is what frees more.
+wait_for_engine_space() {
+  local free tries=0
+  free="$(engine_free_gib)"
+  [ -n "$free" ] || return 0
+  [ "$free" -ge $((SLOTS * JOB_PEAK_GIB)) ] || { reclaim_engine_space "$1"; free="$(engine_free_gib)"; }
+  while [ -n "$free" ] && [ "$free" -lt "$JOB_PEAK_GIB" ] && [ ! -e "$state_dir/draining" ]; do
+    [ $((tries % 10)) -ne 0 ] || log "slot $1: only ${free} GiB free for jobs on the VM disk or the Mac, less than a job's ${JOB_PEAK_GIB} GiB peak; no job starts until space frees"
+    tries=$((tries + 1))
+    sleep "$SPACE_WAIT"
+    free="$(engine_free_gib)"
+  done
 }
 
 run_slot() {
@@ -369,6 +431,7 @@ run_slot() {
       backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
       continue
     fi
+    wait_for_engine_space "$slot"
     name="$prefix-$slot-$(date +%s)"
     rc=0
     register_runner "$slot" "$gid" "$name" || rc=$?
@@ -403,10 +466,10 @@ run_slot() {
     fi
     forget_runner "$id"
     docker rm -f -v "$name" >/dev/null 2>&1 || true
-    trim_engine_disk "$slot"
+    reclaim_engine_space "$slot"
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
-    log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
+    log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s$(free_note)"
     # A container that dies at once (a missing image, a daemon that is down)
     # would otherwise register and discard runners in a tight loop.
     if [ "$rc" -ne 0 ] && [ $(($(date +%s) - started)) -lt 30 ] && engine_lost; then

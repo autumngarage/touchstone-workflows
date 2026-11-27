@@ -42,6 +42,9 @@ COLIMA=/opt/homebrew/bin/colima
 # job and hourly, so the Mac holds only what is in use. A rebuild deletes the
 # VM with its disk, so the new size applies to the VM it makes.
 VM_DISK=140
+# A job's writable layers peak near 18 GiB (linux-runner.sh's JOB_PEAK_GIB); status warns
+# when the space jobs can write falls below every slot's peak.
+JOB_PEAK_GIB=18
 # Memory the VM keeps for its own engine and kernel, outside every job's limit.
 VM_RESERVED_GIB=3
 
@@ -94,9 +97,28 @@ install_daemon() { # SLOTS QUEUE_SLOTS
   printf '%s %s %s %s\n' "$1" "$2" "$VM_CPUS" "$VM_MEMORY" >"$CONF"
 }
 
+# One line on the space jobs can write: the VM's data disk, and the Mac under it, whose free
+# space bounds the sparse VM disk. Either one short of every slot's peak is a warning.
+engine_disk_line() {
+  local vm size host need
+  need=$((SLOTS * JOB_PEAK_GIB))
+  read -r vm size < <(as_run_user "$COLIMA" ssh -- df -k --output=avail,size /var/lib/docker </dev/null 2>/dev/null | tail -n 1) || true
+  host="$(df -k "$RUN_AS_HOME" | awk 'NR == 2 {print $4}')"
+  if [ -z "${vm:-}" ] || [ -z "$host" ]; then
+    echo "engine disk: unreadable (is the VM running?)"
+    return 0
+  fi
+  vm=$((vm / 1048576)) size=$((size / 1048576)) host=$((host / 1048576))
+  echo "engine disk: VM ${vm} GiB free of ${size}, Mac ${host} GiB free"
+  if [ "$vm" -lt "$need" ] || [ "$host" -lt "$need" ]; then
+    echo "WARNING: engine disk space is under ${need} GiB ($SLOTS slots x ${JOB_PEAK_GIB} GiB job peak); jobs reclaim space first and wait below ${JOB_PEAK_GIB} GiB"
+  fi
+}
+
 cmd_status() {
   read_conf
   echo "slots=$SLOTS queue_slots=$QUEUE_SLOTS vm_cpus=$VM_CPUS vm_memory=${VM_MEMORY}GiB"
+  engine_disk_line
   echo "runner code: touchstone-workflows $(git_tw rev-parse HEAD)"
   launchctl print "$SERVICE" 2>/dev/null | grep -E '^\s*(state|pid) =' | head -2 || echo "daemon: not loaded"
 }
