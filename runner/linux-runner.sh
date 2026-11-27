@@ -363,7 +363,9 @@ engine_free_gib() {
 # VM's data disk is a sparse file that grows with every job's writes and shrinks only when the
 # VM trims them; three slots write more than 50 GB an hour, so waiting for the hourly
 # fstrim.timer let the file fill the Mac's disk. What is removed:
-#   - this host's stopped job containers (their writable layers and volumes);
+#   - this host's exited job containers (their writable layers and volumes). Never a created
+#     one, which is another slot's launch in progress, and never by force, so a container that
+#     started meanwhile is refused, not killed;
 #   - Sysbox's per-container data for a container that no longer exists. The directory list is
 #     read before the container list, so a directory with no container is one whose container
 #     was removed; a mounted one is never touched;
@@ -373,8 +375,8 @@ engine_free_gib() {
 reclaim_engine_space() {
   [ "$ENGINE" = colima ] || return 0
   local out leftover
-  docker ps -aq --filter "name=$own_names" --filter status=exited --filter status=dead --filter status=created |
-    while read -r leftover; do docker rm -f -v "$leftover" >/dev/null 2>&1 || true; done
+  docker ps -aq --filter "name=$own_names" --filter status=exited --filter status=dead |
+    while read -r leftover; do docker rm -v "$leftover" >/dev/null 2>&1 || true; done
   docker image prune -f >/dev/null 2>&1 || log "slot $1: pruning dangling images failed"
   docker builder prune -f >/dev/null 2>&1 || log "slot $1: pruning the build cache failed"
   out="$(colima ssh -- sudo sh -c 'cd '"$SYSBOX_DATA_ROOT"'/docker 2>/dev/null || exit 0
