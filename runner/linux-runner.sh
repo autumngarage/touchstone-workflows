@@ -397,10 +397,10 @@ run_slot() {
     # A container that dies at once (a missing image, a daemon that is down)
     # would otherwise register and discard runners in a tight loop.
     if [ "$rc" -ne 0 ] && [ $(($(date +%s) - started)) -lt 30 ] && engine_lost; then
-      # No job runs on an engine that is gone, so the supervisor stops at once, and launchd
-      # (KeepAlive) starts it again; its ensure_engine starts the VM. Before, every slot
-      # retried against the dead engine until someone restarted the daemon.
-      log "slot $slot: the container engine stopped answering; the supervisor stops so launchd starts it, and the engine, again"
+      # No job runs on an engine that is gone, so the supervisor stops at once. It exits
+      # non-zero (cmd_run's end), so the daemon's KeepAlive {SuccessfulExit=false} starts it
+      # again and its ensure_engine starts the VM.
+      log "slot $slot: the container engine stopped answering; the supervisor stops with a failure so launchd starts it, and the engine, again"
       : >"$state_dir/engine-lost"
       kill -TERM "$supervisor" 2>/dev/null || true
       return 0
@@ -426,6 +426,8 @@ drain_slots() {
     stop_slots
     return
   fi
+  # Only a stop that arrives here from outside is a clean end; cmd_run exits 0 for it alone.
+  stop_requested=1
   trap stop_slots INT TERM
   until mkdir "$state_dir/register.lock" 2>/dev/null; do sleep 1; done
   : >"$state_dir/draining"
@@ -488,6 +490,7 @@ forget_stale_runners() {
 
 cmd_run() {
   local gid slot pid pids drain_pid="" janitor_pid=""
+  stop_requested=""
   # The process a slot stops when the engine is gone; $$ is the supervisor in every slot.
   supervisor=$$
   if [ -n "$LOG_FILE" ]; then
@@ -554,6 +557,13 @@ cmd_run() {
     wait "$janitor_pid" 2>/dev/null || true
   fi
   rm -f "$state_dir/draining"
+  # The service is kept alive only after a failure (KeepAlive {SuccessfulExit=false}), so
+  # slots that end on their own, or an engine that is gone, must not look like a clean stop.
+  # A run bounded by LINUX_RUNNER_MAX_JOBS is the tests' deliberate end.
+  if [ -e "$state_dir/engine-lost" ] || { [ -z "$stop_requested" ] && [ -z "$MAX_JOBS" ]; }; then
+    log "every slot ended without a stop request; exiting with a failure so the service manager restarts the supervisor"
+    return 1
+  fi
 }
 
 cmd_build() {
