@@ -591,12 +591,52 @@ while kill -0 "$sup" 2>/dev/null; do
   [ "$SECONDS" -lt "$deadline" ] || { kill -KILL "$sup" 2>/dev/null; fail "a supervisor whose engine died kept running: $(cat "$tmp/out")"; }
   /bin/sleep 0.1
 done
-wait "$sup" 2>/dev/null || true
+rc=0; wait "$sup" || rc=$?
 set +m
+[ "$rc" -ne 0 ] || fail "a supervisor that stopped itself on a lost engine exited 0, so launchd would not restart it: $(cat "$tmp/out")"
 grep -Fq 'the container engine stopped answering' "$tmp/out" || fail "the lost engine is not logged: $(cat "$tmp/out")"
 grep -Fq 'stopping at once' "$tmp/out" || fail "the supervisor drained instead of stopping: $(cat "$tmp/out")"
 [ "$(grep -c '^docker run ' "$tmp/calls")" -le 2 ] || fail "slots kept starting containers on a dead engine: $(grep -c '^docker run ' "$tmp/calls")"
-ok "a container that fails at once on a dead engine stops the supervisor for launchd to restart"
+ok "a container that fails at once on a dead engine stops the supervisor with a failure for launchd to restart"
+# The service restarts only after a failure, so an unbounded supervisor exits 0 for a stop
+# request alone: slots that end on their own are a failure, and an outside TERM is clean.
+start_unbounded() {
+  rm -rf "${tmp:?}/state" "${tmp:?}/fake"
+  mkdir -p "$tmp/state" "$tmp/fake"
+  : >"$tmp/calls"
+  touch "$tmp/fake/delete-ok"
+  PATH="$bin:$PATH" HOME="$tmp/home" FAKE_CALLS="$tmp/calls" FAKE_STATE="$tmp/fake" \
+    LINUX_RUNNER_STATE_DIR="$tmp/state" LINUX_RUNNER_SLOTS=2 LINUX_RUNNER_MAX_JOBS= \
+    LINUX_RUNNER_ENGINE=docker LINUX_RUNNER_TOKEN_FILE="" LINUX_RUNNER_DAEMON_DIR="$tmp/daemons" \
+    FAKE_HOME="$tmp/home" FAKE_DOCKER_HOLD=2 FAKE_DOCKER_RC=0 FAKE_REAL_SLEEP_FOR=none \
+    LINUX_RUNNER_DRAIN_INTERVAL=1 \
+    bash "$script" run >"$tmp/out" 2>&1 &
+  sup=$!
+  until [ -f "$tmp/fake/started" ]; do /bin/sleep 0.2; done
+}
+wait_exit() {
+  local deadline=$((SECONDS + 20))
+  while kill -0 "$sup" 2>/dev/null; do
+    [ "$SECONDS" -lt "$deadline" ] || { kill -KILL "$sup" 2>/dev/null; fail "$1: $(cat "$tmp/out")"; }
+    /bin/sleep 0.1
+  done
+  rc=0; wait "$sup" || rc=$?
+}
+set -m
+start_unbounded
+slot_pids="$(pgrep -P "$sup" | tr '\n' ' ')"
+[ -n "$slot_pids" ] || fail "found no slot processes under the supervisor"
+# shellcheck disable=SC2086
+kill -KILL $slot_pids
+wait_exit "a supervisor whose slots died kept running"
+[ "$rc" -ne 0 ] || fail "a supervisor whose slots ended on their own exited 0, so launchd would not restart it: $(cat "$tmp/out")"
+ok "slots that end on their own exit non-zero, so launchd restarts the supervisor"
+start_unbounded
+kill -TERM "$sup"
+wait_exit "a supervisor asked to stop kept running"
+set +m
+[ "$rc" -eq 0 ] || fail "a supervisor drained by an outside TERM exited $rc: $(cat "$tmp/out")"
+ok "an outside TERM drains and exits 0, so launchd leaves it stopped"
 DOCKER_RC=125 ENGINE=colima FLAGS='colima-up' runner run
 has 'sleep 15' "an immediate failure with the engine answering"
 ! grep -Fq 'stopped answering' "$tmp/out" || fail "a container's own failure was taken for a lost engine: $(cat "$tmp/out")"
