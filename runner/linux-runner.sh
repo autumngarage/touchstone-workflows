@@ -338,6 +338,18 @@ engine_lost() {
   ! docker info >/dev/null 2>&1
 }
 
+# trim_engine_disk: hand the space a finished job freed back to the Mac. The VM's data disk
+# is a sparse file on the Mac that grows with every job's writes and shrinks only when the VM
+# trims the freed blocks; three slots write more than 50 GB an hour, so waiting for the hourly
+# fstrim.timer let the file fill the Mac's disk. A plain Linux host frees its disk at once and
+# has nothing to return. A failed trim is logged and never fails the slot.
+trim_engine_disk() {
+  [ "$ENGINE" = colima ] || return 0
+  local out
+  out="$(colima ssh -- sudo fstrim -v /var/lib/docker 2>&1)" \
+    || log "slot $1: trimming the VM's /var/lib/docker failed (the hourly fstrim.timer still returns the space): $out"
+}
+
 run_slot() {
   local slot="$1" backoff="$BACKOFF_START" jobs=0
   local gid name jit id err role started rc
@@ -391,6 +403,7 @@ run_slot() {
     fi
     forget_runner "$id"
     docker rm -f -v "$name" >/dev/null 2>&1 || true
+    trim_engine_disk "$slot"
     rm -f "$state_dir/slot-$slot"
     jobs=$((jobs + 1))
     log "slot $slot: runner $name exited ($rc) after $(($(date +%s) - started))s"
