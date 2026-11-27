@@ -207,6 +207,10 @@ case "$1" in
       *'dpkg-query'*'sysbox-ce'*) [ ! -f "$FAKE_STATE/no-sysbox" ] ;;
       # sysbox-old-data-root: a VM whose Sysbox keeps job data on its root disk.
       *'-C sysbox-mgr'*) [ ! -f "$FAKE_STATE/sysbox-old-data-root" ] ;;
+      *'fstrim'*)
+        printf 'fstrim\n' >>"$FAKE_CALLS.trims"
+        [ ! -f "$FAKE_STATE/trim-fails" ] || { echo "fstrim: /var/lib/docker: FITRIM failed" >&2; exit 1; }
+        ;;
       *'sudo sh -s'*)
         cat >"$FAKE_STATE/sysbox-install-script"
         [ ! -f "$FAKE_STATE/sysbox-install-fails" ] || exit 1
@@ -637,6 +641,23 @@ wait_exit "a supervisor asked to stop kept running"
 set +m
 [ "$rc" -eq 0 ] || fail "a supervisor drained by an outside TERM exited $rc: $(cat "$tmp/out")"
 ok "an outside TERM drains and exits 0, so launchd leaves it stopped"
+rm -f "$tmp/calls.trims"
+FLAGS=colima-up ENGINE=colima runner run
+[ "$rc" -eq 0 ] || fail "a colima run exited $rc: $(cat "$tmp/out")"
+[ "$(grep -c '^docker run ' "$tmp/calls")" -ge 1 ] || fail "no job ran: $(cat "$tmp/calls")"
+[ "$(grep -c '^docker run ' "$tmp/calls")" -eq "$(grep -c fstrim "$tmp/calls.trims")" ] \
+  || fail "each finished job must trim the VM's Docker disk exactly once: $(cat "$tmp/calls") / $(cat "$tmp/calls.trims")"
+[ "$(grep -c 'colima ssh -- sudo fstrim -v /var/lib/docker' "$tmp/calls")" -eq "$(grep -c '^docker run ' "$tmp/calls")" ] \
+  || fail "the trim must target /var/lib/docker: $(cat "$tmp/calls")"
+rm -f "$tmp/calls.trims"
+JOBS=2 FLAGS='colima-up trim-fails' ENGINE=colima runner run
+[ "$rc" -eq 0 ] || fail "a failing trim stopped the run (exit $rc): $(cat "$tmp/out")"
+grep -Fq 'trimming the VM' "$tmp/out" || fail "a failed trim is not logged: $(cat "$tmp/out")"
+grep -Fq 'FITRIM failed' "$tmp/out" || fail "a failed trim's output is not logged: $(cat "$tmp/out")"
+[ "$(grep -c '^docker run ' "$tmp/calls")" -ge 2 ] || fail "a failed trim stopped the slot from taking its next job: $(cat "$tmp/calls")"
+FLAGS= ENGINE=docker runner run
+lacks 'fstrim' "a plain Docker host"
+ok "a job's end trims the VM's Docker disk once, a failing trim leaves the slot running, and a plain host is left alone"
 DOCKER_RC=125 ENGINE=colima FLAGS='colima-up' runner run
 has 'sleep 15' "an immediate failure with the engine answering"
 ! grep -Fq 'stopped answering' "$tmp/out" || fail "a container's own failure was taken for a lost engine: $(cat "$tmp/out")"
