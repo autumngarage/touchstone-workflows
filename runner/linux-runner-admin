@@ -36,10 +36,12 @@ RUN_AS_HOME=/Users/linuxci
 RUN_AS_PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 COLIMA=/opt/homebrew/bin/colima
 # The VM's data disk holds the job image and every job's build and inner
-# Docker. Three full hesperus validations filled 60 GiB on 2026-11-23
-# (4.8 GiB left, queue run for #4183); a job peaks near 18 GiB. The disk is
-# sparse and the VM trims hourly, so the Mac holds only what is in use.
-VM_DISK=90
+# Docker. A job's writable layers peak near 18 GiB and there are three slots,
+# so 55 GiB of layers plus the image and headroom outgrew 90 GiB (ENOSPC
+# compiling Rust, 2026-11-27). The disk is sparse and the VM trims after every
+# job and hourly, so the Mac holds only what is in use. A rebuild deletes the
+# VM with its disk, so the new size applies to the VM it makes.
+VM_DISK=140
 # Memory the VM keeps for its own engine and kernel, outside every job's limit.
 VM_RESERVED_GIB=3
 
